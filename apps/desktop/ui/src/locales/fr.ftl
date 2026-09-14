@@ -402,6 +402,7 @@ storage-export-button = Exporter…
 accounts-yours = Vos comptes
 account-switch-failed = Impossible de changer de compte : { $error }
 account-switch-draft-failed = Le brouillon ouvert n'a pas pu être enregistré, le compte n'a donc pas été changé : { $error }
+view-switch-draft-failed = Le brouillon ouvert n'a pas pu être enregistré, la boîte n'a donc pas été ouverte : { $error }
 accounts-add = Ajouter un compte
 accounts-remove = Supprimer le compte
 accounts-remove-help = Supprime ce compte, son courrier et son mot de passe. Rien ne change sur le serveur.

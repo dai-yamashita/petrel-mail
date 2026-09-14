@@ -29,7 +29,7 @@ import { key } from './lib/keys';
 import { promisesMissingAttachment } from './lib/compose-checks';
 import { AUTOSAVE_MS, draftSignature, slotFor, unsaved } from './lib/draft-autosave';
 import type { ComposerSlot } from './lib/draft-autosave';
-import { opensComposer } from './lib/draft-view';
+import { leavingComposerView, opensComposer } from './lib/draft-view';
 import { draftFromRecord } from './lib/draft-record';
 import { settleDraft } from './lib/close-draft';
 import { replyHeaders, replyTargets } from './lib/reply';
@@ -356,6 +356,14 @@ export function App() {
     countModes: countModes(arrangement),
     folderRole: (id) => folders.find((f) => f.id === id)?.role ?? undefined,
     onSettled: () => setTriageEpoch((n) => n + 1),
+    onRowLeft: (row, kind) => {
+      // Saving here would undo the bin: save_draft files the row in Drafts.
+      // Drop the composer so the next autosave never starts. An in-flight
+      // save is the engine's problem; it will not re-home a binned draft.
+      if (kind !== 'trash' && kind !== 'spam') return;
+      const openId = slotRef.current.id ?? draftRef.current?.savedId ?? null;
+      if (openId != null && row.id === openId) setDraft(null);
+    },
   });
 
   // Which conversations a confirmed delete would remove. Captured when the
@@ -401,7 +409,26 @@ export function App() {
    * over the same inbox-wide results, which is the header lying about what is
    * on screen. Picking a mailbox means you want that mailbox.
    */
-  const goToView = (v: string) => {
+  const goToView = async (v: string) => {
+    // Drafts is the only mailbox that *is* the composer. Walking out with
+    // the editor still mounted left it floating over the inbox. A reply
+    // opened from anywhere else is a different session and stays put.
+    if (leavingComposerView(view, v)) {
+      const current = draftRef.current;
+      if (current) {
+        const settled = await settleDraft(
+          current,
+          slotRef.current,
+          (d) => saveDraftRef.current(d, { quiet: true }),
+          api.pushDraft,
+        );
+        if (!settled.ok) {
+          setToast(t('view-switch-draft-failed', { error: settled.error }));
+          return;
+        }
+        setDraft(null);
+      }
+    }
     setQuery('');
     setView(v);
   };
@@ -1876,7 +1903,7 @@ export function App() {
         onView={(v) => {
           if (v === 'help') setHelpOpen(true);
           else if (v === 'settings') setSettingsOpen('appearance');
-          else goToView(v);
+          else void goToView(v);
         }}
       />
 
@@ -2421,7 +2448,7 @@ export function App() {
             if (v === 'help') setHelpOpen(true);
             else if (v === 'settings') setSettingsOpen('appearance');
             else if (v === 'search') searchRef.current?.focus();
-            else setView(v);
+            else void goToView(v);
           },
         }}
       />

@@ -13,9 +13,10 @@ export type Settled = { ok: true; id: number | null } | { ok: false; error: stri
  * what somebody typed. A message that never held anything has no row and
  * nothing to push, and may go at once.
  *
- * Shared by the popped-out window's close, and by the account switch in the
+ * Shared by the popped-out window's close, by the account switch in the
  * main window, which has to file the draft under the account it was written
- * in before the store's notion of "active" moves.
+ * in before the store's notion of "active" moves, and by leaving Drafts for
+ * another mailbox, which used to leave the editor floating over the inbox.
  */
 export async function settleDraft(
   d: Draft,

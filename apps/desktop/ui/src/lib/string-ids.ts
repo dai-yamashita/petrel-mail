@@ -370,6 +370,7 @@ export const STRING_IDS = [
   'accounts-yours',
   'account-switch-failed',
   'account-switch-draft-failed',
+  'view-switch-draft-failed',
   'accounts-add',
   'accounts-remove',
   'accounts-remove-help',

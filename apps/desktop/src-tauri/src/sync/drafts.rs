@@ -31,6 +31,16 @@ pub(crate) async fn push_draft_to_server(
         else {
             return Ok(());
         };
+        // A draft that has left Drafts — trashed, spammed — must not grow a
+        // new server copy there. The debounce from the last save can still
+        // fire after the row has moved, and an APPEND would let ordinary
+        // folder sync put it back in the local Drafts list.
+        if !store
+            .message_in_role(draft_id, "drafts")
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
         let record = store.load_draft(draft_id).map_err(|e| e.to_string())?;
         let (msgid, old_uid) = store
             .draft_sync_state(draft_id)

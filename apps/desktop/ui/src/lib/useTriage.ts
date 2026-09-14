@@ -90,6 +90,10 @@ export function useTriage(opts: {
   /** Called once an action has settled either way, and after an undo — the
    *  moment the store can be asked for the real numbers. */
   onSettled?: () => void;
+  /** Fired the moment a row leaves the list, before the store answers.
+   *  The composer has to hear this immediately: a save still in flight
+   *  after a trash would write the draft back into Drafts. */
+  onRowLeft?: (row: Thread, kind: ActionKind) => void;
   /** Names the list on screen: account, view and query. An offer made in
    *  another list reverses its action but leaves these rows alone. */
   listKey?: string;
@@ -107,6 +111,7 @@ export function useTriage(opts: {
     countModes = {},
     folderRole,
     onSettled,
+    onRowLeft,
     listKey = '',
   } = opts;
   const [pending, setPending] = useState(false);
@@ -184,6 +189,7 @@ export function useTriage(opts: {
 
       if (removes) {
         setItems((prev) => prev.filter((m) => m.id !== row.id));
+        onRowLeft?.(row, kind);
         // Selection only follows when the row you archived is the one you were
         // reading — then it moves on, the way it would if you were working down
         // the list from the keyboard. Archiving some *other* row from its hover
@@ -280,6 +286,7 @@ export function useTriage(opts: {
       countModes,
       folderRole,
       onSettled,
+      onRowLeft,
     ],
   );
 

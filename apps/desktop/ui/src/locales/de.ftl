@@ -402,6 +402,7 @@ storage-export-button = Exportieren…
 accounts-yours = Ihre Konten
 account-switch-failed = Konto konnte nicht gewechselt werden: { $error }
 account-switch-draft-failed = Der offene Entwurf konnte nicht gespeichert werden, deshalb wurde das Konto nicht gewechselt: { $error }
+view-switch-draft-failed = Der offene Entwurf konnte nicht gespeichert werden, deshalb wurde das Postfach nicht geöffnet: { $error }
 accounts-add = Konto hinzufügen
 accounts-remove = Konto entfernen
 accounts-remove-help = Entfernt dieses Konto, seine E-Mails und sein Passwort. Auf dem Server ändert sich nichts.

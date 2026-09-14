@@ -404,6 +404,7 @@ storage-export-button = Export…
 accounts-yours = Your accounts
 account-switch-failed = Could not switch accounts: { $error }
 account-switch-draft-failed = Could not save the open draft, so the account was not switched: { $error }
+view-switch-draft-failed = Could not save the open draft, so the mailbox was not opened: { $error }
 accounts-add = Add account
 accounts-remove = Remove account
 accounts-remove-help = Removes this account, mail, and password. Nothing on the server changes.

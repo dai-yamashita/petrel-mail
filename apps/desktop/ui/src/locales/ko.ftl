@@ -407,6 +407,7 @@ storage-export-button = 내보내기…
 accounts-yours = 내 계정
 account-switch-failed = 계정을 전환할 수 없습니다: { $error }
 account-switch-draft-failed = 열려 있는 임시 보관 메일을 저장할 수 없어 계정을 전환하지 않았습니다: { $error }
+view-switch-draft-failed = 열려 있는 임시 보관 메일을 저장할 수 없어 메일함을 열지 않았습니다: { $error }
 accounts-add = 계정 추가
 accounts-remove = 계정 제거
 accounts-remove-help = 이 계정과 메일, 비밀번호를 제거합니다. 서버에서는 아무것도 바뀌지 않습니다.

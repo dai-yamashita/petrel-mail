@@ -279,10 +279,17 @@ impl Store {
             }
         }
 
-        let folder = self.ensure_folder(account_id, "drafts", "drafts")?;
-        self.conn
-            .execute("DELETE FROM placements WHERE message_id = ?1", params![id])?;
-        self.place_message(id, folder)?;
+        // A save used to wipe every placement and file the row in Drafts.
+        // That is how a draft that had just been trashed walked back into
+        // the Drafts list the next time autosave fired, with the composer
+        // still open on the same message. The words can still land; the
+        // home folder cannot.
+        if !self.message_in_role(id, "trash")? && !self.message_in_role(id, "spam")? {
+            let folder = self.ensure_folder(account_id, "drafts", "drafts")?;
+            self.conn
+                .execute("DELETE FROM placements WHERE message_id = ?1", params![id])?;
+            self.place_message(id, folder)?;
+        }
         Ok(id)
     }
 
