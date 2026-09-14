@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../lib/api';
+import {
+  FRAME_HEIGHT_CAP,
+  INITIAL_FRAME_HEIGHT,
+  isRecord,
+  nextFrameHeight,
+  wheelDeltaPx,
+} from '../lib/frame-height';
 import { useSettings } from '../lib/settings';
 import { t } from '../lib/strings';
 
@@ -13,14 +20,23 @@ import { t } from '../lib/strings';
  * by the sanitizer and could never carry a matching nonce anyway; the frame is
  * still opaque-origin, still network-blocked by CSP, still cut off from IPC.
  */
-export function MessageBody({ messageId, title }: { messageId: number; title: string }) {
+export function MessageBody({
+  messageId,
+  title,
+  onHeight,
+}: {
+  messageId: number;
+  title: string;
+  /** The conversation virtualizer measures from the card, not the frame. */
+  onHeight?: () => void;
+}) {
   const { settings } = useSettings();
   const [url, setUrl] = useState<string | null>(null);
   // Set when the body could not be asked for. Distinct from "not yet": a
   // failure used to leave `url` null, which is the loading state, so a
   // message whose body could not be fetched showed a placeholder for ever.
   const [failed, setFailed] = useState<string | null>(null);
-  const [height, setHeight] = useState(180);
+  const [height, setHeight] = useState(INITIAL_FRAME_HEIGHT);
   const [blocked, setBlocked] = useState(0);
   const [sender, setSender] = useState<string | null>(null);
   const frameRef = useRef<HTMLIFrameElement>(null);
@@ -52,6 +68,7 @@ export function MessageBody({ messageId, title }: { messageId: number; title: st
     setUrl(null);
     setFailed(null);
     setBlocked(0);
+    setHeight(INITIAL_FRAME_HEIGHT);
     api
       .messageUrl(messageId)
       // The app's theme rides the URL so the frame is *born* the right color
@@ -78,45 +95,61 @@ export function MessageBody({ messageId, title }: { messageId: number; title: st
   }, [messageId, reload, settings.theme, forceLight, appDark]);
 
   useEffect(() => {
+    onHeight?.();
+  }, [height, onHeight]);
+
+  useEffect(() => {
     function onMessage(e: MessageEvent) {
       // Only accept the shape we defined, and only from our own frame: the
       // window is addressable by anything that can post to it.
       if (e.source !== frameRef.current?.contentWindow) return;
-      const data = e.data as {
-        petrelHeight?: unknown;
-        petrelKey?: {
-          key: string;
-          metaKey: boolean;
-          ctrlKey: boolean;
-          shiftKey: boolean;
-          altKey: boolean;
-        };
-      };
+      if (!isRecord(e.data)) return;
+      const data = e.data;
 
       // How much the sanitizer refused. Reported out rather than drawn inside
       // the frame: a banner in there could say what happened but never offer to
       // undo it — the frame has no IPC and no same-origin access by design.
-      const b = (data as { petrelBlocked?: unknown })?.petrelBlocked;
+      const b = data.petrelBlocked;
       if (typeof b === 'number') setBlocked((prev) => (prev === b ? prev : b));
 
-      const h = data?.petrelHeight;
-      if (typeof h === 'number' && h > 0 && h < 20000) {
-        const ceil = Math.ceil(h);
-        setHeight((prev) => (prev === ceil ? prev : ceil));
+      setHeight((prev) => {
+        const next = nextFrameHeight({
+          prev,
+          reported: data.petrelHeight,
+          fitted: data.petrelFitted === true,
+        });
+        return next == null ? prev : next;
+      });
+
+      const wheel = data.petrelWheel;
+      if (isRecord(wheel) && typeof wheel.deltaY === 'number') {
+        const body = frameRef.current
+          ?.closest('.reader')
+          ?.querySelector('.reader-body');
+        if (body instanceof HTMLElement) {
+          const deltaMode = typeof wheel.deltaMode === 'number' ? wheel.deltaMode : 0;
+          body.scrollBy({
+            top: wheelDeltaPx({
+              deltaY: wheel.deltaY,
+              deltaMode,
+              pageSize: body.clientHeight,
+            }),
+          });
+        }
       }
 
       // A focused frame swallows keydown, so every shortcut in the app dies the
       // moment you click a message. The frame forwards key identity and we
       // replay it here, on the window the rest of the app listens to.
-      const k = data?.petrelKey;
-      if (k && typeof k.key === 'string') {
+      const k = data.petrelKey;
+      if (isRecord(k) && typeof k.key === 'string') {
         window.dispatchEvent(
           new KeyboardEvent('keydown', {
             key: k.key,
-            metaKey: !!k.metaKey,
-            ctrlKey: !!k.ctrlKey,
-            shiftKey: !!k.shiftKey,
-            altKey: !!k.altKey,
+            metaKey: k.metaKey === true,
+            ctrlKey: k.ctrlKey === true,
+            shiftKey: k.shiftKey === true,
+            altKey: k.altKey === true,
             bubbles: true,
           }),
         );
@@ -196,14 +229,15 @@ export function MessageBody({ messageId, title }: { messageId: number; title: st
         resort for a message too wide to shrink to a readable size — without it
         such a message is simply cut off with no way to reach the rest. The
         frame still never scrolls vertically; the document's own CSS holds that,
-        and the height below is what makes it unnecessary. */}
+        and the height below is what makes it unnecessary. Past the host cap
+        the reporter opens overflow-y on html, once, so the tail is reachable. */}
     <iframe
       ref={frameRef}
       className="msg-frame"
       src={url}
       sandbox="allow-scripts"
       title={title}
-      style={{ height }}
+      style={{ height: Math.min(height, FRAME_HEIGHT_CAP) }}
     />
     </>
   );

@@ -56,19 +56,39 @@
     fitting = false;
   }
 
-  // The host sizes the iframe to this number. scrollHeight still includes
-  // the unscaled overflow of a transformed message, which is how a short
-  // wide mail left a blank band under the text. The box already has the
-  // height the fitter decided; its bottom plus the padding under it is
-  // the space the message actually occupies.
+  // The host sizes the iframe to this number. A transformed message still
+  // occupies its unscaled layout height, so scrollHeight of that document is
+  // a blank band under the text — the box already has the fitted height.
+  // Without a transform, getBoundingClientRect can clamp to the iframe
+  // viewport once html is overflow-hidden, which is how a later layout pass
+  // (older cards landing above this one) shrank a finished body. The fit
+  // element's own layout height is the content, not the window.
+  var HEIGHT_CAP = 200000;
+
+  function contentLayoutHeight(inner, pad) {
+    var top = 0;
+    var el = inner;
+    while (el) {
+      top += el.offsetTop;
+      el = el.offsetParent;
+    }
+    return top + inner.scrollHeight + pad;
+  }
+
   function h() {
     var box = document.getElementById('petrel-box');
+    var inner = document.getElementById('petrel-fit');
     var b = document.body;
-    if (box && b) {
-      var pad = parseFloat(getComputedStyle(b).paddingBottom) || 0;
+    var d = document.documentElement;
+    var pad = b ? (parseFloat(getComputedStyle(b).paddingBottom) || 0) : 0;
+    if (box && b && lastTransform) {
       return Math.ceil(box.getBoundingClientRect().bottom + pad);
     }
-    var d = document.documentElement;
+    var boxH = box && b ? box.getBoundingClientRect().bottom + pad : 0;
+    var innerH = inner && b ? inner.getBoundingClientRect().bottom + pad : 0;
+    var layout = inner && b ? contentLayoutHeight(inner, pad) : 0;
+    var measured = Math.max(boxH, innerH, layout);
+    if (measured > 0) return Math.ceil(measured);
     return Math.max(d.scrollHeight, b ? b.scrollHeight : 0);
   }
 
@@ -78,12 +98,21 @@
       raf = 0;
       fit();
       var height = h();
+      if (height >= HEIGHT_CAP) {
+        height = HEIGHT_CAP;
+        document.documentElement.style.overflowY = 'auto';
+      }
       var blocked = typeof BLOCKED !== 'undefined' ? BLOCKED : 0;
-      var payload = height + ':' + blocked;
+      var fitted = !!lastTransform;
+      var payload = height + ':' + blocked + ':' + (fitted ? '1' : '0');
       if (payload === lastPosted) return;
       lastPosted = payload;
       try {
-        parent.postMessage({ petrelHeight: height, petrelBlocked: blocked }, '*');
+        parent.postMessage({
+          petrelHeight: height,
+          petrelBlocked: blocked,
+          petrelFitted: fitted
+        }, '*');
       } catch (e) {}
     });
   }
@@ -241,4 +270,19 @@
       }, '*');
     } catch (err) {}
   });
+
+  // Wheel stays inside the frame. The conversation scrolls on the host, and
+  // a focused body would otherwise swallow the gesture — the same reason
+  // keys are forwarded. Vertical only: sideways is how a message too wide
+  // to shrink is reached, and pinch-zoom is the browser's.
+  addEventListener('wheel', function (e) {
+    if (e.ctrlKey) return;
+    if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+    e.preventDefault();
+    try {
+      parent.postMessage({
+        petrelWheel: { deltaY: e.deltaY, deltaMode: e.deltaMode }
+      }, '*');
+    } catch (err) {}
+  }, { passive: false });
 })();
