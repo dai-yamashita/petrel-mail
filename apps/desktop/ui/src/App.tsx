@@ -30,6 +30,7 @@ import { promisesMissingAttachment } from './lib/compose-checks';
 import { AUTOSAVE_MS, draftSignature, slotFor, unsaved } from './lib/draft-autosave';
 import type { ComposerSlot } from './lib/draft-autosave';
 import { opensComposer } from './lib/draft-view';
+import { syncOnOpen } from './lib/mailbox-sync';
 import { draftFromRecord } from './lib/draft-record';
 import { settleDraft } from './lib/close-draft';
 import { replyHeaders, replyTargets } from './lib/reply';
@@ -404,6 +405,12 @@ export function App() {
   const goToView = (v: string) => {
     setQuery('');
     setView(v);
+    // Sweep folders are not on the inbox wake path. Ask for the one
+    // just opened so the list is not last sweep's, without putting
+    // every mailbox back on the wake that made new mail wait half a
+    // minute.
+    const mailbox = syncOnOpen(v);
+    if (mailbox) void api.syncMailbox(mailbox).catch(() => {});
   };
 
   /** A blank message, signed. The C key, the palette and the File menu all
@@ -2421,7 +2428,7 @@ export function App() {
             if (v === 'help') setHelpOpen(true);
             else if (v === 'settings') setSettingsOpen('appearance');
             else if (v === 'search') searchRef.current?.focus();
-            else setView(v);
+            else goToView(v);
           },
         }}
       />

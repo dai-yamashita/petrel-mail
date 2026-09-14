@@ -357,6 +357,7 @@ pub fn run() {
         outbox: Mutex::new(Vec::new()),
         draining: AtomicBool::new(false),
         draft_dirty: Mutex::new(std::collections::HashSet::new()),
+        folder_sync_inflight: Mutex::new(std::collections::HashSet::new()),
         pending_notify: Mutex::new(Vec::new()),
         pending_alerts: Mutex::new(Vec::new()),
         last_sync_ms: std::sync::atomic::AtomicI64::new(0),
@@ -640,6 +641,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::settings::status,
             commands::mail::list_threads,
+            commands::mail::sync_mailbox,
             commands::mail::thread_by_id,
             commands::windows::open_external,
             commands::compose::stage_attachment,

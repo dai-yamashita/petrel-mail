@@ -4,6 +4,7 @@ use crate::diag::log_sync;
 use crate::message_view::ViewTokens;
 use petrel_engine::blob::BlobStore;
 use petrel_engine::store::Store;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
@@ -71,6 +72,10 @@ pub(crate) struct AppState {
     /// Drafts edited since their last push to the server, for the 30-second
     /// debounce. A draft in here has exactly one push task sleeping on it.
     pub(crate) draft_dirty: Mutex<std::collections::HashSet<i64>>,
+    /// On-open folder fetches already running, keyed by the view
+    /// (`sent`, `folder:3`). Opening the same mailbox twice must not
+    /// stack IMAP sessions on it. Different mailboxes may overlap.
+    pub(crate) folder_sync_inflight: Mutex<HashSet<String>>,
     /// Arrivals a rule marked notify-anyway, waiting for the next status
     /// poll to carry them to the announcer. Drained on read: each is said
     /// once.
@@ -486,6 +491,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Arc<AppState> {
         outbox: Mutex::new(Vec::new()),
         draining: AtomicBool::new(false),
         draft_dirty: Mutex::new(std::collections::HashSet::new()),
+        folder_sync_inflight: Mutex::new(HashSet::new()),
         pending_notify: Mutex::new(Vec::new()),
         pending_alerts: Mutex::new(Vec::new()),
         last_sync_ms: std::sync::atomic::AtomicI64::new(0),

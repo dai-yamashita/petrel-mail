@@ -574,6 +574,14 @@ enum Scope {
     Inbox,
     /// Every folder, for the sweep that catches what other clients did.
     Everything,
+    /// One role folder, when the person opened that mailbox. Those
+    /// folders are not on the wake path, and waiting out the
+    /// five-minute sweep is what made opening them feel like the
+    /// server had not been asked.
+    Role(&'static str),
+    /// A folder the user made, addressed by row id — same reason as
+    /// Role, but user folders have no role to filter on.
+    FolderId(i64),
 }
 
 /// The targets a scope leaves.
@@ -591,6 +599,14 @@ fn narrow(targets: Vec<(String, String, i64)>, scope: Scope) -> Vec<(String, Str
             .into_iter()
             .filter(|(role, _, _)| role == "inbox")
             .collect(),
+        Scope::Role(want) => targets
+            .into_iter()
+            .filter(|(role, _, _)| role == want)
+            .collect(),
+        Scope::FolderId(want) => targets
+            .into_iter()
+            .filter(|(_, _, id)| *id == want)
+            .collect(),
     }
 }
 
@@ -603,6 +619,71 @@ struct CycleReport {
     failures: usize,
     attempted: usize,
     last_failure: Option<String>,
+}
+
+/// Folders that may be fetched when the person opens them. Inbox has
+/// IDLE. Archive is All Mail. Snoozed, outbox and tags have no folder
+/// to SELECT.
+const ON_OPEN_ROLES: &[&str] = &["sent", "drafts", "spam", "trash", "starred"];
+
+fn open_sync_scope(view: &str) -> Option<Scope> {
+    if let Some(role) = ON_OPEN_ROLES.iter().copied().find(|r| *r == view) {
+        return Some(Scope::Role(role));
+    }
+    view.strip_prefix("folder:")
+        .and_then(|rest| rest.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .map(Scope::FolderId)
+}
+
+fn claim_folder_sync(state: &AppState, key: &str) -> bool {
+    let Ok(mut set) = state.folder_sync_inflight.lock() else {
+        return false;
+    };
+    set.insert(key.to_string())
+}
+
+fn release_folder_sync(state: &AppState, key: &str) {
+    if let Ok(mut set) = state.folder_sync_inflight.lock() {
+        set.remove(key);
+    }
+}
+
+/// Fetches one folder now, without waiting for the sweep.
+///
+/// Opening Sent or Drafts used to show only what the last sweep had. A
+/// wake is the inbox alone, on purpose; putting every folder back on
+/// that path is the half-minute wait this split removed. One folder is
+/// the same cost as a wake.
+pub(crate) fn spawn_view_sync(state: Arc<AppState>, account: i64, view: &str) {
+    let Some(scope) = open_sync_scope(view) else {
+        return;
+    };
+    let key = view.to_string();
+    if !claim_folder_sync(&state, &key) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let cfg = {
+            let Ok(store) = state.store() else {
+                release_folder_sync(&state, &key);
+                return;
+            };
+            crate::config::imap_config_for(&store, account)
+        };
+        let Some(cfg) = cfg else {
+            release_folder_sync(&state, &key);
+            return;
+        };
+        let report = run_sync_cycle(&state, account, &cfg, false, scope).await;
+        if report.fresh > 0 {
+            log_sync(&format!("account {account} {key}: {} new", report.fresh));
+            state
+                .last_sync_ms
+                .store(crate::state::now_ms(), Ordering::Relaxed);
+        }
+        release_folder_sync(&state, &key);
+    });
 }
 
 /// One sync cycle for one account: every folder, one connection.
@@ -1549,14 +1630,18 @@ mod folder_survey_tests {
 
 #[cfg(test)]
 mod scope_tests {
-    use super::{Scope, narrow};
+    use super::{Scope, narrow, open_sync_scope};
 
     /// The shape `folders_to_sync` returns: (role, path, id), roles first.
     fn targets() -> Vec<(String, String, i64)> {
         [
             ("inbox", "INBOX", 1),
             ("sent", "Sent", 2),
+            ("drafts", "Drafts", 6),
+            ("spam", "Spam", 7),
             ("trash", "Trash", 3),
+            ("starred", "Starred", 8),
+            ("", "Contracts", 9),
             ("", "Archive", 4),
             ("", "Archive/2026", 5),
         ]
@@ -1574,7 +1659,51 @@ mod scope_tests {
 
     #[test]
     fn a_sweep_takes_everything() {
-        assert_eq!(narrow(targets(), Scope::Everything).len(), 5);
+        assert_eq!(narrow(targets(), Scope::Everything).len(), 9);
+    }
+
+    #[test]
+    fn opening_drafts_takes_that_folder_and_nothing_else() {
+        let out = narrow(targets(), Scope::Role("drafts"));
+        let paths: Vec<&str> = out.iter().map(|(_, p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["Drafts"]);
+    }
+
+    #[test]
+    fn opening_sent_takes_that_folder_and_nothing_else() {
+        let out = narrow(targets(), Scope::Role("sent"));
+        let paths: Vec<&str> = out.iter().map(|(_, p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["Sent"]);
+    }
+
+    #[test]
+    fn opening_a_user_folder_takes_that_id_and_nothing_else() {
+        let out = narrow(targets(), Scope::FolderId(9));
+        let paths: Vec<&str> = out.iter().map(|(_, p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["Contracts"]);
+    }
+
+    #[test]
+    fn opening_inbox_or_archive_does_not_ask_the_server() {
+        // Inbox has IDLE. Archive is All Mail, excluded from folders_to_sync
+        // so it must not grow a SELECT here either.
+        assert_eq!(open_sync_scope("inbox"), None);
+        assert_eq!(open_sync_scope("archive"), None);
+        assert_eq!(open_sync_scope("outbox"), None);
+        assert_eq!(open_sync_scope("snoozed"), None);
+        assert_eq!(open_sync_scope("tag:urgent"), None);
+    }
+
+    #[test]
+    fn opening_a_listed_mailbox_names_that_scope() {
+        assert_eq!(open_sync_scope("sent"), Some(Scope::Role("sent")));
+        assert_eq!(open_sync_scope("drafts"), Some(Scope::Role("drafts")));
+        assert_eq!(open_sync_scope("spam"), Some(Scope::Role("spam")));
+        assert_eq!(open_sync_scope("trash"), Some(Scope::Role("trash")));
+        assert_eq!(open_sync_scope("starred"), Some(Scope::Role("starred")));
+        assert_eq!(open_sync_scope("folder:9"), Some(Scope::FolderId(9)));
+        assert_eq!(open_sync_scope("folder:0"), None);
+        assert_eq!(open_sync_scope("folder:nope"), None);
     }
 
     #[test]

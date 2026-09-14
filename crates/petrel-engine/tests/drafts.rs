@@ -4,7 +4,7 @@
 //! folder, so the Drafts view and every triage action work on them without
 //! learning a second kind of thing.
 
-use petrel_engine::store::{ListView, Store, flags};
+use petrel_engine::store::{ListView, NewMessage, Sort, SortKey, Store, flags};
 
 fn store() -> (Store, i64) {
     let s = Store::open_in_memory().unwrap();
@@ -462,6 +462,178 @@ fn two_drafts_list_as_two_even_when_threaded_together() {
         .list_threads(&view, 0, 50, petrel_engine::store::Sort::default())
         .expect("list");
     assert_eq!(rows.len(), 2, "two drafts are two rows");
+}
+
+#[test]
+fn drafts_list_finds_a_few_among_many_inbox_messages() {
+    // The page used to walk every message looking for a drafts placement.
+    // A large inbox then made opening Drafts cost the mailbox, not the
+    // handful of drafts. The list must still return only those drafts.
+    let (mut s, account) = store();
+    let inbox = s.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let msgs: Vec<NewMessage> = (0..200)
+        .map(|i| NewMessage {
+            account_id: account,
+            date_ms: 10_000 + i,
+            from_addr: "a@example.com".into(),
+            from_display: "A".into(),
+            to_addr: "me@example.com".into(),
+            subject: format!("inbox-{i}"),
+            body_text: "body".into(),
+        })
+        .collect();
+    let ids = s.insert_messages(&msgs).unwrap();
+    for id in &ids {
+        s.place_message(*id, inbox).unwrap();
+    }
+    s.save_draft(account, None, "a@example.com", "old-draft", "one", "")
+        .unwrap();
+    s.save_draft(account, None, "a@example.com", "new-draft", "two", "")
+        .unwrap();
+
+    let rows = s
+        .list_threads(
+            &ListView::Folder("drafts".into()),
+            0,
+            50,
+            petrel_engine::store::Sort::default(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let subjects: Vec<&str> = rows.iter().map(|r| r.subject.as_str()).collect();
+    assert!(subjects.contains(&"old-draft"));
+    assert!(subjects.contains(&"new-draft"));
+    assert!(
+        !subjects.iter().any(|s| s.starts_with("inbox-")),
+        "inbox mail must not leak into the drafts list"
+    );
+}
+
+#[test]
+fn drafts_list_pages_from_the_cursor() {
+    let (s, account) = store();
+    for i in 0..5 {
+        s.save_draft(account, None, "a@example.com", &format!("d{i}"), "body", "")
+            .unwrap();
+    }
+    let sort = petrel_engine::store::Sort::default();
+    let first = s
+        .list_threads(&ListView::Folder("drafts".into()), 0, 2, sort)
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    let rest = s
+        .list_threads_after(
+            &ListView::Folder("drafts".into()),
+            2,
+            sort,
+            first[1].date_ms,
+            first[1].thread_id,
+        )
+        .unwrap();
+    assert_eq!(rest.len(), 2);
+    let first_ids: Vec<i64> = first.iter().map(|r| r.id).collect();
+    assert!(
+        !rest.iter().any(|r| first_ids.contains(&r.id)),
+        "the next page must not repeat the cursor page"
+    );
+}
+
+#[test]
+fn drafts_list_sorts_by_sender_among_inbox_mail() {
+    // Sender sort groups first, so the FROM clause is the whole cost.
+    // Starting from placements must still return only the drafts, and
+    // in from-name order, not the inbox mail that shares the mailbox.
+    let (mut s, account) = store();
+    let inbox = s.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let drafts = s.ensure_folder(account, "drafts", "Drafts").unwrap();
+    let inbox_msgs: Vec<NewMessage> = (0..80)
+        .map(|i| NewMessage {
+            account_id: account,
+            date_ms: 1_000 + i,
+            from_addr: "zzz@example.com".into(),
+            from_display: "Zzz".into(),
+            to_addr: "me@example.com".into(),
+            subject: format!("inbox-{i}"),
+            body_text: "body".into(),
+        })
+        .collect();
+    let inbox_ids = s.insert_messages(&inbox_msgs).unwrap();
+    for id in &inbox_ids {
+        s.place_message(*id, inbox).unwrap();
+    }
+    for (i, name) in ["Cam", "Amy", "Ben"].iter().enumerate() {
+        let ids = s
+            .insert_messages(&[NewMessage {
+                account_id: account,
+                date_ms: 20_000 + i as i64,
+                from_addr: format!("{}@example.com", name.to_ascii_lowercase()),
+                from_display: (*name).into(),
+                to_addr: "me@example.com".into(),
+                subject: format!("draft-{name}"),
+                body_text: "body".into(),
+            }])
+            .unwrap();
+        s.place_message(ids[0], drafts).unwrap();
+    }
+
+    let rows = s
+        .list_threads(
+            &ListView::Folder("drafts".into()),
+            0,
+            50,
+            Sort {
+                key: SortKey::Sender,
+                ascending: true,
+            },
+        )
+        .unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.from_display.as_str()).collect();
+    assert_eq!(names, ["Amy", "Ben", "Cam"]);
+}
+
+#[test]
+fn drafts_list_follows_a_vanished_sender_cursor() {
+    // The cursor draft may leave the folder between pages. The fallback
+    // that reads its sort key must still speak the messages table, not
+    // the placements join that named it `m`.
+    let (mut s, account) = store();
+    let drafts = s.ensure_folder(account, "drafts", "Drafts").unwrap();
+    for (i, name) in ["Amy", "Ben", "Cam", "Dan", "Eve"].iter().enumerate() {
+        let ids = s
+            .insert_messages(&[NewMessage {
+                account_id: account,
+                date_ms: 10_000 + i as i64,
+                from_addr: format!("{}@example.com", name.to_ascii_lowercase()),
+                from_display: (*name).into(),
+                to_addr: "me@example.com".into(),
+                subject: format!("d{i}"),
+                body_text: "body".into(),
+            }])
+            .unwrap();
+        s.place_message(ids[0], drafts).unwrap();
+    }
+    let sort = Sort {
+        key: SortKey::Sender,
+        ascending: true,
+    };
+    let view = ListView::Folder("drafts".into());
+    let all = s.list_threads(&view, 0, 20, sort).unwrap();
+    let first = s.list_threads(&view, 0, 2, sort).unwrap();
+    let cursor = first.last().unwrap().clone();
+    let expected: Vec<i64> = all
+        .iter()
+        .skip(2)
+        .map(|r| r.id)
+        .filter(|id| *id != cursor.id)
+        .collect();
+
+    s.remove_placement(cursor.id, account, "Drafts").unwrap();
+
+    let rest = s
+        .list_threads_after(&view, 10, sort, cursor.date_ms, cursor.thread_id)
+        .unwrap();
+    let ids: Vec<i64> = rest.iter().map(|r| r.id).collect();
+    assert_eq!(ids, expected);
 }
 
 #[test]
