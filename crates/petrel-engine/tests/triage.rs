@@ -1275,3 +1275,246 @@ fn an_exclusive_archive_keeps_the_uid_of_a_member_already_archived() {
     assert_eq!(store.placement_uid(ids[1], filed).unwrap(), Some(Some(21)));
     assert_eq!(store.folders_of(ids[1]).unwrap(), vec![filed]);
 }
+
+fn listed(store: &Store, view: ListView) -> Vec<i64> {
+    store
+        .list_threads(&view, 0, 50, petrel_engine::store::Sort::default())
+        .unwrap()
+        .into_iter()
+        .map(|t| t.thread_id)
+        .collect()
+}
+
+fn search_has(store: &Store, query: &str, thread: i64) -> bool {
+    store
+        .search_threads(query, 50)
+        .unwrap()
+        .iter()
+        .any(|t| t.thread_id == thread)
+}
+
+fn bin_only_message(
+    store: &mut Store,
+    blobs: &petrel_engine::blob::BlobStore,
+    account: i64,
+    dest: i64,
+) -> (i64, i64) {
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let ids = ingest_reply_chain(store, blobs, account, inbox, 1);
+    store.remove_placement(ids[0], account, "INBOX").unwrap();
+    store.place_message(ids[0], dest).unwrap();
+    (ids[0], thread_of(store, ids[0]))
+}
+
+/// The reported bug: Move to Inbox from Spam left the row gone in the UI
+/// and still sitting in spam in the store, so inbox search missed it and
+/// spam search found it again.
+#[test]
+fn moving_from_spam_to_inbox_files_the_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let spam = store.ensure_folder(account, "spam", "Junk").unwrap();
+    let (id, tid) = bin_only_message(&mut store, &blobs, account, spam);
+
+    let receipt = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(inbox),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(receipt.message_count, 1);
+    assert_eq!(store.folders_of(id).unwrap(), vec![inbox]);
+    assert!(
+        listed(&store, ListView::Inbox).contains(&tid),
+        "inbox listing must show it"
+    );
+    assert!(
+        !listed(&store, ListView::Folder("spam".into())).contains(&tid),
+        "spam listing must not"
+    );
+    assert!(search_has(&store, "shared in:inbox", tid));
+    assert!(!search_has(&store, "shared in:spam", tid));
+    let queued: Vec<i64> = store
+        .pending_actions(account)
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.action_id == receipt.action_id)
+        .map(|p| p.message_id)
+        .collect();
+    assert_eq!(queued, vec![id]);
+
+    assert!(store.undo_action(receipt.action_id).unwrap());
+    assert_eq!(store.folders_of(id).unwrap(), vec![spam]);
+}
+
+#[test]
+fn moving_from_trash_to_inbox_files_the_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let trash = store.ensure_folder(account, "trash", "Trash").unwrap();
+    let (id, tid) = bin_only_message(&mut store, &blobs, account, trash);
+
+    let receipt = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(inbox),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(receipt.message_count, 1);
+    assert_eq!(store.folders_of(id).unwrap(), vec![inbox]);
+    assert!(listed(&store, ListView::Inbox).contains(&tid));
+    assert!(!listed(&store, ListView::Folder("trash".into())).contains(&tid));
+    assert!(search_has(&store, "shared in:inbox", tid));
+    assert!(!search_has(&store, "shared in:trash", tid));
+}
+
+#[test]
+fn archiving_a_spam_only_conversation_leaves_the_bin() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let spam = store.ensure_folder(account, "spam", "Junk").unwrap();
+    let (id, tid) = bin_only_message(&mut store, &blobs, account, spam);
+
+    let receipt = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Archive,
+            None,
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(receipt.message_count, 1);
+    let archive = store.folder_for_role(account, "archive").unwrap().unwrap();
+    assert_eq!(store.folders_of(id).unwrap(), vec![archive]);
+    assert!(!listed(&store, ListView::Folder("spam".into())).contains(&tid));
+    assert!(listed(&store, ListView::Folder("archive".into())).contains(&tid));
+}
+
+#[test]
+fn archiving_a_spam_only_conversation_clears_spam_when_folders_are_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let spam = store
+        .ensure_folder(account, "spam", "[Gmail]/Spam")
+        .unwrap();
+    let archive = store
+        .ensure_folder(account, "archive", "[Gmail]/All Mail")
+        .unwrap();
+    let (id, tid) = bin_only_message(&mut store, &blobs, account, spam);
+
+    let receipt = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Archive,
+            None,
+            PlacementPolicy::Labels,
+        )
+        .unwrap();
+    assert_eq!(receipt.message_count, 1);
+    assert_eq!(store.folders_of(id).unwrap(), vec![archive]);
+    assert!(!listed(&store, ListView::Folder("spam".into())).contains(&tid));
+}
+
+#[test]
+fn archiving_a_mixed_thread_still_leaves_spam_where_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let spam = store.ensure_folder(account, "spam", "Junk").unwrap();
+    let ids = ingest_reply_chain(&mut store, &blobs, account, inbox, 2);
+    store.remove_placement(ids[1], account, "INBOX").unwrap();
+    store.place_message(ids[1], spam).unwrap();
+    let tid = thread_of(&store, ids[0]);
+
+    let r = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Archive,
+            None,
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(r.message_count, 1, "only the inbox message moved");
+    let archive = store.folder_for_role(account, "archive").unwrap().unwrap();
+    assert_eq!(store.folders_of(ids[0]).unwrap(), vec![archive]);
+    assert_eq!(
+        store.folders_of(ids[1]).unwrap(),
+        vec![spam],
+        "the junk copy stays in spam"
+    );
+}
+
+#[test]
+fn moving_a_mixed_thread_rescues_spam_and_leaves_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let sent = store.ensure_folder(account, "sent", "Sent").unwrap();
+    let spam = store.ensure_folder(account, "spam", "Junk").unwrap();
+    let dest = store.ensure_named_folder(account, "Projects").unwrap();
+    let ids = ingest_reply_chain(&mut store, &blobs, account, inbox, 3);
+    store.remove_placement(ids[1], account, "INBOX").unwrap();
+    store.place_message_at(ids[1], sent, 9).unwrap();
+    store.remove_placement(ids[2], account, "INBOX").unwrap();
+    store.place_message(ids[2], spam).unwrap();
+    let tid = thread_of(&store, ids[0]);
+
+    let r = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(dest),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(r.message_count, 2);
+    assert_eq!(store.folders_of(ids[0]).unwrap(), vec![dest]);
+    assert_eq!(
+        store.folders_of(ids[1]).unwrap(),
+        vec![sent],
+        "the reply stays in Sent"
+    );
+    assert_eq!(
+        store.folders_of(ids[2]).unwrap(),
+        vec![dest],
+        "spam is rescued to the destination"
+    );
+    let queued: Vec<i64> = store
+        .pending_actions(account)
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.action_id == r.action_id)
+        .map(|p| p.message_id)
+        .collect();
+    assert_eq!(queued, vec![ids[0], ids[2]]);
+}

@@ -660,6 +660,7 @@ palette-run = 実行
 palette-all-shortcuts = すべてのショートカット
 palette-more = 他 { $count } 件の結果
 triage-failed = 実行できませんでした: { $error }
+triage-not-applied = 移動するメールがありません。
 undo-done = 取り消しました
 undo-too-late = 取り消すには遅すぎます。すでにサーバーに送られました。
 triage-many = { $what } · { $count } 件のスレッド

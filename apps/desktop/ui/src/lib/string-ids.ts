@@ -658,6 +658,7 @@ export const STRING_IDS = [
   'palette-all-shortcuts',
   'palette-more',
   'triage-failed',
+  'triage-not-applied',
   'undo-done',
   'undo-too-late',
   'triage-many',
