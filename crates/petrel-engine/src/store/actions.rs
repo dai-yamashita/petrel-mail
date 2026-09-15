@@ -339,7 +339,11 @@ impl Store {
         // put left the row in the bin — the list is membership, and one
         // leftover copy is enough. Preferring Sent did the same. The rest
         // of a long thread is left alone: filing 108 inbox members queued
-        // MOVEs the server had no copy for.
+        // MOVEs the server had no copy for, and a sibling filed in a folder
+        // or archived stays there — pulling it out would undo a choice
+        // somebody made. The row can then still show in that folder's list;
+        // only the acting view could settle that, and the engine is not
+        // told it yet.
         //
         // Where folders are labels, archiving is one thing: taking the Inbox
         // label off. Your own reply carries it too — Gmail puts a reply in
@@ -370,9 +374,6 @@ impl Store {
             match (kind, policy) {
                 (ActionKind::Archive, crate::actions::PlacementPolicy::Labels) => {
                     self.thread_ids_kept_from_labels_archive(thread_id)?
-                }
-                (ActionKind::Move, _) if dest_is_inbox => {
-                    self.thread_ids_in_roles(thread_id, "'sent','drafts'")?
                 }
                 (ActionKind::Archive | ActionKind::Move, _) => {
                     self.thread_ids_in_roles(thread_id, "'sent','drafts','trash','spam'")?

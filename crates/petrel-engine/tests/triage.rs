@@ -1554,6 +1554,51 @@ fn moving_from_spam_to_inbox_takes_a_sent_copy_that_is_also_junked() {
     assert!(!listed(&store, ListView::Folder("spam".into())).contains(&tid));
 }
 
+/// Move to Inbox from a bin takes the binned members and nothing else. A
+/// sibling filed in a folder stays filed: pulling it out would undo a choice
+/// somebody made and move a server copy nobody asked about.
+#[test]
+fn moving_to_inbox_from_a_bin_leaves_a_filed_sibling_filed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let trash = store.ensure_folder(account, "trash", "Trash").unwrap();
+    let filed = store.ensure_named_folder(account, "Projects").unwrap();
+    let ids = ingest_reply_chain(&mut store, &blobs, account, inbox, 2);
+    store.remove_placement(ids[0], account, "INBOX").unwrap();
+    store.place_message_at(ids[0], filed, 4).unwrap();
+    store.remove_placement(ids[1], account, "INBOX").unwrap();
+    store.place_message_at(ids[1], trash, 7).unwrap();
+    let tid = thread_of(&store, ids[0]);
+
+    let r = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(inbox),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(r.message_count, 1, "the trashed member only");
+    assert_eq!(store.folders_of(ids[0]).unwrap(), vec![filed]);
+    assert_eq!(store.folders_of(ids[1]).unwrap(), vec![inbox]);
+    assert!(listed(&store, ListView::Inbox).contains(&tid));
+    assert!(!listed(&store, ListView::Folder("trash".into())).contains(&tid));
+    assert!(listed(&store, ListView::UserFolder(filed)).contains(&tid));
+    let queued: Vec<i64> = store
+        .pending_actions(account)
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.action_id == r.action_id)
+        .map(|p| p.message_id)
+        .collect();
+    assert_eq!(queued, vec![ids[1]]);
+}
+
 #[test]
 fn archiving_a_spam_only_conversation_leaves_the_bin() {
     let dir = tempfile::tempdir().unwrap();
