@@ -212,9 +212,36 @@ export function useTriage(opts: {
         );
       }
 
+      const putRowBack = () => {
+        if (bump) onTagCount?.(bump.tagId, -bump.delta);
+        if (movedAny) onViewCount?.(negated(moved));
+        setItems((prev) => {
+          if (!removes) return prev.map((m) => (m.id === row.id ? row : m));
+          if (prev.some((m) => m.id === row.id)) return prev;
+          const at = Math.min(atIndex, prev.length);
+          return [...prev.slice(0, at), row, ...prev.slice(at)];
+        });
+        if (removes && row.id === activeId) setActiveId(row.id);
+      };
+
       setPending(true);
       try {
         const receipt = await api.triage(row.thread_id, kind, targetId);
+        // Move and archive from a bin used to return this empty receipt while
+        // the list had already dropped the row. Treating it as success left
+        // the conversation gone here and still in spam the next time search
+        // asked. mark_read of an already-read thread is the same shape, but
+        // it never removes a row.
+        if (
+          (kind === 'move' || kind === 'archive') &&
+          receipt.action_id === 0 &&
+          receipt.message_count === 0
+        ) {
+          void api.log(JSON.stringify({ kind: 'triage', stage: 'not-applied', k }));
+          putRowBack();
+          if (!quiet) onMessage(t('triage-not-applied'));
+          return;
+        }
         void api.log(JSON.stringify({ kind: 'triage', stage: 'ok', id: receipt.action_id }));
         // Quiet actions still queue for the server — the server has to learn
         // that you read it — but they announce nothing and offer no undo.
@@ -239,8 +266,6 @@ export function useTriage(opts: {
           onMessage(receipt.description, offer);
         }
       } catch (err) {
-        if (bump) onTagCount?.(bump.tagId, -bump.delta);
-        if (movedAny) onViewCount?.(negated(moved));
         if (quiet) {
           // Nothing was optimistically removed for a quiet action, so there is
           // nothing to roll back; log it and leave the row as it was.
@@ -254,13 +279,7 @@ export function useTriage(opts: {
         // than one that never moved. Only this row: restoring the whole list
         // as it stood before the call used to bring back the siblings of a
         // batch that had already succeeded, and drop any page merged since.
-        setItems((prev) => {
-          if (!removes) return prev.map((m) => (m.id === row.id ? row : m));
-          if (prev.some((m) => m.id === row.id)) return prev;
-          const at = Math.min(atIndex, prev.length);
-          return [...prev.slice(0, at), row, ...prev.slice(at)];
-        });
-        if (removes && row.id === activeId) setActiveId(row.id);
+        putRowBack();
         onMessage(t('triage-failed', { error: String(err) }));
       } finally {
         setPending(false);

@@ -317,12 +317,17 @@ impl Store {
             ActionKind::MarkUnread => format!(" AND flags & {} != 0", flags::SEEN),
             _ => String::new(),
         };
-        // Archive and Move take a message out of the inbox or a folder. They
-        // do not take your own replies out of Sent, or pull a message out of
-        // the bin: a thread-wide archive used to relocate every message in
-        // the conversation, wherever it sat, and the drain then moved your
-        // Sent copy to Archive on the server. Bins are exclusive whatever the
-        // provider, so Trash and Spam still take everything.
+        // Archive takes a message out of the inbox. It does not take your own
+        // replies out of Sent, or pull a message out of the bin on a mixed
+        // conversation: a thread-wide archive used to relocate every message,
+        // wherever it sat, and the drain then moved the Sent copy to Archive
+        // on the server. Trash and Spam still take everything, because bins
+        // are exclusive whatever the provider.
+        //
+        // Move names a destination. Sent and drafts stay put — that is the
+        // accident above — but spam and trash go with it. "Move to Inbox"
+        // from the bin is that item's job; excluding those members left the
+        // row gone from the list and still answering `in:spam`.
         //
         // Where folders are labels, archiving is one thing: taking the Inbox
         // label off. Your own reply carries it too — Gmail puts a reply in
@@ -333,55 +338,36 @@ impl Store {
         // an inbox placement, Sent or not; the rest have nothing to lose and
         // are left alone, which is also what keeps the drain from moving a
         // Sent copy anywhere.
+        //
+        // A conversation that lives only in a bin is the other case: there
+        // is no inbox member to archive, and leaving it there makes Archive
+        // from Spam a no-op. Then we take the binned members, still not Sent
+        // or drafts.
         let kept_where_they_are: Vec<i64> = match (kind, policy) {
             (ActionKind::Archive, crate::actions::PlacementPolicy::Labels) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT m.id FROM messages m
-                     WHERE coalesce(m.thread_id, -m.id) = ?1 AND m.deleted_at_ms IS NULL
-                       AND (EXISTS (SELECT 1 FROM placements p
-                                    JOIN folders f ON f.id = p.folder_id
-                                    WHERE p.message_id = m.id
-                                      AND f.role IN ('drafts','trash','spam'))
-                            OR NOT EXISTS (SELECT 1 FROM placements p
-                                           JOIN folders f ON f.id = p.folder_id
-                                           WHERE p.message_id = m.id AND f.role = 'inbox'))",
-                )?;
-                stmt.query_map(params![thread_id], |r| r.get(0))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?
+                self.thread_ids_kept_from_labels_archive(thread_id)?
             }
-            (ActionKind::Archive | ActionKind::Move, _) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT DISTINCT m.id FROM messages m
-                     JOIN placements p ON p.message_id = m.id
-                     JOIN folders f ON f.id = p.folder_id
-                     WHERE coalesce(m.thread_id, -m.id) = ?1 AND m.deleted_at_ms IS NULL
-                       AND f.role IN ('sent','drafts','trash','spam')",
-                )?;
-                stmt.query_map(params![thread_id], |r| r.get(0))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?
+            (ActionKind::Archive, _) => {
+                self.thread_ids_in_roles(thread_id, "'sent','drafts','trash','spam'")?
             }
+            (ActionKind::Move, _) => self.thread_ids_in_roles(thread_id, "'sent','drafts'")?,
             _ => Vec::new(),
         };
-        let exclude = |column: &str| {
-            if kept_where_they_are.is_empty() {
+        let exclude = |column: &str, kept: &[i64]| {
+            if kept.is_empty() {
                 String::new()
             } else {
-                let list: Vec<String> = kept_where_they_are.iter().map(|i| i.to_string()).collect();
+                let list: Vec<String> = kept.iter().map(|i| i.to_string()).collect();
                 format!(" AND {column} NOT IN ({})", list.join(","))
             }
         };
-        let bare_filter = format!("{flag_filter}{}", exclude("id"));
-        let aliased_filter = format!("{flag_filter}{}", exclude("m.id"));
-        let ids: Vec<i64> = {
-            let sql = format!(
-                "SELECT id FROM messages
-                 WHERE coalesce(thread_id, -id) = ?1 AND deleted_at_ms IS NULL{bare_filter}
-                 ORDER BY id"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            stmt.query_map(params![thread_id], |r| r.get(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
+        let mut ids: Vec<i64> = self.thread_message_ids(
+            thread_id,
+            &format!("{flag_filter}{}", exclude("id", &kept_where_they_are)),
+        )?;
+        if ids.is_empty() && matches!(kind, ActionKind::Archive) {
+            ids = self.thread_ids_in_bin_for_rescue(thread_id, &flag_filter)?;
+        }
         if ids.is_empty() {
             return Ok(ActionReceipt {
                 action_id: 0,
@@ -390,6 +376,8 @@ impl Store {
                 description: kind.past_tense().to_string(),
             });
         }
+        let bare_filter = format!("{flag_filter}{}", sql_id_in("id", &ids));
+        let aliased_filter = format!("{flag_filter}{}", sql_id_in("m.id", &ids));
 
         // Captured *before* anything changes: undo restores what was, rather
         // than guessing an inverse — which breaks as soon as two actions touch
@@ -522,6 +510,15 @@ impl Store {
                             "DELETE FROM placements
                              WHERE message_id = ?1
                                AND folder_id IN (SELECT id FROM folders WHERE role = 'inbox')",
+                            params![id],
+                        )?;
+                        // A conversation rescued from the bin has no inbox
+                        // label to lose. Leaving the spam or trash placement
+                        // would keep it in that listing after we add archive.
+                        self.conn.execute(
+                            "DELETE FROM placements
+                             WHERE message_id = ?1
+                               AND folder_id IN (SELECT id FROM folders WHERE role IN ('spam','trash'))",
                             params![id],
                         )?;
                     }
@@ -794,6 +791,71 @@ impl Store {
             if reached > 0 { "sent" } else { "undeliverable" },
         )?;
         Ok(true)
+    }
+
+    fn thread_message_ids(&self, thread_id: i64, extra: &str) -> Result<Vec<i64>> {
+        let sql = format!(
+            "SELECT id FROM messages
+             WHERE coalesce(thread_id, -id) = ?1 AND deleted_at_ms IS NULL{extra}
+             ORDER BY id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(params![thread_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn thread_ids_in_roles(&self, thread_id: i64, roles_sql: &str) -> Result<Vec<i64>> {
+        let sql = format!(
+            "SELECT DISTINCT m.id FROM messages m
+             JOIN placements p ON p.message_id = m.id
+             JOIN folders f ON f.id = p.folder_id
+             WHERE coalesce(m.thread_id, -m.id) = ?1 AND m.deleted_at_ms IS NULL
+               AND f.role IN ({roles_sql})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(params![thread_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn thread_ids_kept_from_labels_archive(&self, thread_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id FROM messages m
+             WHERE coalesce(m.thread_id, -m.id) = ?1 AND m.deleted_at_ms IS NULL
+               AND (EXISTS (SELECT 1 FROM placements p
+                            JOIN folders f ON f.id = p.folder_id
+                            WHERE p.message_id = m.id
+                              AND f.role IN ('drafts','trash','spam'))
+                    OR NOT EXISTS (SELECT 1 FROM placements p
+                                   JOIN folders f ON f.id = p.folder_id
+                                   WHERE p.message_id = m.id AND f.role = 'inbox'))",
+        )?;
+        Ok(stmt
+            .query_map(params![thread_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Members sitting in spam or trash, and not in Sent or drafts. Used when
+    /// an archive would otherwise touch nobody — a conversation that lives
+    /// only in a bin.
+    fn thread_ids_in_bin_for_rescue(&self, thread_id: i64, flag_filter: &str) -> Result<Vec<i64>> {
+        let sql = format!(
+            "SELECT DISTINCT m.id FROM messages m
+             JOIN placements p ON p.message_id = m.id
+             JOIN folders f ON f.id = p.folder_id
+             WHERE coalesce(m.thread_id, -m.id) = ?1 AND m.deleted_at_ms IS NULL
+               AND f.role IN ('trash','spam')
+               AND NOT EXISTS (
+                   SELECT 1 FROM placements p2
+                   JOIN folders f2 ON f2.id = p2.folder_id
+                   WHERE p2.message_id = m.id AND f2.role IN ('sent','drafts')
+               ){flag_filter}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(params![thread_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Priors for every message an action will touch, in one pass per table.
@@ -1449,4 +1511,9 @@ impl Store {
         }
         Ok(changed)
     }
+}
+
+fn sql_id_in(column: &str, ids: &[i64]) -> String {
+    let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+    format!(" AND {column} IN ({})", list.join(","))
 }

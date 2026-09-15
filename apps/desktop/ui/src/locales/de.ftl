@@ -699,6 +699,7 @@ palette-more = { $count ->
    *[other] { $count } weitere Ergebnisse
 }
 triage-failed = Das war nicht möglich: { $error }
+triage-not-applied = Nichts zu verschieben.
 undo-done = Widerrufen
 undo-too-late = Zu spät zum Widerrufen. Das ist bereits an den Server gegangen.
 triage-many = { $what } · { $count } Konversationen
