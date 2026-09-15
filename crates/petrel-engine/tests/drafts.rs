@@ -4,7 +4,26 @@
 //! folder, so the Drafts view and every triage action work on them without
 //! learning a second kind of thing.
 
+use petrel_engine::actions::{ActionKind, PlacementPolicy};
 use petrel_engine::store::{ListView, NewMessage, Sort, SortKey, Store, flags};
+
+fn thread_of(store: &Store, id: i64) -> i64 {
+    store.thread_of(id).unwrap().unwrap_or(-id)
+}
+
+fn listed(store: &Store, role: &str) -> Vec<i64> {
+    store
+        .list_threads(
+            &ListView::Folder(role.into()),
+            0,
+            50,
+            petrel_engine::store::Sort::default(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect()
+}
 
 fn store() -> (Store, i64) {
     let s = Store::open_in_memory().unwrap();
@@ -120,6 +139,74 @@ fn deleting_a_draft_removes_it() {
         .unwrap()
         .is_empty()
     );
+}
+
+#[test]
+fn trashing_a_draft_takes_it_out_of_drafts() {
+    let (s, account) = store();
+    let id = s
+        .save_draft(account, None, "a@example.com", "S", "b", "")
+        .unwrap();
+    s.apply_thread_action(
+        account,
+        thread_of(&s, id),
+        ActionKind::Trash,
+        None,
+        PlacementPolicy::Exclusive,
+    )
+    .unwrap();
+
+    assert!(
+        listed(&s, "drafts").is_empty(),
+        "a trashed draft must leave the Drafts list"
+    );
+    assert_eq!(listed(&s, "trash"), vec![id]);
+}
+
+#[test]
+fn saving_a_trashed_draft_does_not_put_it_back_in_drafts() {
+    let (s, account) = store();
+    let id = s
+        .save_draft(account, None, "a@example.com", "S", "one", "")
+        .unwrap();
+    s.apply_thread_action(
+        account,
+        thread_of(&s, id),
+        ActionKind::Trash,
+        None,
+        PlacementPolicy::Exclusive,
+    )
+    .unwrap();
+    s.save_draft(account, Some(id), "a@example.com", "S", "two", "")
+        .unwrap();
+
+    assert!(
+        listed(&s, "drafts").is_empty(),
+        "autosave after trash must not re-file the row in Drafts"
+    );
+    assert_eq!(listed(&s, "trash"), vec![id]);
+    assert_eq!(s.load_draft(id).unwrap().body, "two");
+}
+
+#[test]
+fn saving_a_spammed_draft_does_not_put_it_back_in_drafts() {
+    let (s, account) = store();
+    let id = s
+        .save_draft(account, None, "a@example.com", "S", "one", "")
+        .unwrap();
+    s.apply_thread_action(
+        account,
+        thread_of(&s, id),
+        ActionKind::Spam,
+        None,
+        PlacementPolicy::Exclusive,
+    )
+    .unwrap();
+    s.save_draft(account, Some(id), "a@example.com", "S", "two", "")
+        .unwrap();
+
+    assert!(listed(&s, "drafts").is_empty());
+    assert_eq!(listed(&s, "spam"), vec![id]);
 }
 
 /// Send later: a draft with a time on it.

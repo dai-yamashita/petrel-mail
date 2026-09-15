@@ -372,6 +372,7 @@ storage-export-button = 書き出す…
 accounts-yours = あなたのアカウント
 account-switch-failed = アカウントを切り替えられませんでした: { $error }
 account-switch-draft-failed = 開いている下書きを保存できなかったため、アカウントを切り替えませんでした: { $error }
+view-switch-draft-failed = 開いている下書きを保存できなかったため、フォルダを開きませんでした: { $error }
 accounts-add = アカウントを追加
 accounts-remove = アカウントを削除
 accounts-remove-help = このアカウントとそのメール、パスワードを削除します。サーバー上は変わりません。

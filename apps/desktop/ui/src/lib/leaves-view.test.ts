@@ -21,6 +21,8 @@ describe('leavesView for the rest', () => {
   it('is unchanged for the bins, archiving and the marks', () => {
     expect(leavesView('delete_forever', 'starred')).toBe(true);
     expect(leavesView('trash', 'starred')).toBe(true);
+    expect(leavesView('trash', 'drafts')).toBe(true);
+    expect(leavesView('spam', 'drafts')).toBe(true);
     expect(leavesView('trash', 'trash')).toBe(false);
     expect(leavesView('archive', 'inbox')).toBe(true);
     expect(leavesView('archive', 'starred')).toBe(false);

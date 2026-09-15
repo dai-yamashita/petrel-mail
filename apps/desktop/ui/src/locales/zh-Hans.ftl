@@ -372,6 +372,7 @@ storage-export-button = 导出…
 accounts-yours = 你的账户
 account-switch-failed = 无法切换账户：{ $error }
 account-switch-draft-failed = 无法保存打开的草稿，因此未切换账户：{ $error }
+view-switch-draft-failed = 无法保存打开的草稿，因此未打开该邮箱：{ $error }
 accounts-add = 添加账户
 accounts-remove = 移除账户
 accounts-remove-help = 移除此账户及其邮件和密码。服务器上的内容不变。

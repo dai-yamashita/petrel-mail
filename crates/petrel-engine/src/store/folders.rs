@@ -608,6 +608,19 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Whether this message currently sits in a folder of the given role.
+    pub fn message_in_role(&self, message_id: i64, role: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM placements p
+               JOIN folders f ON f.id = p.folder_id
+               WHERE p.message_id = ?1 AND f.role = ?2
+             )",
+            params![message_id, role],
+            |r| r.get::<_, i64>(0),
+        )? == 1)
+    }
+
     /// How this account's provider models placement.
     ///
     /// Derived from the account kind rather than sniffed per action, so every

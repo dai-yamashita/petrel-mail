@@ -424,6 +424,7 @@ storage-export-button = Exportar…
 accounts-yours = Tus cuentas
 account-switch-failed = No se pudo cambiar de cuenta: { $error }
 account-switch-draft-failed = No se pudo guardar el borrador abierto, así que no se cambió de cuenta: { $error }
+view-switch-draft-failed = No se pudo guardar el borrador abierto, así que no se abrió el buzón: { $error }
 accounts-add = Añadir cuenta
 accounts-remove = Eliminar cuenta
 accounts-remove-help = Elimina esta cuenta, su correo y su contraseña. Nada cambia en el servidor.

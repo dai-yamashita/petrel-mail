@@ -403,6 +403,7 @@ storage-export-button = Exportar…
 accounts-yours = Suas contas
 account-switch-failed = Não foi possível trocar de conta: { $error }
 account-switch-draft-failed = Não foi possível salvar o rascunho aberto, então a conta não foi trocada: { $error }
+view-switch-draft-failed = Não foi possível salvar o rascunho aberto, então a caixa não foi aberta: { $error }
 accounts-add = Adicionar conta
 accounts-remove = Remover conta
 accounts-remove-help = Remove esta conta, o e-mail e a senha. Nada muda no servidor.
