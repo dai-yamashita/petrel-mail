@@ -149,3 +149,51 @@ fn snoozed_list_finds_a_few_among_many_inbox_messages() {
 
     assert_eq!(subjects(&s, &ListView::Snoozed), ["inbox-8"]);
 }
+
+/// A tag's name is unique per account, not per store. The tag page used to
+/// collect the other account's conversations too, and since the row query
+/// keeps the account, they took up the page and then vanished from it: an
+/// account with three Urgent conversations opened the tag and saw none.
+#[test]
+fn a_tag_list_stays_inside_the_active_account() {
+    let (mut s, mine) = store();
+    let theirs = s.ensure_test_account().unwrap();
+    s.set_active_account(mine).unwrap();
+    let my_ids = fill_inbox(&mut s, mine, 10);
+    let their_inbox = s.ensure_folder(theirs, "inbox", "INBOX").unwrap();
+    // Newer than mine, and more than a page of them, so a walk that forgot
+    // the account would fill the page with theirs and mine would fall off.
+    let their_msgs: Vec<NewMessage> = (0..60)
+        .map(|i| NewMessage {
+            account_id: theirs,
+            date_ms: 50_000 + i,
+            from_addr: "c@example.com".into(),
+            from_display: "C".into(),
+            to_addr: "them@example.com".into(),
+            subject: format!("theirs-{i}"),
+            body_text: "body".into(),
+        })
+        .collect();
+    let their_ids = s.insert_messages(&their_msgs).unwrap();
+    for id in &their_ids {
+        s.place_message(*id, their_inbox).unwrap();
+    }
+    let my_tag = s.ensure_tag(mine, "Urgent", None).unwrap();
+    let their_tag = s.ensure_tag(theirs, "Urgent", None).unwrap();
+    for id in &my_ids[..3] {
+        s.tag_message(*id, my_tag).unwrap();
+    }
+    for id in &their_ids {
+        s.tag_message(*id, their_tag).unwrap();
+    }
+
+    let view = ListView::Tag("Urgent".into());
+    let mut found = subjects(&s, &view);
+    found.sort();
+    assert_eq!(found, ["inbox-0", "inbox-1", "inbox-2"]);
+    assert_eq!(
+        s.count_view(&view, true).unwrap(),
+        3,
+        "the count and the page must agree"
+    );
+}

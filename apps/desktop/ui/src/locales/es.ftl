@@ -722,6 +722,7 @@ palette-more = { $count ->
 }
 triage-failed = No se pudo hacer eso: { $error }
 triage-not-applied = Nada que mover.
+triage-nothing-to-archive = Nada que archivar.
 undo-done = Deshecho
 undo-too-late = Demasiado tarde para deshacerlo. Eso ya fue al servidor.
 triage-many = { $what } · { $count } conversaciones

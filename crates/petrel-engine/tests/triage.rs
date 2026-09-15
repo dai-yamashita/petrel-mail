@@ -1470,8 +1470,11 @@ fn archiving_a_mixed_thread_still_leaves_spam_where_it_is() {
     );
 }
 
+/// Filing a conversation from the inbox leaves its Sent copy and its junked
+/// reply where they are: on Gmail a trashed thread that gains a reply has
+/// inbox and trash members, and the move must not un-trash the rest.
 #[test]
-fn moving_a_mixed_thread_rescues_spam_and_leaves_sent() {
+fn moving_a_mixed_thread_leaves_sent_and_spam_where_they_are() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(&dir.path().join("t.db")).unwrap();
     let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
@@ -1497,7 +1500,7 @@ fn moving_a_mixed_thread_rescues_spam_and_leaves_sent() {
             PlacementPolicy::Exclusive,
         )
         .unwrap();
-    assert_eq!(r.message_count, 2);
+    assert_eq!(r.message_count, 1, "only the inbox message moved");
     assert_eq!(store.folders_of(ids[0]).unwrap(), vec![dest]);
     assert_eq!(
         store.folders_of(ids[1]).unwrap(),
@@ -1506,8 +1509,8 @@ fn moving_a_mixed_thread_rescues_spam_and_leaves_sent() {
     );
     assert_eq!(
         store.folders_of(ids[2]).unwrap(),
-        vec![dest],
-        "spam is rescued to the destination"
+        vec![spam],
+        "the junked reply stays in spam"
     );
     let queued: Vec<i64> = store
         .pending_actions(account)
@@ -1516,5 +1519,80 @@ fn moving_a_mixed_thread_rescues_spam_and_leaves_sent() {
         .filter(|p| p.action_id == r.action_id)
         .map(|p| p.message_id)
         .collect();
-    assert_eq!(queued, vec![ids[0], ids[2]]);
+    assert_eq!(queued, vec![ids[0]]);
+}
+
+/// From Sent, Move names the sent copy. The mixed-thread rule kept it out,
+/// so a conversation you wrote had nothing left to move and the row simply
+/// vanished from the list.
+#[test]
+fn moving_a_sent_only_conversation_files_the_sent_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let sent = store.ensure_folder(account, "sent", "Sent").unwrap();
+    let dest = store.ensure_named_folder(account, "Projects").unwrap();
+    let ids = ingest_reply_chain(&mut store, &blobs, account, inbox, 1);
+    store.remove_placement(ids[0], account, "INBOX").unwrap();
+    store.place_message_at(ids[0], sent, 9).unwrap();
+    let tid = thread_of(&store, ids[0]);
+
+    let r = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(dest),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(r.message_count, 1);
+    assert_eq!(store.folders_of(ids[0]).unwrap(), vec![dest]);
+    assert!(listed(&store, ListView::UserFolder(dest)).contains(&tid));
+    assert!(!listed(&store, ListView::Folder("sent".into())).contains(&tid));
+    let queued: Vec<i64> = store
+        .pending_actions(account)
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.action_id == r.action_id)
+        .map(|p| p.message_id)
+        .collect();
+    assert_eq!(queued, vec![ids[0]]);
+}
+
+/// A sent copy and a junked reply and nothing else: the sent copy is what
+/// moves, and the junk stays junk.
+#[test]
+fn moving_a_conversation_in_sent_and_spam_takes_the_sent_copy_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let sent = store.ensure_folder(account, "sent", "Sent").unwrap();
+    let spam = store.ensure_folder(account, "spam", "Junk").unwrap();
+    let dest = store.ensure_named_folder(account, "Projects").unwrap();
+    let ids = ingest_reply_chain(&mut store, &blobs, account, inbox, 2);
+    store.remove_placement(ids[0], account, "INBOX").unwrap();
+    store.place_message_at(ids[0], sent, 9).unwrap();
+    store.remove_placement(ids[1], account, "INBOX").unwrap();
+    store.place_message(ids[1], spam).unwrap();
+    let tid = thread_of(&store, ids[0]);
+
+    let r = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(dest),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(r.message_count, 1);
+    assert_eq!(store.folders_of(ids[0]).unwrap(), vec![dest]);
+    assert_eq!(store.folders_of(ids[1]).unwrap(), vec![spam]);
 }

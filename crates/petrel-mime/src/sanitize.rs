@@ -181,12 +181,14 @@ fn filter_style(value: &str) -> String {
         {
             continue;
         }
-        // Viewport units size the message to the iframe window. The frame is
-        // then told not to scroll, so the rest of the body is clipped with no
-        // way to reach it. Pixel and percent heights stay: they hold a layout
-        // apart, and percent resolves against auto-height parents, not the
-        // window, once the document shell says `height: auto`.
-        if matches!(prop_norm.as_str(), "height" | "max-height") && is_viewport_sized(val_trim) {
+        // Viewport heights size the message to the iframe window, and the
+        // window is sized to the message: a `100vh` wrapper and the frame
+        // chase each other up to the host's cap. Any property, not only
+        // `height` — a font size, a line height or a padding in vh grows the
+        // same way. `vw` stays: the width is the pane's, never the content's.
+        // Pixel and percent heights stay too; percent resolves against
+        // auto-height parents, not the window.
+        if is_viewport_sized(val_trim) {
             continue;
         }
         kept.push(format!("{prop_norm}: {val_trim}"));
@@ -194,19 +196,29 @@ fn filter_style(value: &str) -> String {
     kept.join("; ")
 }
 
-/// CSS viewport units in a length, including inside `calc()`.
+/// A length in viewport heights — vh, vmin, vmax, their dynamic forms
+/// (dvh, svh, lvh) — anywhere in the value, `calc()` included.
 fn is_viewport_sized(val: &str) -> bool {
     let v = val.to_ascii_lowercase();
-    for unit in ["vmin", "vmax", "vh", "vw"] {
-        let mut rest = v.as_str();
-        while let Some(i) = rest.find(unit) {
-            let after = i + unit.len();
-            let before_ok = i == 0 || !rest.as_bytes()[i - 1].is_ascii_alphabetic();
-            let after_ok = after == rest.len() || !rest.as_bytes()[after].is_ascii_alphabetic();
-            if before_ok && after_ok {
+    let b = v.as_bytes();
+    for unit in ["vmin", "vmax", "vh"] {
+        let mut from = 0;
+        while let Some(i) = v[from..].find(unit) {
+            let at = from + i;
+            let after = at + unit.len();
+            // `10vh`, `10dvh`; never `avh` or `vhs`: a number has to sit in
+            // front, an optional d/s/l between, and no letter behind.
+            let mut before = at;
+            if before > 0 && matches!(b[before - 1], b'd' | b's' | b'l') {
+                before -= 1;
+            }
+            let number_before =
+                before > 0 && (b[before - 1].is_ascii_digit() || b[before - 1] == b'.');
+            let letter_after = after < b.len() && b[after].is_ascii_alphabetic();
+            if number_before && !letter_after {
                 return true;
             }
-            rest = &rest[after..];
+            from = after;
         }
     }
     false
@@ -763,6 +775,31 @@ mod tests {
 
         let img = clean(r#"<img src="cid:part1" width="320" height="15">"#);
         assert!(img.contains("height=\"15\""), "{img}");
+    }
+
+    /// The chase is not a property of `height`: anything the window sizes
+    /// grows the message when the window grows.
+    #[test]
+    fn viewport_heights_are_dropped_from_every_property() {
+        let out = clean(
+            r#"<p style="font-size: 10vh; line-height: 100vh; padding-top: 50vmin;
+                          margin-bottom: 20dvh; margin-top: 4px; width: 50vw">x</p>"#,
+        );
+        assert!(!out.contains("10vh"), "{out}");
+        assert!(!out.contains("100vh"), "{out}");
+        assert!(!out.contains("50vmin"), "{out}");
+        assert!(!out.contains("20dvh"), "{out}");
+        assert!(out.contains("margin-top: 4px"), "{out}");
+        assert!(out.contains("width: 50vw"), "{out}");
+
+        assert!(is_viewport_sized("100vh"));
+        assert!(is_viewport_sized("calc(100vh - 10px)"));
+        assert!(is_viewport_sized("1.5svh"));
+        assert!(is_viewport_sized("50VMAX"));
+        assert!(!is_viewport_sized("80vw"));
+        assert!(!is_viewport_sized("15px"));
+        assert!(!is_viewport_sized("vh"));
+        assert!(!is_viewport_sized("avh"));
     }
 
     #[test]

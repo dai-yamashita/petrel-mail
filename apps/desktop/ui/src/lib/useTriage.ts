@@ -68,6 +68,12 @@ function negated(deltas: Record<string, number>): Record<string, number> {
   return Object.fromEntries(Object.entries(deltas).map(([k, d]) => [k, -d]));
 }
 
+/** What to say when the store found nothing to act on. Archive has its own
+ *  word; everything else that can come back empty is a move. */
+function notAppliedText(kind: ActionKind): 'triage-nothing-to-archive' | 'triage-not-applied' {
+  return kind === 'archive' ? 'triage-nothing-to-archive' : 'triage-not-applied';
+}
+
 export function useTriage(opts: {
   items: Thread[];
   setItems: (fn: (prev: Thread[]) => Thread[]) => void;
@@ -130,6 +136,9 @@ export function useTriage(opts: {
   // While a batch runs, each row's undo offer is collected here instead of
   // becoming the toast, so the batch can offer them all at once.
   const collecting = useRef<UndoOffer[] | null>(null);
+  // Rows a batch put back because the store found nothing to act on. The
+  // batch says so once, rather than once per row.
+  const notApplied = useRef(0);
 
   const run = useCallback(
     async (kind: ActionKind, threadId?: number, targetId?: number, quiet = false) => {
@@ -245,7 +254,8 @@ export function useTriage(opts: {
         ) {
           void api.log(JSON.stringify({ kind: 'triage', stage: 'not-applied', k }));
           putRowBack();
-          if (!quiet) onMessage(t('triage-not-applied'));
+          notApplied.current += 1;
+          if (!quiet && !collecting.current) onMessage(t(notAppliedText(kind)));
           return;
         }
         void api.log(JSON.stringify({ kind: 'triage', stage: 'ok', id: receipt.action_id }));
@@ -331,14 +341,20 @@ export function useTriage(opts: {
         : null;
       const offers: UndoOffer[] = [];
       collecting.current = offers;
+      notApplied.current = 0;
       try {
         for (const id of ids) await run(kind, id, targetId);
       } finally {
         collecting.current = null;
       }
-      if (wasActive && leavesView(kind, view)) setActiveId(survivor ? survivor.id : null);
       const [first, ...rest] = offers;
-      if (!first) return;
+      if (!first) {
+        // Every row came back: the cursor stays where it was, and the batch
+        // says once what each row would have said.
+        if (notApplied.current > 0) onMessage(t(notAppliedText(kind)));
+        return;
+      }
+      if (wasActive && leavesView(kind, view)) setActiveId(survivor ? survivor.id : null);
       const offer: UndoOffer = { ...first, more: rest };
       lastUndo.current = offer;
       onMessage(

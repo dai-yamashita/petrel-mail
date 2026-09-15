@@ -324,10 +324,13 @@ impl Store {
         // on the server. Trash and Spam still take everything, because bins
         // are exclusive whatever the provider.
         //
-        // Move names a destination. Sent and drafts stay put — that is the
-        // accident above — but spam and trash go with it. "Move to Inbox"
-        // from the bin is that item's job; excluding those members left the
-        // row gone from the list and still answering `in:spam`.
+        // Move names a destination and follows the same rule on a mixed
+        // conversation: Sent, drafts and the bins stay put. A trashed thread
+        // that gains a reply has inbox and trash members, and filing the
+        // reply must not un-trash the rest. The rescue below is for the
+        // conversation that has nothing else: "Move to Inbox" from the bin
+        // used to touch nobody, leaving the row gone from the list and
+        // still answering `in:spam`.
         //
         // Where folders are labels, archiving is one thing: taking the Inbox
         // label off. Your own reply carries it too — Gmail puts a reply in
@@ -347,10 +350,9 @@ impl Store {
             (ActionKind::Archive, crate::actions::PlacementPolicy::Labels) => {
                 self.thread_ids_kept_from_labels_archive(thread_id)?
             }
-            (ActionKind::Archive, _) => {
+            (ActionKind::Archive | ActionKind::Move, _) => {
                 self.thread_ids_in_roles(thread_id, "'sent','drafts','trash','spam'")?
             }
-            (ActionKind::Move, _) => self.thread_ids_in_roles(thread_id, "'sent','drafts'")?,
             _ => Vec::new(),
         };
         let exclude = |column: &str, kept: &[i64]| {
@@ -365,8 +367,24 @@ impl Store {
             thread_id,
             &format!("{flag_filter}{}", exclude("id", &kept_where_they_are)),
         )?;
-        if ids.is_empty() && matches!(kind, ActionKind::Archive) {
-            ids = self.thread_ids_in_bin_for_rescue(thread_id, &flag_filter)?;
+        if ids.is_empty() {
+            ids = match kind {
+                ActionKind::Archive => {
+                    self.thread_ids_in_bin_for_rescue(thread_id, &flag_filter)?
+                }
+                // From Sent the sent copy is what was meant; from a bin, the
+                // binned members. Sent first, so filing a conversation you
+                // wrote never pulls its junked sibling out with it.
+                ActionKind::Move => {
+                    let sent = self.thread_ids_in_roles(thread_id, "'sent'")?;
+                    if sent.is_empty() {
+                        self.thread_ids_in_bin_for_rescue(thread_id, &flag_filter)?
+                    } else {
+                        sent
+                    }
+                }
+                _ => ids,
+            };
         }
         if ids.is_empty() {
             return Ok(ActionReceipt {

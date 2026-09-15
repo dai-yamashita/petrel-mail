@@ -23,6 +23,7 @@ export async function settleDraft(
   slot: ComposerSlot,
   save: (d: Draft) => Promise<number | null>,
   push: (id: number) => Promise<void>,
+  opts: { awaitPush?: boolean } = {},
 ): Promise<Settled> {
   let id = slot.id;
   if (unsaved(d, slot)) {
@@ -34,7 +35,12 @@ export async function settleDraft(
     if (id == null) return { ok: false, error: 'no draft row' };
   }
   // Best effort: the row is written either way, and the next sync pass
-  // pushes whatever this one could not.
-  if (id != null) await push(id).catch(() => {});
+  // pushes whatever this one could not. A mailbox switch does not wait for
+  // the server: the words are safe once the row is written, and an APPEND
+  // over a slow link must not hold the click on Inbox.
+  if (id != null) {
+    const pushed = push(id).catch(() => {});
+    if (opts.awaitPush !== false) await pushed;
+  }
   return { ok: true, id };
 }

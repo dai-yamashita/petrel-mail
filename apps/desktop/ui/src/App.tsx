@@ -417,11 +417,14 @@ export function App() {
     if (leavingComposerView(view, v)) {
       const current = draftRef.current;
       if (current) {
+        // Saved before the switch, pushed after it: the save is local and
+        // quick, the push is an IMAP round trip that must not hold the click.
         const settled = await settleDraft(
           current,
           slotRef.current,
           (d) => saveDraftRef.current(d, { quiet: true }),
           api.pushDraft,
+          { awaitPush: false },
         );
         if (!settled.ok) {
           setToast(t('view-switch-draft-failed', { error: settled.error }));

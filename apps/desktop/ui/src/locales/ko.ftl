@@ -697,6 +697,7 @@ palette-all-shortcuts = 모든 단축키
 palette-more = 결과 { $count }개 더
 triage-failed = 할 수 없습니다: { $error }
 triage-not-applied = 옮길 메일이 없습니다.
+triage-nothing-to-archive = 보관할 메일이 없습니다.
 undo-done = 실행 취소됨
 undo-too-late = 실행을 취소하기에 늦었습니다. 이미 서버로 갔습니다.
 triage-many = { $what } · 대화 { $count }개

@@ -5,7 +5,6 @@ import {
   INITIAL_FRAME_HEIGHT,
   isRecord,
   nextFrameHeight,
-  wheelDeltaPx,
 } from '../lib/frame-height';
 import { useSettings } from '../lib/settings';
 import { t } from '../lib/strings';
@@ -20,16 +19,7 @@ import { t } from '../lib/strings';
  * by the sanitizer and could never carry a matching nonce anyway; the frame is
  * still opaque-origin, still network-blocked by CSP, still cut off from IPC.
  */
-export function MessageBody({
-  messageId,
-  title,
-  onHeight,
-}: {
-  messageId: number;
-  title: string;
-  /** The conversation virtualizer measures from the card, not the frame. */
-  onHeight?: () => void;
-}) {
+export function MessageBody({ messageId, title }: { messageId: number; title: string }) {
   const { settings } = useSettings();
   const [url, setUrl] = useState<string | null>(null);
   // Set when the body could not be asked for. Distinct from "not yet": a
@@ -95,10 +85,6 @@ export function MessageBody({
   }, [messageId, reload, settings.theme, forceLight, appDark]);
 
   useEffect(() => {
-    onHeight?.();
-  }, [height, onHeight]);
-
-  useEffect(() => {
     function onMessage(e: MessageEvent) {
       // Only accept the shape we defined, and only from our own frame: the
       // window is addressable by anything that can post to it.
@@ -112,31 +98,8 @@ export function MessageBody({
       const b = data.petrelBlocked;
       if (typeof b === 'number') setBlocked((prev) => (prev === b ? prev : b));
 
-      setHeight((prev) => {
-        const next = nextFrameHeight({
-          prev,
-          reported: data.petrelHeight,
-          fitted: data.petrelFitted === true,
-        });
-        return next == null ? prev : next;
-      });
-
-      const wheel = data.petrelWheel;
-      if (isRecord(wheel) && typeof wheel.deltaY === 'number') {
-        const body = frameRef.current
-          ?.closest('.reader')
-          ?.querySelector('.reader-body');
-        if (body instanceof HTMLElement) {
-          const deltaMode = typeof wheel.deltaMode === 'number' ? wheel.deltaMode : 0;
-          body.scrollBy({
-            top: wheelDeltaPx({
-              deltaY: wheel.deltaY,
-              deltaMode,
-              pageSize: body.clientHeight,
-            }),
-          });
-        }
-      }
+      const h = nextFrameHeight(data.petrelHeight);
+      if (h != null) setHeight((prev) => (prev === h ? prev : h));
 
       // A focused frame swallows keydown, so every shortcut in the app dies the
       // moment you click a message. The frame forwards key identity and we

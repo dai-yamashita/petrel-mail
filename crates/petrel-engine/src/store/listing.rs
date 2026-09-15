@@ -321,11 +321,18 @@ fn page_walk(view: &ListView, account: i64) -> Option<PageWalk> {
         )),
         ListView::Folder(_) => Some(membership_walk(&role_folder_ids_sql(account), "")),
         ListView::UserFolder(id) => Some(membership_walk(&user_folder_ids_sql(*id), "")),
+        // The account is half of a tag's key (UNIQUE(account_id, name)).
+        // Without it, one name in two accounts paged the other account's
+        // conversations in, rows_for_keys then dropped them, and the page
+        // came back short while the count — which keeps the account —
+        // stayed right.
         ListView::Tag(_) => Some(membership_walk(
-            "SELECT mt.message_id
-               FROM message_tags mt
-               JOIN tags tg ON tg.id = mt.tag_id
-              WHERE tg.name = ?3",
+            &format!(
+                "SELECT mt.message_id
+                   FROM message_tags mt
+                   JOIN tags tg ON tg.id = mt.tag_id
+                  WHERE tg.account_id = {account} AND tg.name = ?3"
+            ),
             &format!("AND {binned}", binned = not_binned("m")),
         )),
         ListView::Starred => Some(PageWalk {
@@ -966,7 +973,7 @@ impl Store {
 
     /// Conversations in a view: all of them, or only those holding something
     /// unread.
-    fn count_view(&self, view: &ListView, total: bool) -> Result<i64> {
+    pub fn count_view(&self, view: &ListView, total: bool) -> Result<i64> {
         if let Some(n) = self.count_view_from_placements(view, total)? {
             return Ok(n);
         }

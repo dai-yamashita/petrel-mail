@@ -636,14 +636,40 @@ fn open_sync_scope(view: &str) -> Option<Scope> {
         .map(Scope::FolderId)
 }
 
+/// How long after an on-open fetch the same mailbox is left alone. A click
+/// a moment after the last one has nothing new to ask for, and every ask
+/// is a login.
+const ON_OPEN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a mailbox last fetched at `last` is due again at `now`.
+fn on_open_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        Some(at) => now.duration_since(at) >= ON_OPEN_COOLDOWN,
+        None => true,
+    }
+}
+
 fn claim_folder_sync(state: &AppState, key: &str) -> bool {
+    let last = state
+        .folder_synced_at
+        .lock()
+        .ok()
+        .and_then(|m| m.get(key).copied());
+    if !on_open_due(last, std::time::Instant::now()) {
+        return false;
+    }
     let Ok(mut set) = state.folder_sync_inflight.lock() else {
         return false;
     };
     set.insert(key.to_string())
 }
 
-fn release_folder_sync(state: &AppState, key: &str) {
+/// `fetched` is whether the server was actually asked; a claim released
+/// before that (no store, no config) starts no cooldown.
+fn release_folder_sync(state: &AppState, key: &str, fetched: bool) {
+    if fetched && let Ok(mut m) = state.folder_synced_at.lock() {
+        m.insert(key.to_string(), std::time::Instant::now());
+    }
     if let Ok(mut set) = state.folder_sync_inflight.lock() {
         set.remove(key);
     }
@@ -666,13 +692,13 @@ pub(crate) fn spawn_view_sync(state: Arc<AppState>, account: i64, view: &str) {
     tauri::async_runtime::spawn(async move {
         let cfg = {
             let Ok(store) = state.store() else {
-                release_folder_sync(&state, &key);
+                release_folder_sync(&state, &key, false);
                 return;
             };
             crate::config::imap_config_for(&store, account)
         };
         let Some(cfg) = cfg else {
-            release_folder_sync(&state, &key);
+            release_folder_sync(&state, &key, false);
             return;
         };
         let report = run_sync_cycle(&state, account, &cfg, false, scope).await;
@@ -682,7 +708,7 @@ pub(crate) fn spawn_view_sync(state: Arc<AppState>, account: i64, view: &str) {
                 .last_sync_ms
                 .store(crate::state::now_ms(), Ordering::Relaxed);
         }
-        release_folder_sync(&state, &key);
+        release_folder_sync(&state, &key, true);
     });
 }
 
@@ -1692,6 +1718,18 @@ mod scope_tests {
         assert_eq!(open_sync_scope("outbox"), None);
         assert_eq!(open_sync_scope("snoozed"), None);
         assert_eq!(open_sync_scope("tag:urgent"), None);
+    }
+
+    #[test]
+    fn an_opened_mailbox_is_left_alone_within_the_cooldown() {
+        use super::{ON_OPEN_COOLDOWN, on_open_due};
+        // A point safely after the clock's start, so the subtractions below
+        // cannot underflow on a fresh process.
+        let now = std::time::Instant::now() + ON_OPEN_COOLDOWN * 2;
+        assert!(on_open_due(None, now), "never fetched: due");
+        assert!(!on_open_due(Some(now), now), "just fetched: not due");
+        assert!(!on_open_due(Some(now - ON_OPEN_COOLDOWN / 2), now));
+        assert!(on_open_due(Some(now - ON_OPEN_COOLDOWN), now));
     }
 
     #[test]

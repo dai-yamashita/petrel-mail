@@ -51,6 +51,17 @@ describe('settleDraft', () => {
     expect(result).toEqual({ ok: true, id: null });
   });
 
+  it('does not wait for the push when asked not to, but still starts it', async () => {
+    // A mailbox switch: the row is safe once saved, and an APPEND over a
+    // slow link must not hold the click. The push here never resolves.
+    const push = vi.fn(() => new Promise<void>(() => {}));
+    const result = await settleDraft(typed, slotFor(blank), async () => 5, push, {
+      awaitPush: false,
+    });
+    expect(result).toEqual({ ok: true, id: 5 });
+    expect(push).toHaveBeenCalledWith(5);
+  });
+
   it('treats a failed push as done: the row is written and the next sync pushes it', async () => {
     const result = await settleDraft(typed, slotFor(blank), async () => 3, async () => {
       throw new Error('offline');

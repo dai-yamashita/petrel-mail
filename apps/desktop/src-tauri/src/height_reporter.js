@@ -59,10 +59,12 @@
   // The host sizes the iframe to this number. A transformed message still
   // occupies its unscaled layout height, so scrollHeight of that document is
   // a blank band under the text — the box already has the fitted height.
-  // Without a transform, getBoundingClientRect can clamp to the iframe
-  // viewport once html is overflow-hidden, which is how a later layout pass
-  // (older cards landing above this one) shrank a finished body. The fit
-  // element's own layout height is the content, not the window.
+  // Without a transform the tallest of the box, the fit element and its
+  // scrollable extent is taken: a float or an oversized child can hang
+  // below the box it sits in, and a rect alone cut those off.
+  //
+  // Past the cap the frame is allowed to scroll on its own, once: the host
+  // used to drop any report this tall and leave the frame at first paint.
   var HEIGHT_CAP = 200000;
 
   function contentLayoutHeight(inner, pad) {
@@ -92,27 +94,65 @@
     return Math.max(d.scrollHeight, b ? b.scrollHeight : 0);
   }
 
+  // A message whose height follows the window — a viewport unit the
+  // sanitizer did not catch, or something newer — grows by exactly what the
+  // host just gave it, the host gives it that again, and the two chase each
+  // other up to the cap. Three rounds of growth matching the last resize is
+  // that chase and nothing else; the height is then held where it was.
+  var CHASE_ROUNDS = 3;
+  var lastInner = null;
+  var lastHeight = null;
+  var chasing = 0;
+  var held = null;
+
+  function holdIfChasingTheWindow(height) {
+    if (held != null) return held;
+    var inner = window.innerHeight;
+    if (lastHeight != null && lastInner != null) {
+      var grew = height - lastHeight;
+      var given = inner - lastInner;
+      if (given > 0) {
+        chasing = grew >= given - 2 ? chasing + 1 : 0;
+      } else if (grew !== 0) {
+        // The content moved with no resize behind it: not a chase.
+        chasing = 0;
+      }
+      // Neither moved: a re-measure the observer asked for, nothing to learn.
+      if (chasing >= CHASE_ROUNDS) {
+        held = lastHeight;
+        return held;
+      }
+    }
+    lastHeight = height;
+    lastInner = inner;
+    return height;
+  }
+
+  // The document itself changed — a new text size, find marks — so a held
+  // height is stale. Measure afresh; a chase starts over from here.
+  function releaseHold() {
+    held = null;
+    chasing = 0;
+    lastHeight = null;
+    lastInner = null;
+  }
+
   function post() {
     if (raf) return;
     raf = requestAnimationFrame(function () {
       raf = 0;
       fit();
-      var height = h();
+      var height = holdIfChasingTheWindow(h());
       if (height >= HEIGHT_CAP) {
         height = HEIGHT_CAP;
         document.documentElement.style.overflowY = 'auto';
       }
       var blocked = typeof BLOCKED !== 'undefined' ? BLOCKED : 0;
-      var fitted = !!lastTransform;
-      var payload = height + ':' + blocked + ':' + (fitted ? '1' : '0');
+      var payload = height + ':' + blocked;
       if (payload === lastPosted) return;
       lastPosted = payload;
       try {
-        parent.postMessage({
-          petrelHeight: height,
-          petrelBlocked: blocked,
-          petrelFitted: fitted
-        }, '*');
+        parent.postMessage({ petrelHeight: height, petrelBlocked: blocked }, '*');
       } catch (e) {}
     });
   }
@@ -173,6 +213,7 @@
     // Bounded: the only thing this accepts is a plausible font size.
     if (typeof n === 'number' && n >= 10 && n <= 28) {
       document.documentElement.style.setProperty('--petrel-size', n + 'px');
+      releaseHold();
       post();
     }
   });
@@ -198,6 +239,7 @@
   }
 
   function runFind(term) {
+    releaseHold();
     clearFind();
     if (!term) { post(); return; }
     var needle = term.toLowerCase();
@@ -270,19 +312,4 @@
       }, '*');
     } catch (err) {}
   });
-
-  // Wheel stays inside the frame. The conversation scrolls on the host, and
-  // a focused body would otherwise swallow the gesture — the same reason
-  // keys are forwarded. Vertical only: sideways is how a message too wide
-  // to shrink is reached, and pinch-zoom is the browser's.
-  addEventListener('wheel', function (e) {
-    if (e.ctrlKey) return;
-    if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
-    e.preventDefault();
-    try {
-      parent.postMessage({
-        petrelWheel: { deltaY: e.deltaY, deltaMode: e.deltaMode }
-      }, '*');
-    } catch (err) {}
-  }, { passive: false });
 })();

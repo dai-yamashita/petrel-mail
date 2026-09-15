@@ -4,7 +4,7 @@ use crate::diag::log_sync;
 use crate::message_view::ViewTokens;
 use petrel_engine::blob::BlobStore;
 use petrel_engine::store::Store;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
@@ -76,6 +76,10 @@ pub(crate) struct AppState {
     /// (`sent`, `folder:3`). Opening the same mailbox twice must not
     /// stack IMAP sessions on it. Different mailboxes may overlap.
     pub(crate) folder_sync_inflight: Mutex<HashSet<String>>,
+    /// When each on-open fetch last finished, by the same key. The inflight
+    /// set stops two fetches at once; this stops a login per click when
+    /// somebody flicks between Sent and Drafts.
+    pub(crate) folder_synced_at: Mutex<HashMap<String, std::time::Instant>>,
     /// Arrivals a rule marked notify-anyway, waiting for the next status
     /// poll to carry them to the announcer. Drained on read: each is said
     /// once.
@@ -492,6 +496,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Arc<AppState> {
         draining: AtomicBool::new(false),
         draft_dirty: Mutex::new(std::collections::HashSet::new()),
         folder_sync_inflight: Mutex::new(HashSet::new()),
+        folder_synced_at: Mutex::new(HashMap::new()),
         pending_notify: Mutex::new(Vec::new()),
         pending_alerts: Mutex::new(Vec::new()),
         last_sync_ms: std::sync::atomic::AtomicI64::new(0),

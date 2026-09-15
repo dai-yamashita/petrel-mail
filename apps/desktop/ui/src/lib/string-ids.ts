@@ -660,6 +660,7 @@ export const STRING_IDS = [
   'palette-more',
   'triage-failed',
   'triage-not-applied',
+  'triage-nothing-to-archive',
   'undo-done',
   'undo-too-late',
   'triage-many',
