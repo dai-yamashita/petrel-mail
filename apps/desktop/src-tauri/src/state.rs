@@ -3,7 +3,7 @@
 use crate::diag::log_sync;
 use crate::message_view::ViewTokens;
 use petrel_engine::blob::BlobStore;
-use petrel_engine::store::Store;
+use petrel_engine::store::{Store, WalCheckpoint};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
@@ -11,9 +11,13 @@ use std::sync::{Arc, Mutex, TryLockError};
 pub(crate) struct AppState {
     pub(crate) store: Mutex<Store>,
     /// Extra connections for SELECTs. WAL already allows them to run during
-    /// a write; two of them so a recount and a listing do not share one lock.
-    /// Empty stand-ins when `readers_live` is false (tests, after a wipe).
+    /// a write. Two share listing and search. Empty stand-ins when
+    /// `readers_live` is false (tests, after a wipe).
     pub(crate) reads: [Mutex<Store>; 2],
+    /// Sidebar and footer counts. Those queries take seconds on a large
+    /// mailbox; they used to sit in `reads` and a search then waited
+    /// behind them for a minute.
+    pub(crate) read_counts: Mutex<Store>,
     /// One more connection, only for opening a message. Recounts keep the
     /// pool busy; the conversation index has its own. The body URL must
     /// not wait for either.
@@ -93,6 +97,10 @@ pub(crate) struct AppState {
     /// The status bar ages this into words; a static "just now" was the
     /// previous implementation, and it was stuck by construction.
     pub(crate) last_sync_ms: std::sync::atomic::AtomicI64,
+    /// Bumped when a re-extraction has rewritten stored text. The status
+    /// poll carries it so the window reloads the list; otherwise the
+    /// heading keeps the subject it loaded at launch.
+    pub(crate) extraction_gen: std::sync::atomic::AtomicI64,
     /// When the user last asked the store for something, in ms. Backfill
     /// yields to this: history is the least urgent work in the program, and
     /// a stride that makes a click wait has its priorities inverted.
@@ -287,6 +295,49 @@ impl AppState {
             .map_err(|_| "store lock poisoned".to_string())
     }
 
+    /// Truncates the WAL if no listing is mid-SELECT.
+    ///
+    /// Other connections holding a snapshot make TRUNCATE return busy.
+    /// The reader locks are taken first so those connections are idle.
+    /// A listing already running is left alone; the caller retries.
+    pub(crate) fn checkpoint_wal_truncate(&self) -> Result<WalCheckpoint, String> {
+        let mut held = Vec::new();
+        if self.readers_live.load(Ordering::Relaxed) {
+            for slot in [
+                &self.reads[0],
+                &self.reads[1],
+                &self.read_counts,
+                &self.read_open,
+                &self.read_index,
+            ] {
+                match slot.try_lock() {
+                    Ok(g) => held.push(g),
+                    Err(TryLockError::Poisoned(p)) => held.push(p.into_inner()),
+                    Err(TryLockError::WouldBlock) => {
+                        return Ok(WalCheckpoint {
+                            busy: true,
+                            log: 0,
+                            checkpointed: 0,
+                        });
+                    }
+                }
+            }
+        }
+        let store = match self.store.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Ok(WalCheckpoint {
+                    busy: true,
+                    log: 0,
+                    checkpointed: 0,
+                });
+            }
+        };
+        let _held = held;
+        store.checkpoint_wal().map_err(|e| e.to_string())
+    }
+
     /// A connection that may read while the writer is busy.
     ///
     /// Falls back to the write store when no secondary was opened — in-memory
@@ -303,6 +354,16 @@ impl AppState {
             }
         }
         self.reads[0]
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())
+    }
+
+    /// Counts only. A listing or a search must not wait on this.
+    pub(crate) fn store_read_counts(&self) -> Result<std::sync::MutexGuard<'_, Store>, String> {
+        if !self.readers_live.load(Ordering::Relaxed) {
+            return self.store();
+        }
+        self.read_counts
             .lock()
             .map_err(|_| "store lock poisoned".to_string())
     }
@@ -352,6 +413,11 @@ impl AppState {
             *g = empty;
         }
         if let Ok(mut g) = self.read_index.lock()
+            && let Ok(empty) = Store::open_in_memory()
+        {
+            *g = empty;
+        }
+        if let Ok(mut g) = self.read_counts.lock()
             && let Ok(empty) = Store::open_in_memory()
         {
             *g = empty;
@@ -479,6 +545,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Arc<AppState> {
             Mutex::new(Store::open_in_memory().expect("reader")),
             Mutex::new(Store::open_in_memory().expect("reader")),
         ],
+        read_counts: Mutex::new(Store::open_in_memory().expect("reader")),
         read_open: Mutex::new(Store::open_in_memory().expect("reader")),
         read_index: Mutex::new(Store::open_in_memory().expect("reader")),
         readers_live: AtomicBool::new(false),
@@ -500,6 +567,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Arc<AppState> {
         pending_notify: Mutex::new(Vec::new()),
         pending_alerts: Mutex::new(Vec::new()),
         last_sync_ms: std::sync::atomic::AtomicI64::new(0),
+        extraction_gen: std::sync::atomic::AtomicI64::new(0),
         ui_touch_ms: std::sync::atomic::AtomicI64::new(0),
         server_total: std::sync::atomic::AtomicUsize::new(0),
         shown_once: Mutex::new(std::collections::HashSet::new()),

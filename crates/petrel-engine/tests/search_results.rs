@@ -570,3 +570,34 @@ fn snoozed_mail_is_out_of_the_inbox_for_a_search_too() {
         "is:snoozed must still find what was snoozed"
     );
 }
+
+/// A subject that opens with `[name]` is how a lot of mail is titled.
+/// The brackets are punctuation, not an FTS column filter, and a prefix
+/// must not fall back to the first letter inside them.
+#[test]
+fn a_bracketed_token_in_the_inbox_is_findable() {
+    let mut store = Store::open_in_memory().unwrap();
+    let account = store.ensure_test_account().unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let ids = store
+        .insert_messages(&[NewMessage {
+            account_id: account,
+            date_ms: 1_700_000_000_000,
+            from_addr: "billing@example.com".into(),
+            from_display: "Billing".into(),
+            to_addr: "me@example.com".into(),
+            subject: "[Acme] invoice 2214".into(),
+            body_text: "Your invoice is ready.".into(),
+        }])
+        .unwrap();
+    store.place_message(ids[0], inbox).unwrap();
+
+    let hits = store
+        .search_threads("in:inbox [acme]", 20)
+        .expect("bracketed inbox search");
+    assert_eq!(hits.len(), 1, "the bracketed subject is in the inbox");
+    assert!(hits[0].subject.contains("[Acme]"));
+
+    // Mid-token punctuation only: nothing to match yet, and must not hang.
+    assert!(store.search_threads("in:inbox [", 20).unwrap().is_empty());
+}

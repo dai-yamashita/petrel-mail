@@ -19,6 +19,8 @@ mod listing;
 mod maintenance;
 mod search;
 
+pub use maintenance::{ReindexProgress, WalCheckpoint};
+
 pub const SCHEMA_VERSION: i64 = 26;
 /// How many of a message's References are kept. Threading only ever looks
 /// for the nearest ancestors, and an unbounded header is both a query
@@ -662,6 +664,30 @@ fn cjk_snippet(body: &str, query: &str) -> String {
     out
 }
 
+/// The last run of letters or digits in a token. Prefix search is decided
+/// on this, not on the raw spelling: `[z` is three characters but the
+/// tokenizer only sees `z`, and `z*` matches most of a mailbox.
+fn last_alnum_run(w: &str) -> &str {
+    let mut start = None;
+    let mut end = 0;
+    let mut run = None;
+    for (i, c) in w.char_indices() {
+        if c.is_alphanumeric() {
+            if run.is_none() {
+                run = Some(i);
+            }
+            end = i + c.len_utf8();
+            start = run;
+        } else {
+            run = None;
+        }
+    }
+    match start {
+        Some(s) => &w[s..end],
+        None => "",
+    }
+}
+
 /// Build a safe FTS5 MATCH expression: every token is a quoted phrase (internal
 /// quotes doubled), bare tokens AND together, and the final bare token becomes a
 /// prefix query for as-you-type search. User text never reaches MATCH unquoted.
@@ -703,7 +729,7 @@ fn match_expr(query: &str, prefix_last: bool) -> Option<String> {
                 s.push(ch);
                 chars.next();
             }
-            if !s.is_empty() {
+            if s.chars().any(char::is_alphanumeric) {
                 toks.push(Tok::Word(s));
             }
         }
@@ -719,7 +745,7 @@ fn match_expr(query: &str, prefix_last: bool) -> Option<String> {
         .map(|(i, t)| match t {
             Tok::Phrase(p) => format!("\"{}\"", esc(p)),
             Tok::Word(w) => {
-                if prefix_last && i == last && w.chars().count() >= 2 {
+                if prefix_last && i == last && last_alnum_run(w).chars().count() >= 2 {
                     format!("\"{}\"*", esc(w))
                 } else {
                     format!("\"{}\"", esc(w))
@@ -1147,6 +1173,11 @@ fn apply_runtime_pragmas(conn: &Connection) -> Result<String> {
     let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // After a long writer (re-extraction) the WAL file keeps its peak
+    // size unless a checkpoint truncates it. A 7GB leftover made every
+    // listing and search take tens of seconds. Cap the file so a
+    // restart cannot leave that behind.
+    conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
     Ok(mode)
 }
@@ -2062,5 +2093,11 @@ mod tests {
         // An embedded quote splits tokens; nothing unquoted ever reaches MATCH.
         assert_eq!(match_expr("a\"b", true).unwrap(), "\"a\" \"b\"");
         assert!(match_expr("   ", true).is_none());
+        // Brackets are ordinary subject punctuation. The last letters are
+        // what FTS sees, so prefix follows those, not the raw token length.
+        assert_eq!(match_expr("[z.com]", true).unwrap(), "\"[z.com]\"*");
+        assert_eq!(match_expr("[z", true).unwrap(), "\"[z\"");
+        assert!(match_expr("[", true).is_none());
+        assert_eq!(match_expr("z.com", true).unwrap(), "\"z.com\"*");
     }
 }

@@ -4,6 +4,16 @@
 //! Moved verbatim from mod.rs (Phase 1.5).
 use super::*;
 
+/// Whether a WAL checkpoint finished, and how much it moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCheckpoint {
+    /// True when another connection still held the WAL, so the file
+    /// was not truncated.
+    pub busy: bool,
+    pub log: i64,
+    pub checkpointed: i64,
+}
+
 /// How far one slice of the re-extraction got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReindexProgress {
@@ -125,20 +135,37 @@ impl Store {
         }
         // Where the last slice stopped. Ordered by id so "after this one" is
         // a stable place to resume from, whatever else arrives meanwhile.
-        let cursor: i64 = settings
+        let mut cursor: i64 = settings
             .get("reindex_cursor")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        // A leftover cursor belongs to the version that wrote it. A new
+        // extraction must start at id 0, or the first stretch is never
+        // rewritten. The first time we record a target, keep the cursor:
+        // that is an in-flight pass of this same version (the upgrade that
+        // introduced the key).
+        let target: i64 = settings
+            .get("reindex_target")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if target != Self::EXTRACTION_VERSION {
+            self.set_setting("reindex_target", &Self::EXTRACTION_VERSION.to_string())?;
+            if target != 0 {
+                self.set_setting("reindex_cursor", "0")?;
+                cursor = 0;
+            }
+        }
 
-        let rows: Vec<(i64, String)> = {
+        let rows: Vec<(i64, String, String, String)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, blob_hash FROM messages
+                "SELECT id, blob_hash, coalesce(subject, ''), coalesce(from_display, '')
+                 FROM messages
                  WHERE blob_hash IS NOT NULL AND deleted_at_ms IS NULL AND id > ?1
                  ORDER BY id LIMIT ?2",
             )?;
             let it = stmt.query_map(
                 params![cursor, i64::try_from(limit).unwrap_or(i64::MAX)],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
             it.collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -155,12 +182,32 @@ impl Store {
             // that was already correct.
             self.set_setting("extraction_version", &Self::EXTRACTION_VERSION.to_string())?;
             self.set_setting("reindex_cursor", "0")?;
+            self.set_setting("reindex_target", &Self::EXTRACTION_VERSION.to_string())?;
             return Ok(ReindexProgress {
                 done: 0,
                 finished: true,
             });
         }
-        let last_id = rows.last().map(|(id, _)| *id).unwrap_or(cursor);
+        let last_id = rows.last().map(|(id, _, _, _)| *id).unwrap_or(cursor);
+        // Version 6 only repairs encoded-words that became U+FFFD. Reading
+        // every blob on a mailbox of hundreds of thousands holds the lock
+        // for tens of minutes and grows the WAL by gigabytes. Rows whose
+        // stored text has no replacement character are already fine.
+        let fffd_only = held == 5 && Self::EXTRACTION_VERSION == 6;
+        let to_rewrite: Vec<(i64, String)> = rows
+            .iter()
+            .filter(|(_, _, subject, from)| {
+                !fffd_only || subject.contains('\u{FFFD}') || from.contains('\u{FFFD}')
+            })
+            .map(|(id, hash, _, _)| (*id, hash.clone()))
+            .collect();
+        if to_rewrite.is_empty() {
+            self.set_setting("reindex_cursor", &last_id.to_string())?;
+            return Ok(ReindexProgress {
+                done: 0,
+                finished: false,
+            });
+        }
 
         let tx = self.conn.transaction()?;
         let mut done = 0usize;
@@ -185,7 +232,7 @@ impl Store {
             let mut upd_att = tx.prepare(
                 "UPDATE attachments SET filename = ?3 WHERE message_id = ?1 AND part_id = ?2",
             )?;
-            for (id, hash) in rows {
+            for (id, hash) in to_rewrite {
                 // A blob that will not read is not a reason to abandon the
                 // rest; it keeps whatever text it already had.
                 let Ok(raw) = blobs.read(&hash) else { continue };
@@ -269,6 +316,24 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Pushes committed WAL pages back into the main file and truncates it.
+    ///
+    /// RESTART leaves the file at its peak size. A re-extraction on this
+    /// mailbox grew it to several gigabytes; listings then took tens of
+    /// seconds. TRUNCATE is what actually shrinks it.
+    pub fn checkpoint_wal(&self) -> Result<WalCheckpoint> {
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+        Ok(WalCheckpoint {
+            busy: busy != 0,
+            log,
+            checkpointed,
+        })
     }
 
     pub fn rebuild_fts(&self) -> Result<()> {

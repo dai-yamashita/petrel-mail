@@ -333,6 +333,8 @@ export type Status = {
    *  each one arrives once. */
   alerts?: string[];
   last_sync_ms: number;
+  /** Increments after a re-extraction rewrites stored subjects. */
+  extraction_gen: number;
 };
 
 /* Dev-only: `npm run dev` opens in a plain browser, where Tauri's invoke does
@@ -533,6 +535,7 @@ const mockAccounts: Account[] = [
 const mock = {
   status: async (): Promise<Status> => ({
     last_sync_ms: Date.now(),
+    extraction_gen: 0,
     configured: true, demo: false,
     seeding: false, count: 10000, server_total: 12500, source: 'tom@northbay.example',
     retention: 'mirror', data_dir: '~/Library/Application Support/Petrel',

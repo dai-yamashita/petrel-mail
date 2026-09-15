@@ -4,12 +4,24 @@ import {
   THREAD_PAGE_MAX,
   bodiesToMount,
   clampThreadLimit,
+  headingSubject,
   keepExistingPane,
   nextExpanded,
   olderCards,
   previewCard,
 } from './reader-window';
 import type { Thread } from './api';
+
+describe('headingSubject', () => {
+  it('prefers the hydrated newest over a stale list row', () => {
+    expect(headingSubject('old copy', 'repaired copy')).toBe('repaired copy');
+  });
+
+  it('keeps the list row until the newest has a subject', () => {
+    expect(headingSubject('from the list', undefined)).toBe('from the list');
+    expect(headingSubject('from the list', '   ')).toBe('from the list');
+  });
+});
 
 describe('keepExistingPane', () => {
   it('holds the cards only for the thread already on screen', () => {

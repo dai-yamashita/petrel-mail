@@ -290,7 +290,7 @@ async fn run_allmail_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig)
 /// Parks a background task while the user is working. Returns when the UI
 /// has been quiet for a beat — the spec's "interactive preempts backfill",
 /// implemented as politeness rather than a queue.
-async fn yield_to_user(state: &Arc<AppState>) {
+pub(crate) async fn yield_to_user(state: &Arc<AppState>) {
     while ui_recently_active(state, 1500) {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     }
