@@ -1382,6 +1382,178 @@ fn moving_from_trash_to_inbox_files_the_message() {
     assert!(!search_has(&store, "shared in:trash", tid));
 }
 
+/// A conversation you replied to, then trashed: the sent copy often still
+/// sits in Sent. Preferring that copy on Move to Inbox left the trashed
+/// members where they were, so the row never left Trash.
+#[test]
+fn moving_from_trash_to_inbox_takes_the_trashed_members_not_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let sent = store.ensure_folder(account, "sent", "Sent").unwrap();
+    let trash = store.ensure_folder(account, "trash", "Trash").unwrap();
+    let ids = ingest_reply_chain(&mut store, &blobs, account, inbox, 2);
+    store.remove_placement(ids[0], account, "INBOX").unwrap();
+    store.place_message_at(ids[0], sent, 9).unwrap();
+    store.remove_placement(ids[1], account, "INBOX").unwrap();
+    store.place_message(ids[1], trash).unwrap();
+    let tid = thread_of(&store, ids[0]);
+
+    let r = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(inbox),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(r.message_count, 1, "the trashed member, not the sent copy");
+    assert_eq!(store.folders_of(ids[0]).unwrap(), vec![sent]);
+    assert_eq!(store.folders_of(ids[1]).unwrap(), vec![inbox]);
+    assert!(listed(&store, ListView::Inbox).contains(&tid));
+    assert!(!listed(&store, ListView::Folder("trash".into())).contains(&tid));
+}
+
+/// Gmail: a trashed thread that gains a reply has inbox and trash members.
+/// Filing that reply to a folder must not un-trash the rest; Move to Inbox
+/// from Trash takes only the binned members, so a long thread does not
+/// queue a MOVE for every inbox copy.
+#[test]
+fn moving_from_trash_to_inbox_rescues_a_mixed_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let trash = store.ensure_folder(account, "trash", "Trash").unwrap();
+    let ids = ingest_reply_chain(&mut store, &blobs, account, inbox, 4);
+    store.remove_placement(ids[3], account, "INBOX").unwrap();
+    store.place_message(ids[3], trash).unwrap();
+    let tid = thread_of(&store, ids[0]);
+
+    let r = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(inbox),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(r.message_count, 1, "only the trashed member");
+    assert_eq!(store.folders_of(ids[0]).unwrap(), vec![inbox]);
+    assert_eq!(store.folders_of(ids[3]).unwrap(), vec![inbox]);
+    assert!(listed(&store, ListView::Inbox).contains(&tid));
+    assert!(!listed(&store, ListView::Folder("trash".into())).contains(&tid));
+    let queued: Vec<i64> = store
+        .pending_actions(account)
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.action_id == r.action_id)
+        .map(|p| p.message_id)
+        .collect();
+    assert_eq!(queued, vec![ids[3]]);
+}
+
+/// The live mailbox: a sent or draft copy that also sits in Trash. Keeping
+/// Sent and drafts put left those copies in the bin, and the row came back.
+#[test]
+fn moving_from_trash_to_inbox_takes_a_sent_copy_that_is_also_trashed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let sent = store.ensure_folder(account, "sent", "Sent").unwrap();
+    let trash = store.ensure_folder(account, "trash", "Trash").unwrap();
+    let ids = ingest_reply_chain(&mut store, &blobs, account, inbox, 2);
+    store.place_message_at(ids[0], sent, 9).unwrap();
+    store.place_message(ids[0], trash).unwrap();
+    let tid = thread_of(&store, ids[0]);
+
+    let r = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(inbox),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(r.message_count, 1);
+    assert_eq!(store.folders_of(ids[0]).unwrap(), vec![inbox]);
+    assert_eq!(store.folders_of(ids[1]).unwrap(), vec![inbox]);
+    assert!(!listed(&store, ListView::Folder("trash".into())).contains(&tid));
+}
+
+#[test]
+fn moving_from_trash_to_inbox_takes_a_draft_that_is_also_trashed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let drafts = store.ensure_folder(account, "drafts", "Drafts").unwrap();
+    let trash = store.ensure_folder(account, "trash", "Trash").unwrap();
+    let ids = ingest_reply_chain(&mut store, &blobs, account, inbox, 2);
+    store.place_message(ids[0], drafts).unwrap();
+    store.place_message(ids[0], trash).unwrap();
+    let tid = thread_of(&store, ids[0]);
+
+    let r = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(inbox),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(r.message_count, 1);
+    assert_eq!(store.folders_of(ids[0]).unwrap(), vec![inbox]);
+    assert!(!listed(&store, ListView::Folder("trash".into())).contains(&tid));
+    assert!(!listed(&store, ListView::Folder("drafts".into())).contains(&tid));
+}
+
+/// Spam is the other exclusive bin. A sent copy that still carries the spam
+/// placement keeps the row in Junk the same way a trashed sent copy did.
+#[test]
+fn moving_from_spam_to_inbox_takes_a_sent_copy_that_is_also_junked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    store.set_active_account(account).unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let sent = store.ensure_folder(account, "sent", "Sent").unwrap();
+    let spam = store.ensure_folder(account, "spam", "Junk").unwrap();
+    let ids = ingest_reply_chain(&mut store, &blobs, account, inbox, 2);
+    store.place_message_at(ids[0], sent, 9).unwrap();
+    store.place_message(ids[0], spam).unwrap();
+    let tid = thread_of(&store, ids[0]);
+
+    let r = store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Move,
+            Some(inbox),
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(r.message_count, 1);
+    assert_eq!(store.folders_of(ids[0]).unwrap(), vec![inbox]);
+    assert_eq!(store.folders_of(ids[1]).unwrap(), vec![inbox]);
+    assert!(!listed(&store, ListView::Folder("spam".into())).contains(&tid));
+}
+
 #[test]
 fn archiving_a_spam_only_conversation_leaves_the_bin() {
     let dir = tempfile::tempdir().unwrap();

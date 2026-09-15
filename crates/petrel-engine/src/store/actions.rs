@@ -332,6 +332,15 @@ impl Store {
         // used to touch nobody, leaving the row gone from the list and
         // still answering `in:spam`.
         //
+        // Move to Inbox is the exception. That verb is the rescue: the UI
+        // hides it in the inbox, and using it from Trash or Spam has to
+        // take every member that still sits in a bin, including a Sent or
+        // draft copy that also has a trash or spam placement. Keeping those
+        // put left the row in the bin — the list is membership, and one
+        // leftover copy is enough. Preferring Sent did the same. The rest
+        // of a long thread is left alone: filing 108 inbox members queued
+        // MOVEs the server had no copy for.
+        //
         // Where folders are labels, archiving is one thing: taking the Inbox
         // label off. Your own reply carries it too — Gmail puts a reply in
         // the conversation's inbox — and a reply exempted for sitting in
@@ -346,14 +355,30 @@ impl Store {
         // is no inbox member to archive, and leaving it there makes Archive
         // from Spam a no-op. Then we take the binned members, still not Sent
         // or drafts.
-        let kept_where_they_are: Vec<i64> = match (kind, policy) {
-            (ActionKind::Archive, crate::actions::PlacementPolicy::Labels) => {
-                self.thread_ids_kept_from_labels_archive(thread_id)?
+        let dest_is_inbox = match (kind, target) {
+            (ActionKind::Move, Some(id)) => self.folder_has_role(id, "inbox")?,
+            _ => false,
+        };
+        let inbox_bins = if dest_is_inbox {
+            self.thread_ids_in_bins(thread_id, &flag_filter)?
+        } else {
+            Vec::new()
+        };
+        let kept_where_they_are: Vec<i64> = if !inbox_bins.is_empty() {
+            Vec::new()
+        } else {
+            match (kind, policy) {
+                (ActionKind::Archive, crate::actions::PlacementPolicy::Labels) => {
+                    self.thread_ids_kept_from_labels_archive(thread_id)?
+                }
+                (ActionKind::Move, _) if dest_is_inbox => {
+                    self.thread_ids_in_roles(thread_id, "'sent','drafts'")?
+                }
+                (ActionKind::Archive | ActionKind::Move, _) => {
+                    self.thread_ids_in_roles(thread_id, "'sent','drafts','trash','spam'")?
+                }
+                _ => Vec::new(),
             }
-            (ActionKind::Archive | ActionKind::Move, _) => {
-                self.thread_ids_in_roles(thread_id, "'sent','drafts','trash','spam'")?
-            }
-            _ => Vec::new(),
         };
         let exclude = |column: &str, kept: &[i64]| {
             if kept.is_empty() {
@@ -363,18 +388,23 @@ impl Store {
                 format!(" AND {column} NOT IN ({})", list.join(","))
             }
         };
-        let mut ids: Vec<i64> = self.thread_message_ids(
-            thread_id,
-            &format!("{flag_filter}{}", exclude("id", &kept_where_they_are)),
-        )?;
+        let mut ids: Vec<i64> = if !inbox_bins.is_empty() {
+            inbox_bins
+        } else {
+            self.thread_message_ids(
+                thread_id,
+                &format!("{flag_filter}{}", exclude("id", &kept_where_they_are)),
+            )?
+        };
         if ids.is_empty() {
             ids = match kind {
                 ActionKind::Archive => {
                     self.thread_ids_in_bin_for_rescue(thread_id, &flag_filter)?
                 }
                 // From Sent the sent copy is what was meant; from a bin, the
-                // binned members. Sent first, so filing a conversation you
-                // wrote never pulls its junked sibling out with it.
+                // binned members. Sent first when the destination is a folder
+                // you named, so filing a conversation you wrote never pulls
+                // its junked sibling out with it.
                 ActionKind::Move => {
                     let sent = self.thread_ids_in_roles(thread_id, "'sent'")?;
                     if sent.is_empty() {
@@ -823,6 +853,18 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    fn folder_has_role(&self, folder_id: i64, role: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM folders WHERE id = ?1 AND role = ?2",
+                params![folder_id, role],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
     fn thread_ids_in_roles(&self, thread_id: i64, roles_sql: &str) -> Result<Vec<i64>> {
         let sql = format!(
             "SELECT DISTINCT m.id FROM messages m
@@ -849,6 +891,24 @@ impl Store {
                                    JOIN folders f ON f.id = p.folder_id
                                    WHERE p.message_id = m.id AND f.role = 'inbox'))",
         )?;
+        Ok(stmt
+            .query_map(params![thread_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Members sitting in trash or spam, Sent and draft copies included.
+    /// Move to Inbox has to take these: the bin lists are membership, and a
+    /// leftover dual-placed copy is enough to keep the row there.
+    fn thread_ids_in_bins(&self, thread_id: i64, flag_filter: &str) -> Result<Vec<i64>> {
+        let sql = format!(
+            "SELECT DISTINCT m.id FROM messages m
+             JOIN placements p ON p.message_id = m.id
+             JOIN folders f ON f.id = p.folder_id
+             WHERE coalesce(m.thread_id, -m.id) = ?1 AND m.deleted_at_ms IS NULL
+               AND f.role IN ('trash','spam'){flag_filter}
+             ORDER BY m.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         Ok(stmt
             .query_map(params![thread_id], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?)
