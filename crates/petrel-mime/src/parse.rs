@@ -7,6 +7,8 @@
 
 use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders};
 
+use crate::encoded_word::merge_adjacent_encoded_words;
+
 /// One attachment's metadata. Bytes stay in the raw blob; this records where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
@@ -436,7 +438,12 @@ fn id_list(value: &HeaderValue<'_>) -> Vec<String> {
 /// Parses raw RFC822. Returns `None` only when the bytes yield no message at
 /// all; malformed-but-present mail parses with whatever could be salvaged.
 pub fn parse_message(raw: &[u8]) -> Option<ParsedMessage> {
-    let msg = MessageParser::default().parse(raw)?;
+    // mail-parser decodes each encoded-word to a string. Adjacent words that
+    // split a UTF-8 character (い folded as E3 | 81 84) become U+FFFD unless
+    // the octets are concatenated first. The blob is not rewritten.
+    let rewritten = merge_adjacent_encoded_words(raw);
+    let parsed = rewritten.as_ref();
+    let msg = MessageParser::default().parse(parsed)?;
 
     let from_list = addr_list(msg.from());
     let (from_display, from_addr) = match from_list.first() {
@@ -493,7 +500,7 @@ pub fn parse_message(raw: &[u8]) -> Option<ParsedMessage> {
             .headers()
             .iter()
             .map(|h| {
-                let value = raw
+                let value = parsed
                     .get(h.offset_start as usize..h.offset_end as usize)
                     .map(|b| String::from_utf8_lossy(b).trim().to_string())
                     .unwrap_or_default();
@@ -562,6 +569,71 @@ body\r\n";
         assert!(m.body_text.contains("lock pricing"));
         assert!(m.date_ms.unwrap() > 1_700_000_000_000);
         assert_eq!(m.addresses().len(), 3);
+    }
+
+    #[test]
+    fn split_utf8_encoded_words_merge_to_one_subject() {
+        // A folded Subject that splits い (E3 81 84) across two Base64 words.
+        let raw = b"From: billing@example.com\r\n\
+To: me@example.com\r\n\
+Subject: =?utf-8?B?44GU5Yip55So5paZ6YeR44Gu44GK5pSv5omV4w==?=\r\n\
+ =?utf-8?B?gYTjgYzlrozkuobjgZfjgb7jgZfjgZ8=?=\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\r\n\
+body\r\n";
+        let m = parse_message(raw).expect("parses");
+        let subject = m.subject.as_deref().expect("subject");
+        assert_eq!(subject, "ご利用料金のお支払いが完了しました");
+        assert!(
+            !subject.contains('\u{FFFD}'),
+            "split octets must not become replacement chars: {subject:?}"
+        );
+    }
+
+    #[test]
+    fn character_aligned_adjacent_utf8_b_words_still_decode() {
+        let raw = b"From: =?utf-8?B?5p2x5Lqs?= <tokyo@example.com>\r\n\
+Subject: =?utf-8?B?5p2x5Lqs?= =?utf-8?B?6KiI55S7?=\r\n\r\n\
+\xe6\x9d\xb1\xe4\xba\xac\xe8\xa8\x88\xe7\x94\xbb\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("東京計画"));
+        assert_eq!(m.from_display.as_deref(), Some("東京"));
+        assert_eq!(
+            m.body_text.trim(),
+            "東京計画",
+            "header/body split must survive the rewrite"
+        );
+    }
+
+    #[test]
+    fn different_charsets_are_not_merged() {
+        // Adjacent words, different charsets — independent decode only.
+        let raw = b"From: a@example.com\r\n\
+Subject: =?utf-8?B?5p2x5Lqs?= =?ISO-2022-JP?B?GyRCMnE1RCRON28bKEI=?=\r\n\r\n\
+x\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("東京会議の件"));
+
+        let raw = b"From: a@example.com\r\n\
+Subject: =?utf-8?B?5p2x5Lqs?= =?iso-8859-1?Q?caf=E9?=\r\n\r\n\
+x\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("東京café"));
+    }
+
+    #[test]
+    fn encoded_word_in_body_stays_literal() {
+        let raw = b"From: a@example.com\r\n\
+Subject: plain\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\r\n\
+See =?utf-8?B?5p2x5Lqs?= in the body.\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert!(
+            m.body_text.contains("=?utf-8?B?5p2x5Lqs?="),
+            "body encoded-word must not be rewritten: {:?}",
+            m.body_text
+        );
+        assert!(!m.body_text.contains("東京"));
     }
 
     #[test]

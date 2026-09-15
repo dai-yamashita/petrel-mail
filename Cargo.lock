@@ -3180,6 +3180,7 @@ name = "petrel-mime"
 version = "1.0.0"
 dependencies = [
  "ammonia",
+ "base64 0.22.1",
  "mail-parser",
  "thiserror 2.0.20",
  "url",

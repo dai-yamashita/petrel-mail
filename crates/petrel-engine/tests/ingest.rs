@@ -272,6 +272,93 @@ fn iso_2022_jp_ingests_readable_and_searchable() {
     store.fts_integrity_check().expect("index consistent");
 }
 
+/// Folded UTF-8 encoded-word Subject that splits い across two Base64 words.
+fn split_subject_utf8_mail() -> Vec<u8> {
+    b"From: billing@example.com\r\n\
+To: me@example.com\r\n\
+Subject: =?utf-8?B?44GU5Yip55So5paZ6YeR44Gu44GK5pSv5omV4w==?=\r\n\
+ =?utf-8?B?gYTjgYzlrozkuobjgZfjgb7jgZfjgZ8=?=\r\n\
+Date: Tue, 18 Aug 2026 14:02:00 +0000\r\n\
+Message-ID: <split-subject@example.com>\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\r\n\
+Payment confirmed.\r\n"
+        .to_vec()
+}
+
+#[test]
+fn split_utf8_subject_ingests_readable_and_searchable() {
+    let (_dir, mut store, blobs, account) = setup();
+    let raw = split_subject_utf8_mail();
+    let out = store
+        .ingest_raw(&blobs, account, None, Some(1), &raw)
+        .expect("ingest");
+
+    let rows = store.list_recent(0, 10).expect("list");
+    let row = rows.iter().find(|r| r.id == out.message_id).expect("row");
+    assert_eq!(row.subject, "ご利用料金のお支払いが完了しました");
+    assert!(
+        !row.subject.contains('\u{FFFD}'),
+        "split octets must not become replacement chars"
+    );
+
+    for query in ["支払い", "お支払い"] {
+        let hits = store.search(query, 10).expect("search");
+        assert!(
+            hits.iter().any(|h| h.message_id == out.message_id),
+            "query {query:?} should find the message"
+        );
+    }
+
+    let stored = blobs.read(&out.blob_hash).expect("read blob");
+    assert_eq!(stored, raw, "merge is parse-only; raw bytes unchanged");
+    store.fts_integrity_check().expect("index consistent");
+}
+
+#[test]
+fn reindex_repairs_split_utf8_subject() {
+    let (_dir, mut store, blobs, account) = setup();
+    let out = store
+        .ingest_raw(&blobs, account, None, Some(1), &split_subject_utf8_mail())
+        .expect("ingest");
+
+    // Version 5 decoded each word to a string — the three UTF-8 bytes of い
+    // each became U+FFFD.
+    let garbled = "ご利用料金のお支払\u{FFFD}\u{FFFD}\u{FFFD}が完了しました";
+    store
+        .overwrite_extracted(
+            out.message_id,
+            garbled,
+            garbled,
+            "Payment confirmed.",
+            "Payment confirmed.",
+        )
+        .expect("plant stale extraction");
+    store
+        .set_setting("extraction_version", "5")
+        .expect("roll version back");
+
+    let stale = store.list_recent(0, 10).expect("list");
+    let stale_row = stale.iter().find(|r| r.id == out.message_id).expect("row");
+    assert_eq!(stale_row.subject, garbled);
+    assert!(
+        store.search("お支払い", 10).expect("search").is_empty(),
+        "garbled subject must not match until reindex"
+    );
+
+    let n = store.reindex_bodies(&blobs).expect("reindex");
+    assert_eq!(n, 1);
+    assert_eq!(store.reindex_bodies(&blobs).expect("second pass"), 0);
+
+    let rows = store.list_recent(0, 10).expect("list");
+    let row = rows.iter().find(|r| r.id == out.message_id).expect("row");
+    assert_eq!(row.subject, "ご利用料金のお支払いが完了しました");
+    assert!(!row.subject.contains('\u{FFFD}'));
+    let hits = store.search("お支払い", 10).expect("search");
+    assert!(hits.iter().any(|h| h.message_id == out.message_id));
+    store.fts_integrity_check().expect("index consistent");
+}
+
 #[test]
 fn reindex_repairs_legacy_charset_columns() {
     let (_dir, mut store, blobs, account) = setup();
