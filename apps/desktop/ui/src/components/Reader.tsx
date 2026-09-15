@@ -96,6 +96,7 @@ function Expanded({
   onForward,
   onToast,
   onComposeMailto,
+  onHeight,
 }: {
   m: ThreadMessage;
   focused: boolean;
@@ -105,6 +106,7 @@ function Expanded({
   onForward?: (messageId: number) => void;
   onToast: (text: string) => void;
   onComposeMailto?: (to: string, subject: string) => void;
+  onHeight?: () => void;
 }) {
   return (
     <article className="msg" id={`msg-body-${m.id}`} data-focused={focused || undefined}>
@@ -235,7 +237,14 @@ function Expanded({
 
       {m.has_calendar && <InvitationCard messageId={m.id} onToast={onToast} />}
 
-      {mountBody && <MessageBody messageId={m.id} title={m.subject || t('no-subject')} />}
+      {mountBody && (
+        <MessageBody
+          key={m.id}
+          messageId={m.id}
+          title={m.subject || t('no-subject')}
+          onHeight={onHeight}
+        />
+      )}
 
       {m.attachments.length > 0 && (
         <Attachments messageId={m.id} attachments={m.attachments} onToast={onToast} />
@@ -570,6 +579,10 @@ export function Reader({
     virtualizer.measure();
   }, [expanded, virtualizer]);
 
+  const onBodyHeight = useCallback(() => {
+    virtualizer.measure();
+  }, [virtualizer]);
+
   // A new conversation starts with the row on screen. Older rows arriving
   // above it grow the stack; add that growth to scrollTop so the pinned
   // body stays where it was.
@@ -716,6 +729,7 @@ export function Reader({
                     onForward={onForwardFrom}
                     onToast={onToast}
                     onComposeMailto={onComposeMailto}
+                    onHeight={onBodyHeight}
                     onCollapse={() =>
                       setExpanded((prev) => {
                         const next = new Set(prev);
@@ -754,6 +768,7 @@ export function Reader({
                 onForward={onForwardFrom}
                 onToast={onToast}
                 onComposeMailto={onComposeMailto}
+                onHeight={onBodyHeight}
                 onCollapse={() =>
                   setExpanded((prev) => {
                     const next = new Set(prev);

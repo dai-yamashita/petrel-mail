@@ -428,8 +428,10 @@ fn document(body: &str, blocked_remote: usize, nonce: &str, theme: FrameTheme) -
   /* The frame is sized to its content by the host, so it must never grow its
      own vertical scrollbar — a scroll region inside a scroll region. Sideways
      is different: it is the last resort for content too wide to shrink to a
-     readable size, and reaching it beats having it silently cut off. */
-  html {{ overflow-y: hidden; overflow-x: auto; }}
+     readable size, and reaching it beats having it silently cut off.
+     `height: auto` on html and body stops a child's `height: 100%` resolving
+     against the iframe window, which then clipped the rest of the message. */
+  html {{ overflow-y: hidden; overflow-x: auto; height: auto; }}
   :root {{ color-scheme: light;
           --mv-bg: #fff; --mv-ink: #182730; --mv-ink2: #54666e;
           --mv-hair: #d9e1e2; --mv-mark: #fbf0c9; --mv-mark-on: #f6c945; }}
@@ -437,7 +439,7 @@ fn document(body: &str, blocked_remote: usize, nonce: &str, theme: FrameTheme) -
   :root {{ --petrel-size: 15px; }}
   body {{ margin: 0; padding: 14px 16px; background: var(--mv-bg); color: var(--mv-ink);
          font: var(--petrel-size)/1.6 -apple-system, system-ui, sans-serif;
-         word-wrap: break-word; }}
+         word-wrap: break-word; height: auto; }}
   /* `height: auto` cannot be the blanket rule here. It overrides the height a
      message declares on an image, recomputing it from the file's own aspect
      ratio — and mail is full of 1x1 spacer GIFs stretched by their width and
@@ -776,8 +778,31 @@ mod tests {
         let doc = document("<p>hi</p>", 0, "n", FrameTheme::AlwaysLight);
         assert!(doc.contains("getBoundingClientRect().bottom"), "{doc}");
         assert!(doc.contains("paddingBottom"), "{doc}");
-        // scrollHeight remains only as the path when the box is missing.
+        // scrollHeight remains only as the path when the box is missing,
+        // and as the unfitted layout height of #petrel-fit.
         assert!(doc.contains("scrollHeight"), "{doc}");
+        assert!(doc.contains("contentLayoutHeight"), "{doc}");
+        assert!(doc.contains("lastTransform"), "{doc}");
+    }
+
+    /// Wheel over the body never reaches the host scroller on its own.
+    #[test]
+    fn the_frame_forwards_a_vertical_wheel() {
+        let doc = document("<p>hi</p>", 0, "n", FrameTheme::AlwaysLight);
+        assert!(doc.contains("petrelWheel"), "{doc}");
+        assert!(doc.contains("passive: false"), "{doc}");
+    }
+
+    /// Percent heights on the message must not resolve against the iframe window.
+    #[test]
+    fn the_document_shell_is_as_tall_as_its_content() {
+        let doc = document("<p>hi</p>", 0, "n", FrameTheme::AlwaysLight);
+        assert!(
+            doc.contains("html { overflow-y: hidden; overflow-x: auto; height: auto; }"),
+            "{doc}"
+        );
+        assert!(doc.contains("height: auto;"), "{doc}");
+        assert!(doc.contains("200000"), "{doc}");
     }
 
     /// The preview is laid out as the sheet, which is what makes the fit
