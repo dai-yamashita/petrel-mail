@@ -1,7 +1,7 @@
 //! Reading mail: the conversation list, one conversation, search, and the views' counts.
 
 use crate::message_view::message_origin;
-use crate::state::{AppState, Timed, note_ui_touch};
+use crate::state::{AppState, Timed, active_account, note_ui_touch};
 use petrel_engine::store::{ListView, TagSummary, ThreadIndexRow, ThreadListing, ThreadMessage};
 use std::sync::Arc;
 use tauri::{Manager, State};
@@ -39,6 +39,24 @@ pub fn list_threads(
         None => store.list_threads(&view, offset, limit, sort),
     }
     .map_err(|e| e.to_string())
+}
+
+/// Asks the server about one mailbox the person just opened.
+///
+/// Those folders are not on the IDLE wake path. Waiting for the
+/// five-minute sweep is what made the list look stale next to the
+/// inbox. One folder, not every folder — a wake that swept the tree
+/// put the inbox behind half a minute again. Inbox, archive, tags,
+/// snoozed and outbox are ignored here: inbox has IDLE, archive is
+/// All Mail, the rest have no server folder to SELECT.
+#[tauri::command]
+pub async fn sync_mailbox(view: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let account = {
+        let store = state.store()?;
+        active_account(&store)?
+    };
+    crate::sync::spawn_view_sync(Arc::clone(state.inner()), account, &view);
+    Ok(())
 }
 
 /// One conversation by id, for a window that was opened onto it.

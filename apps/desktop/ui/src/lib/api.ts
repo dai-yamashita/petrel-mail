@@ -589,6 +589,7 @@ const mock = {
   createFolder: async () => 999,
   renameFolder: async () => {},
   pushDraft: async () => {},
+  syncMailbox: async () => {},
   unsubscribeInfo: async () => null,
   authenticationInfo: async () => null,
   printMessage: async () => {},
@@ -946,6 +947,7 @@ const real = {
     invoke<void>('unsubscribe_one_click', { messageId }),
   /** The composer closing must not wait out the 30s debounce. */
   pushDraft: (id: number) => invoke<void>('push_draft', { id }),
+  syncMailbox: (view: string) => invoke<void>('sync_mailbox', { view }),
   /** Server first, then the store — the id survives, so the open view does. */
   renameFolder: (folderId: number, newPath: string) =>
     invoke<void>('rename_folder', { folderId, newPath }),

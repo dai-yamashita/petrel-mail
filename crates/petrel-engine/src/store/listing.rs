@@ -153,6 +153,7 @@ impl Store {
         limit: u32,
         sort: Sort,
     ) -> Result<Vec<ThreadListing>> {
+        let walk = page_walk(view, account);
         self.listing_rows(
             account,
             ListingQuery {
@@ -162,6 +163,9 @@ impl Store {
                 offset,
                 bound: view.bound().map(str::to_string),
                 per_message: matches!(view, ListView::Folder(r) if r == "drafts"),
+                from_where: walk.as_ref().map(|w| w.from_where.clone()),
+                prefix: walk.as_ref().map(|w| w.prefix.clone()).unwrap_or_default(),
+                aliased: walk.as_ref().map(|w| w.aliased).unwrap_or(false),
                 sort,
                 before: None,
             },
@@ -184,6 +188,7 @@ impl Store {
         before_thread_id: i64,
     ) -> Result<Vec<ThreadListing>> {
         let account = self.active_account()?.unwrap_or(-1);
+        let walk = page_walk(view, account);
         self.listing_rows(
             account,
             ListingQuery {
@@ -193,6 +198,9 @@ impl Store {
                 offset: 0,
                 bound: view.bound().map(str::to_string),
                 per_message: matches!(view, ListView::Folder(r) if r == "drafts"),
+                from_where: walk.as_ref().map(|w| w.from_where.clone()),
+                prefix: walk.as_ref().map(|w| w.prefix.clone()).unwrap_or_default(),
+                aliased: walk.as_ref().map(|w| w.aliased).unwrap_or(false),
                 sort,
                 before: Some((before_date_ms, before_thread_id)),
             },
@@ -220,6 +228,9 @@ impl Store {
                 offset: 0,
                 bound: Some(thread_id.to_string()),
                 per_message: false,
+                from_where: None,
+                prefix: String::new(),
+                aliased: false,
                 sort: Sort::default(),
                 before: None,
             },
@@ -240,11 +251,115 @@ struct ListingQuery<'a> {
     /// a Message-ID, edited apart on the server — are still two drafts.
     /// Every other view groups into conversations.
     per_message: bool,
+    /// Membership or partial-index `FROM … WHERE`. None walks the date
+    /// index — inbox, archive, and "all", where matches are dense at the
+    /// head or the set *is* the mailbox.
+    from_where: Option<String>,
+    /// `WITH ids AS MATERIALIZED (…)` so membership walks start from
+    /// the folder, not from `idx_messages_account_date`. Empty when
+    /// the walk is the date index or a partial index.
+    prefix: String,
+    /// Columns in `from_where` are `m.*` (a join) rather than bare
+    /// `messages`.
+    aliased: bool,
     sort: Sort,
     /// Date-sort cursor: the last row's `(date_ms, thread_id)`. Sender and
     /// subject sorts ignore it and keep walking from offset, because those
     /// orders have no index to resume on.
     before: Option<(i64, i64)>,
+}
+
+/// Message ids that sit in a role folder. Shared by the count and the
+/// listing so a view cannot count one set and page another.
+fn role_folder_ids_sql(account: i64) -> String {
+    format!(
+        "SELECT p.message_id
+           FROM folders f
+           JOIN placements p ON p.folder_id = f.id
+          WHERE f.account_id = {account} AND f.role = ?3"
+    )
+}
+
+fn user_folder_ids_sql(folder_id: i64) -> String {
+    format!("SELECT message_id FROM placements WHERE folder_id = {folder_id}")
+}
+
+struct PageWalk {
+    /// `WITH ids AS MATERIALIZED (…)` — without this, `ORDER BY date`
+    /// makes SQLite walk `idx_messages_account_date` and probe each
+    /// row for a placement, which is the mailbox-sized plan the counts
+    /// already left behind.
+    prefix: String,
+    from_where: String,
+    aliased: bool,
+}
+
+fn membership_walk(ids_sql: &str, extra: &str) -> PageWalk {
+    // No `m.account_id = ?` here. Folders already scoped the ids, and
+    // that extra filter made SQLite walk `idx_messages_account_date`
+    // then bloom-probe the tiny id set — the mailbox-sized plan again.
+    PageWalk {
+        prefix: format!("WITH ids AS MATERIALIZED ({ids_sql}) "),
+        from_where: format!(
+            "FROM ids
+             JOIN messages m ON m.id = ids.message_id
+             WHERE m.deleted_at_ms IS NULL
+               {extra}"
+        ),
+        aliased: true,
+    }
+}
+
+/// Where a sparse view's page starts. None walks `(account_id, date_ms
+/// DESC)` — inbox, archive, and "all".
+fn page_walk(view: &ListView, account: i64) -> Option<PageWalk> {
+    match view {
+        ListView::Folder(role) if role == "archive" => None,
+        ListView::Folder(role) if role == "drafts" => Some(membership_walk(
+            &role_folder_ids_sql(account),
+            "AND m.send_after_ms IS NULL",
+        )),
+        ListView::Folder(_) => Some(membership_walk(&role_folder_ids_sql(account), "")),
+        ListView::UserFolder(id) => Some(membership_walk(&user_folder_ids_sql(*id), "")),
+        ListView::Tag(_) => Some(membership_walk(
+            "SELECT mt.message_id
+               FROM message_tags mt
+               JOIN tags tg ON tg.id = mt.tag_id
+              WHERE tg.name = ?3",
+            &format!("AND {binned}", binned = not_binned("m")),
+        )),
+        ListView::Starred => Some(PageWalk {
+            prefix: String::new(),
+            from_where: format!(
+                "FROM messages INDEXED BY idx_messages_flagged
+                 WHERE deleted_at_ms IS NULL AND account_id = {account}
+                   AND flags & {flagged} != 0 AND {binned}",
+                flagged = flags::FLAGGED,
+                binned = not_binned("messages"),
+            ),
+            aliased: false,
+        }),
+        ListView::Snoozed => Some(PageWalk {
+            prefix: String::new(),
+            from_where: format!(
+                "FROM messages INDEXED BY idx_messages_snoozed
+                 WHERE deleted_at_ms IS NULL AND account_id = {account}
+                   AND snoozed_until_ms IS NOT NULL
+                   AND snoozed_until_ms > (strftime('%s','now') * 1000)"
+            ),
+            aliased: false,
+        }),
+        ListView::Outbox => Some(PageWalk {
+            prefix: String::new(),
+            from_where: format!(
+                "FROM messages INDEXED BY idx_messages_send_after
+                 WHERE deleted_at_ms IS NULL AND account_id = {account}
+                   AND send_after_ms IS NOT NULL"
+            ),
+            aliased: false,
+        }),
+        ListView::Inbox | ListView::All => None,
+    }
 }
 
 impl Store {
@@ -278,11 +393,19 @@ impl Store {
 
     /// The conversations one page of the list shows, newest first.
     ///
-    /// Walks messages down `(account_id, date_ms DESC)` and keeps the first
-    /// sighting of each conversation, stopping the moment the page is full —
-    /// SQLite streams the rows, so a mailbox of any size costs about a page's
-    /// worth of them. A conversation's *position* is its newest message,
-    /// which is exactly what walking newest-first gives.
+    /// Inbox and the other dense views walk messages down
+    /// `(account_id, date_ms DESC)` and keep the first sighting of each
+    /// conversation, stopping the moment the page is full — SQLite streams
+    /// the rows, so a mailbox of any size costs about a page's worth of
+    /// them. A conversation's *position* is its newest message, which is
+    /// exactly what walking newest-first gives.
+    ///
+    /// Sparse views start from the same membership the counts use —
+    /// placements, tags, or a partial index — so a handful of sent or
+    /// starred rows costs those rows, not the mailbox. Inbox stays on
+    /// the date index: recent mail is dense there, so a page fills
+    /// after a short walk. Archive and "all" stay there too: archive
+    /// is most of a Gmail store, and "all" *is* the store.
     fn page_keys(&self, account: i64, q: &ListingQuery<'_>) -> Result<Vec<i64>> {
         let ListingQuery {
             inner,
@@ -290,18 +413,45 @@ impl Store {
             offset,
             bound,
             per_message,
+            from_where,
+            prefix,
+            aliased,
             sort,
             before,
             ..
         } = q;
-        let (limit, offset, per_message, sort, before) =
-            (*limit, *offset, *per_message, *sort, *before);
+        let (limit, offset, per_message, aliased, sort, before) =
+            (*limit, *offset, *per_message, *aliased, *sort, *before);
         let bound = bound.clone();
-        let key = if per_message {
-            "-id"
-        } else {
-            "coalesce(thread_id, -id)"
+        let prefix = prefix.as_str();
+        let (key, date_col, from_where) = match from_where {
+            Some(from) => {
+                let key = if per_message {
+                    "-m.id"
+                } else if aliased {
+                    "coalesce(m.thread_id, -m.id)"
+                } else {
+                    "coalesce(thread_id, -id)"
+                };
+                let date_col = if aliased { "m.date_ms" } else { "date_ms" };
+                (key, date_col, from.clone())
+            }
+            None => (
+                "coalesce(thread_id, -id)",
+                "date_ms",
+                format!(
+                    "FROM messages
+                     WHERE deleted_at_ms IS NULL AND account_id = {account} AND {inner}"
+                ),
+            ),
         };
+        let from_display = if aliased {
+            "m.from_display"
+        } else {
+            "from_display"
+        };
+        let from_addr = if aliased { "m.from_addr" } else { "from_addr" };
+        let subject_col = if aliased { "m.subject" } else { "subject" };
         // Two shapes, and which one runs is the whole performance story.
         //
         // By date, the walk *is* the sort: stream messages down the index and
@@ -317,9 +467,8 @@ impl Store {
         // somebody chose and would not be for every list open.
         let sql = match sort.key {
             SortKey::Date if !sort.ascending => format!(
-                "SELECT {key}, date_ms FROM messages
-                 WHERE deleted_at_ms IS NULL AND account_id = {account} AND {inner}
-                 ORDER BY date_ms DESC, {key} DESC"
+                "{prefix}SELECT {key}, {date_col} {from_where}
+                 ORDER BY {date_col} DESC, {key} DESC"
             ),
             SortKey::Date => {
                 // Ascending cannot stream. The first message met of a
@@ -330,10 +479,10 @@ impl Store {
                 // pages skipped conversations. Grouped first, like sender and
                 // subject, at the same cost, for a sort somebody chose.
                 format!(
-                    "SELECT n.k, n.d FROM (
-                       SELECT {key} AS k, max(date_ms) AS d FROM messages
-                        WHERE deleted_at_ms IS NULL AND account_id = {account} AND {inner}
-                        GROUP BY k
+                    "{prefix}SELECT n.k, n.d FROM (
+                       SELECT {key} AS k, max({date_col}) AS d
+                       {from_where}
+                       GROUP BY k
                      ) n
                      ORDER BY n.d ASC, n.k ASC"
                 )
@@ -350,13 +499,14 @@ impl Store {
                     _ => "lower(coalesce(nullif(n.subject,''), ''))",
                 };
                 format!(
-                    "SELECT n.k, n.d, {field} AS s FROM (
+                    "{prefix}SELECT n.k, n.d, {field} AS s FROM (
                        SELECT {key} AS k,
-                              max(date_ms) AS d,
-                              from_display, from_addr, subject
-                         FROM messages
-                        WHERE deleted_at_ms IS NULL AND account_id = {account} AND {inner}
-                        GROUP BY k
+                              max({date_col}) AS d,
+                              {from_display} AS from_display,
+                              {from_addr} AS from_addr,
+                              {subject_col} AS subject
+                       {from_where}
+                       GROUP BY k
                      ) n
                      ORDER BY nullif({field}, '') IS NULL, {field} {dir}, n.d DESC"
                 )
@@ -380,17 +530,23 @@ impl Store {
         let cursor_value: Option<String> = match (sort.key, before) {
             (SortKey::Sender | SortKey::Subject, Some((_, cursor_k))) => {
                 let expr = match sort.key {
-                    SortKey::Sender => "lower(coalesce(nullif(from_display,''), from_addr, ''))",
+                    SortKey::Sender => {
+                        if aliased {
+                            "lower(coalesce(nullif(m.from_display,''), m.from_addr, ''))"
+                        } else {
+                            "lower(coalesce(nullif(from_display,''), from_addr, ''))"
+                        }
+                    }
+                    _ if aliased => "lower(coalesce(nullif(m.subject,''), ''))",
                     _ => "lower(coalesce(nullif(subject,''), ''))",
                 };
                 // The key is an i64 the caller handed in, which is what
                 // makes writing it into the SQL safe; the view's own bound
                 // value is still bound, as ?3.
                 let scoped = format!(
-                    "SELECT {expr} FROM messages
-                      WHERE deleted_at_ms IS NULL AND account_id = {account}
-                        AND {key} = {cursor_k} AND {inner}
-                      ORDER BY date_ms DESC LIMIT 1"
+                    "{prefix}SELECT {expr} {from_where}
+                      AND {key} = {cursor_k}
+                      ORDER BY {date_col} DESC LIMIT 1"
                 );
                 let mut stmt = self.conn.prepare_cached(&scoped)?;
                 let supplied: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -408,15 +564,27 @@ impl Store {
                         |r| r.get(0),
                     )
                     .optional()?;
+                // The fallback has no `m` alias: it reads the messages
+                // table as itself. The in-view query above joins
+                // placements or tags and needs `m.`.
+                let fallback_expr = match sort.key {
+                    SortKey::Sender => "lower(coalesce(nullif(from_display,''), from_addr, ''))",
+                    _ => "lower(coalesce(nullif(subject,''), ''))",
+                };
+                let fallback_key = if per_message {
+                    "-id"
+                } else {
+                    "coalesce(thread_id, -id)"
+                };
                 match in_view {
                     Some(v) => Some(v),
                     None => self
                         .conn
                         .query_row(
                             &format!(
-                                "SELECT {expr} FROM messages
+                                "SELECT {fallback_expr} FROM messages
                                   WHERE deleted_at_ms IS NULL AND account_id = {account}
-                                    AND {key} = ?1
+                                    AND {fallback_key} = ?1
                                   ORDER BY date_ms DESC LIMIT 1"
                             ),
                             params![cursor_k],
@@ -558,6 +726,31 @@ impl Store {
         } else {
             "coalesce(m.thread_id, -m.id)"
         };
+        // Drafts keys are `-id`. An EXISTS drafts-placement plus
+        // `account_id = ?` makes SQLite walk `idx_messages_account_thread`
+        // and probe every live row. The ids are already the page: look
+        // them up by rowid and leave the mailbox index alone.
+        let (inner_pred, outer_pred) = if per_message {
+            let ids = keys
+                .iter()
+                .map(|k| (-*k).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            (
+                format!("id IN ({ids}) AND send_after_ms IS NULL"),
+                format!("m.id IN ({ids}) AND m.send_after_ms IS NULL"),
+            )
+        } else {
+            let holes = keys
+                .iter()
+                .map(|k| k.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            (
+                format!("account_id = {account} AND {inner} AND {key} IN ({holes})"),
+                format!("m.account_id = {account} AND {outer} AND {mkey} IN ({holes})"),
+            )
+        };
         let sql = format!(
             "SELECT coalesce(m.thread_id, -m.id), m.id, coalesce(m.from_display,''), coalesce(m.from_addr,''),
                     coalesce(m.subject,''), coalesce(m.snippet,''), m.date_ms, t.n,
@@ -576,36 +769,28 @@ impl Store {
                       max(CASE WHEN flags & 1 = 0 THEN 1 ELSE 0 END) AS unread,
                       max(CASE WHEN flags & 4 != 0 THEN 1 ELSE 0 END) AS starred,
                       max(has_attachments) AS attach
-               FROM messages WHERE deleted_at_ms IS NULL AND account_id = {account} AND {inner}
-                 AND {key} IN ({holes})
+               FROM messages WHERE deleted_at_ms IS NULL AND {inner_pred}
                GROUP BY {key}
              ) t ON {mkey} = t.thread_id AND m.date_ms = t.md
-             WHERE m.deleted_at_ms IS NULL AND m.account_id = {account} AND {outer}
-               AND {mkey} IN ({holes})
+             WHERE m.deleted_at_ms IS NULL AND {outer_pred}
              GROUP BY {mkey}
              ORDER BY m.date_ms DESC LIMIT ?1 OFFSET ?2",
-            inner = inner,
             tags_json = TAGS_JSON,
-            outer = outer,
-            account = account,
             key = key,
             mkey = mkey,
-            // Written into the SQL rather than bound: these are row ids this
-            // query just read out of the database, and mixing anonymous
-            // placeholders with the predicate's numbered ?3 is how a key
-            // silently gets bound as a folder role.
-            holes = keys
-                .iter()
-                .map(|k| k.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
+            inner_pred = inner_pred,
+            outer_pred = outer_pred,
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
         // Two params, or three when the view binds a folder role or tag name.
         // rusqlite rejects a count that does not match what the SQL references,
         // so this cannot be a fixed tuple.
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(limit), Box::new(offset)];
-        if let Some(b) = bound {
+        // Drafts no longer bind ?3: the page is the ids. A leftover
+        // bound would be a third argument the SQL does not name.
+        if stmt.parameter_count() > 2
+            && let Some(b) = bound
+        {
             args.push(Box::new(b));
         }
         let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
@@ -852,7 +1037,7 @@ impl Store {
             )?,
             ListView::UserFolder(id) => self.count_from_message_ids(
                 account,
-                &format!("SELECT message_id FROM placements WHERE folder_id = {id}"),
+                &user_folder_ids_sql(*id),
                 "",
                 "coalesce(m.thread_id, -m.id)",
                 total,
@@ -860,12 +1045,7 @@ impl Store {
             )?,
             ListView::Folder(role) if role == "drafts" => self.count_from_message_ids(
                 account,
-                &format!(
-                    "SELECT p.message_id
-                       FROM folders f
-                       JOIN placements p ON p.folder_id = f.id
-                      WHERE f.account_id = {account} AND f.role = ?3"
-                ),
+                &role_folder_ids_sql(account),
                 "AND m.send_after_ms IS NULL",
                 "-m.id",
                 total,
@@ -894,12 +1074,7 @@ impl Store {
             )?,
             ListView::Folder(role) => self.count_from_message_ids(
                 account,
-                &format!(
-                    "SELECT p.message_id
-                       FROM folders f
-                       JOIN placements p ON p.folder_id = f.id
-                      WHERE f.account_id = {account} AND f.role = ?3"
-                ),
+                &role_folder_ids_sql(account),
                 "",
                 "coalesce(m.thread_id, -m.id)",
                 total,
@@ -1419,5 +1594,94 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+}
+
+#[cfg(test)]
+mod listing_plan {
+    use super::*;
+
+    fn explain(store: &Store, sql: &str) -> String {
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        rows.join("\n")
+    }
+
+    #[test]
+    fn drafts_list_among_many_is_cheap() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store.ensure_test_account().unwrap();
+        let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+        let n = 8_000i64;
+        let msgs: Vec<NewMessage> = (0..n)
+            .map(|i| NewMessage {
+                account_id: account,
+                date_ms: 10_000 + i,
+                from_addr: "a@example.com".into(),
+                from_display: "A".into(),
+                to_addr: "me@example.com".into(),
+                subject: format!("inbox-{i}"),
+                body_text: "body".into(),
+            })
+            .collect();
+        let ids = store.insert_messages(&msgs).unwrap();
+        for id in &ids {
+            store.place_message(*id, inbox).unwrap();
+        }
+        store
+            .save_draft(account, None, "a@example.com", "d1", "one", "")
+            .unwrap();
+        store
+            .save_draft(account, None, "a@example.com", "d2", "two", "")
+            .unwrap();
+
+        let page_sql = format!(
+            "WITH ids AS MATERIALIZED (
+               SELECT p.message_id
+                 FROM folders f
+                 JOIN placements p ON p.folder_id = f.id
+                WHERE f.account_id = {account} AND f.role = 'drafts'
+             )
+             SELECT -m.id, m.date_ms
+             FROM ids
+             JOIN messages m ON m.id = ids.message_id
+             WHERE m.deleted_at_ms IS NULL
+               AND m.send_after_ms IS NULL
+             ORDER BY m.date_ms DESC, -m.id DESC"
+        );
+        let page_plan = explain(&store, &page_sql);
+        eprintln!("page_keys plan:\n{page_plan}");
+        assert!(
+            page_plan.contains("MATERIALIZE ids"),
+            "drafts page must collect placements first:\n{page_plan}"
+        );
+        assert!(
+            !page_plan.contains("idx_messages_account_date"),
+            "drafts page must not walk the date index:\n{page_plan}"
+        );
+
+        let rows_sql = "SELECT m.id FROM messages m WHERE m.id IN (1, 2) LIMIT 50";
+        let rows_plan = explain(&store, rows_sql);
+        eprintln!("rows_for_keys-shaped plan:\n{rows_plan}");
+        assert!(
+            !rows_plan.contains("idx_messages_account_thread"),
+            "drafts rows must not walk the account-thread index:\n{rows_plan}"
+        );
+
+        let start = std::time::Instant::now();
+        let rows = store
+            .list_threads(&ListView::Folder("drafts".into()), 0, 50, Sort::default())
+            .unwrap();
+        let ms = start.elapsed().as_millis();
+        eprintln!("list_threads drafts among {n}: {ms}ms n={}", rows.len());
+        assert_eq!(rows.len(), 2);
+        assert!(ms < 50, "drafts list took {ms}ms among {n} inbox messages");
     }
 }
