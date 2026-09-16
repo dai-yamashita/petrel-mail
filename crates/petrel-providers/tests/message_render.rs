@@ -410,6 +410,21 @@ mod deliverability {
     }
 
     #[test]
+    fn an_empty_paragraph_between_sentences_is_a_break() {
+        // TipTap writes <p></p> for a blank line. Clients collapse that, so
+        // the wire carries <p><br></p>. Edge empties are still dropped.
+        let out = rendered(&note(Some("<p></p><p>One.</p><p></p><p>Two.</p><p></p>")));
+        assert!(
+            out.contains("<p>One.</p><p><br></p><p>Two.</p>"),
+            "blank line missing in:\n{out}"
+        );
+        assert!(
+            !out.contains("<body><p></p>"),
+            "leading empty paragraph travelled in:\n{out}"
+        );
+    }
+
+    #[test]
     fn the_html_part_is_a_document_not_a_fragment() {
         let out = rendered(&note(Some("<p>Hello there.</p>")));
         assert!(

@@ -60,6 +60,15 @@ describe('plainTextFromDoc', () => {
     expect(plainTextFromDoc(doc(p(t('Done.')), p(), p()))).toBe('Done.');
   });
 
+  /* A blank line between sentences is a paragraph mark in CJK, not leftover
+     chrome. Collapsing three-or-more newlines used to fold it away. */
+  it('keeps a blank paragraph between sentences', () => {
+    expect(plainTextFromDoc(doc(p(t('One.')), p(), p(t('Two.'))))).toBe('One.\n\n\n\nTwo.');
+    expect(plainTextFromDoc(doc(p(t('One.')), p(), p(), p(t('Two.'))))).toBe(
+      'One.\n\n\n\n\n\nTwo.',
+    );
+  });
+
   it('survives a node it has never seen without losing the words', () => {
     const odd = { type: 'somethingNew', content: [t('still here')] };
     expect(plainTextFromDoc(doc(odd))).toContain('still here');
