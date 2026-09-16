@@ -25,6 +25,7 @@ import {
   bodiesToMount,
   COLLAPSED_ROW,
   EXPANDED_ROW_ESTIMATE,
+  headingSubject,
   keepExistingPane,
   nextExpanded,
   olderCards,
@@ -261,8 +262,12 @@ export function Reader({
   onForwardFrom,
   onToast,
   onComposeMailto,
+  extractionGen = 0,
 }: {
   thread: Thread | null;
+  /** Bumps after a re-extraction rewrites stored subjects. The pane
+   *  refetches the newest message so the h1 is not the list row's old copy. */
+  extractionGen?: number;
   /** Reply to one message of the thread rather than to its newest. Absent in
       the popped-out window, which has no composer to open. */
   onReplyTo?: (messageId: number, all: boolean) => void;
@@ -312,6 +317,7 @@ export function Reader({
   threadIdRef.current = thread?.thread_id;
   const detailsRef = useRef(details);
   detailsRef.current = details;
+  const extractionGenRef = useRef(extractionGen);
 
   // With the other hooks, above the empty-pane early return: a hook called
   // after it runs on some renders and not others, which is not a hook.
@@ -385,6 +391,16 @@ export function Reader({
       loadedThreadId: loadedThreadIdRef.current,
       requestedThreadId: requested,
     });
+    const genChanged = extractionGen !== extractionGenRef.current;
+    extractionGenRef.current = extractionGen;
+    if (genChanged && hold) {
+      setDetails((prev) => {
+        if (!prev.has(openId)) return prev;
+        const next = new Map(prev);
+        next.delete(openId);
+        return next;
+      });
+    }
     const applyFat = (fat: ThreadMessage) => {
       setDetails((prev) => {
         const next = new Map(prev);
@@ -424,7 +440,9 @@ export function Reader({
         // when it is not the one the row named (mail that arrived between
         // the listing and the open), or when the held conversation grew and
         // that row is not hydrated yet.
-        if (hold ? detailsRef.current.has(last.id) : last.id === openId) return;
+        // First open already fetched openId. A held conversation used to
+        // skip this too, so a rewritten subject never reached the h1.
+        if (!hold && !genChanged && last.id === openId) return;
         return api.threadMessage(last.id).then((fat) => {
           if (!live || !fat) return;
           applyFat(fat);
@@ -445,7 +463,7 @@ export function Reader({
     // changed the header's "3 messages" and not the cards until you left
     // and came back. Same thread, so the pane is held and only the index
     // and the newest message are fetched.
-  }, [thread?.thread_id, thread?.message_count, thread?.newest.id]);
+  }, [thread?.thread_id, thread?.message_count, thread?.newest.id, extractionGen]);
 
   // [ and ] walk the conversation. Handled here rather than in the global map
   // for the same reason j/k live in the list: the keys mean "within the thing
@@ -541,7 +559,9 @@ export function Reader({
   const paintedExpanded =
     newestExpanded && newestId != null ? new Set([...expanded, newestId]) : expanded;
   const mounted = bodiesToMount(paintedExpanded, newestId);
-  const subject = thread?.subject || t('no-subject');
+  const newestDetail = newestId != null ? details.get(newestId) : undefined;
+  const subject =
+    headingSubject(thread?.subject ?? '', newestDetail?.subject) || t('no-subject');
   const walkCards = hold && cards.length > 0 ? cards : newestCard ? [newestCard] : [];
   cardsRef.current = walkCards;
   olderRef.current = older;

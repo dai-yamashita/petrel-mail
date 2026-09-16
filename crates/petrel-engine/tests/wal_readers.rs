@@ -230,3 +230,21 @@ fn every_read_the_desktop_routes_works_on_a_secondary() {
     r.retention_mode(account).expect("retention_mode");
     r.thread_of(ingested.message_id).expect("thread_of");
 }
+
+#[test]
+fn truncate_succeeds_while_an_idle_secondary_is_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("petrel.db");
+    let mut store = Store::open(&path).expect("store");
+    let blobs = BlobStore::open(&dir.path().join("blobs")).expect("blobs");
+    let account = store.ensure_test_account().expect("account");
+    let _ = store
+        .ingest_raw(&blobs, account, None, Some(1), &fixture("ckpt@example.com"))
+        .expect("ingest");
+    let _reader = Store::open_secondary(&path).expect("secondary");
+    let r = store.checkpoint_wal().expect("truncate");
+    assert!(
+        !r.busy,
+        "an idle secondary must not keep the WAL from shrinking"
+    );
+}

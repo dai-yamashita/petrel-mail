@@ -507,6 +507,82 @@ mod reindex_batches {
         let (_d, mut store, blobs) = store_with(6);
         assert_eq!(store.reindex_bodies(&blobs).unwrap(), 6);
     }
+
+    fn setting_i64(store: &Store, key: &str) -> i64 {
+        store
+            .settings()
+            .unwrap()
+            .get(key)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn v6_rewrites_only_rows_with_replacement_chars() {
+        let (_d, mut store, blobs) = store_with(4);
+        let rows = store.list_recent(0, 10).unwrap();
+        let victim = rows[0].id;
+        let original = rows[0].subject.clone();
+        store
+            .overwrite_extracted(victim, "pay\u{FFFD}\u{FFFD}\u{FFFD}", "ok", "s", "s")
+            .unwrap();
+        store.set_setting("extraction_version", "5").unwrap();
+        store.set_setting("reindex_cursor", "0").unwrap();
+
+        let n = store.reindex_bodies(&blobs).unwrap();
+        assert_eq!(n, 1, "clean rows must not be rewritten");
+        let after = store.list_recent(0, 10).unwrap();
+        let fixed = after.iter().find(|r| r.id == victim).unwrap();
+        assert!(!fixed.subject.contains('\u{FFFD}'));
+        assert_eq!(fixed.subject, original);
+    }
+
+    #[test]
+    fn a_new_extraction_resets_a_cursor_left_by_the_previous_version() {
+        let (_d, mut store, blobs) = store_with(10);
+        store.set_setting("extraction_version", "5").unwrap();
+        store.set_setting("reindex_target", "6").unwrap();
+        store.set_setting("reindex_cursor", "0").unwrap();
+        let _ = store.reindex_batch(&blobs, 3).unwrap();
+        let first_three = setting_i64(&store, "reindex_cursor");
+        assert!(first_three > 0);
+
+        store.set_setting("extraction_version", "5").unwrap();
+        store.set_setting("reindex_target", "5").unwrap();
+        store
+            .set_setting("reindex_cursor", &first_three.to_string())
+            .unwrap();
+        let _ = store.reindex_batch(&blobs, 3).unwrap();
+        assert_eq!(
+            setting_i64(&store, "reindex_cursor"),
+            first_three,
+            "must restart from id 0, not continue past the leftover cursor"
+        );
+        assert_eq!(
+            setting_i64(&store, "reindex_target"),
+            Store::EXTRACTION_VERSION
+        );
+    }
+
+    #[test]
+    fn checkpoint_wal_truncates() {
+        let (_d, store, _blobs) = store_with(3);
+        let r = store.checkpoint_wal().unwrap();
+        assert!(!r.busy, "nothing else is using this file");
+    }
+
+    #[test]
+    fn an_in_flight_v6_pass_keeps_its_cursor() {
+        let (_d, mut store, blobs) = store_with(10);
+        store.set_setting("extraction_version", "5").unwrap();
+        store.set_setting("reindex_cursor", "5").unwrap();
+        let _ = store.reindex_batch(&blobs, 3).unwrap();
+        let cursor = setting_i64(&store, "reindex_cursor");
+        assert!(
+            cursor > 5,
+            "kept the leftover cursor, then advanced: {cursor}"
+        );
+    }
 }
 
 /// Is the explicit FTS rebuild at the end of a re-extraction doing anything?

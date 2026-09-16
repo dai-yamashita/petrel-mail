@@ -277,13 +277,16 @@ impl Store {
             // A role, or a folder the user made — by full path or by leaf, so
             // `in:receipts` and `in:projects/petrel` both say what they mean.
             // The parser lowercased the value; the comparisons follow suit.
+            // IN, not a correlated EXISTS. The EXISTS form made the planner
+            // walk the mailbox and probe FTS per row once `in:inbox` was
+            // added to a short token, and the window stopped answering.
             sql.push_str(
-                " AND EXISTS (SELECT 1 FROM placements p JOIN folders f ON f.id = p.folder_id
-                              WHERE p.message_id = m.id
-                                AND (f.role = ?
-                                     OR lower(f.path) = ?
-                                     OR lower(f.path) LIKE '%/' || ?
-                                     OR lower(f.path) LIKE '%.' || ?))",
+                " AND m.id IN (SELECT p.message_id FROM placements p
+                               JOIN folders fol ON fol.id = p.folder_id
+                              WHERE fol.role = ?
+                                 OR lower(fol.path) = ?
+                                 OR lower(fol.path) LIKE '%/' || ?
+                                 OR lower(fol.path) LIKE '%.' || ?)",
             );
             for _ in 0..4 {
                 args.push(Box::new(name.clone()));

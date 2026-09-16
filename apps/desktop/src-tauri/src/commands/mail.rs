@@ -150,7 +150,7 @@ pub fn view_counts(
         .iter()
         .map(|(k, v)| (k.clone(), petrel_engine::store::CountMode::parse(v)))
         .collect();
-    let store = state.store_read()?;
+    let store = state.store_read_counts()?;
     store.view_counts(&modes).map_err(|e| e.to_string())
 }
 
@@ -160,30 +160,33 @@ pub fn view_count(view: Option<String>, state: State<Arc<AppState>>) -> Result<i
     let _t = Timed::new("view_count");
     note_ui_touch(&state);
     let view = ListView::parse(view.as_deref().unwrap_or("inbox"));
-    let store = state.store_read()?;
+    let store = state.store_read_counts()?;
     store.conversations_in(&view).map_err(|e| e.to_string())
 }
 
 /// `sort` absent means best match — the order the ranking produced, which is
 /// the one thing a list cannot offer because a list has nothing to be relevant
 /// to. Any other value is the same key a list would take.
-#[tauri::command(async)]
-pub fn search_messages(
+#[tauri::command]
+pub async fn search_messages(
     query: String,
     sort: Option<String>,
     ascending: Option<bool>,
-    state: State<Arc<AppState>>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ThreadListing>, String> {
-    let _t = Timed::new("search");
-    note_ui_touch(&state);
-    let sort = sort.map(|key| petrel_engine::store::Sort {
-        key: petrel_engine::store::SortKey::parse(&key),
-        ascending: ascending.unwrap_or(false),
-    });
-    let store = state.store_read()?;
-    store
-        .search_threads_sorted(&query, 200, sort)
-        .map_err(|e| e.to_string())
+    super::off_runtime(state, move |state| {
+        let _t = Timed::new("search");
+        note_ui_touch(&state);
+        let sort = sort.map(|key| petrel_engine::store::Sort {
+            key: petrel_engine::store::SortKey::parse(&key),
+            ascending: ascending.unwrap_or(false),
+        });
+        let store = state.store_read()?;
+        store
+            .search_threads_sorted(&query, 200, sort)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// A one-message URL for the reading pane, spelled for this platform's

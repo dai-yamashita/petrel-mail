@@ -91,7 +91,8 @@ function statusNeedsRender(prev: Status | null, next: Status): boolean {
     prev.source !== next.source ||
     prev.retention !== next.retention ||
     prev.sync_error !== next.sync_error ||
-    prev.last_sync_ms !== next.last_sync_ms
+    prev.last_sync_ms !== next.last_sync_ms ||
+    prev.extraction_gen !== next.extraction_gen
   );
 }
 
@@ -163,6 +164,7 @@ export function App() {
     () => ({ threads: api.threads, search: api.search }),
     [],
   );
+  const extractionGenRef = useRef<number | null>(null);
   const { items, setItems, loading, error, loadMore, replaceEpoch } = useThreadWindow({
     query,
     view,
@@ -263,6 +265,12 @@ export function App() {
       api.status().then((s) => {
         if (!live) return;
         setStatus((prev) => (statusNeedsRender(prev, s) ? s : prev));
+        if (extractionGenRef.current === null) {
+          extractionGenRef.current = s.extraction_gen;
+        } else if (s.extraction_gen !== extractionGenRef.current) {
+          extractionGenRef.current = s.extraction_gen;
+          setAccountEpoch((n) => n + 1);
+        }
         // Keep asking after the first sync finishes, not just during it. The
         // engine polls the server every couple of minutes; if the window stops
         // listening once seeding ends, mail arrives into the store and nothing
@@ -1695,7 +1703,7 @@ export function App() {
       live = false;
       window.clearTimeout(t);
     };
-  }, [status?.count, status?.seeding, arrangement, accountEpoch, triageEpoch, setAccounts, setTags]);
+  }, [status?.count, arrangement, accountEpoch, triageEpoch, setAccounts, setTags]);
 
   // First run: no account can sign in, so there is nothing to show but the
   // way to add one. Decided from the status the app reports, not from an
@@ -2168,6 +2176,7 @@ export function App() {
       {(settings.layout !== 'off' || readerOverlay) && !opensComposer(view) && (
         <Reader
           thread={active}
+          extractionGen={status?.extraction_gen ?? 0}
           view={view}
           onToast={setToast}
           onComposeMailto={(to, subject) => {

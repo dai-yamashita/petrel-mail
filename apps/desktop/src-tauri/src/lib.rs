@@ -265,6 +265,17 @@ pub fn run() {
         Ok(s) => s,
         Err(e) => cannot_start("Its mailbox could not be opened.", &db, &e.to_string()),
     };
+    // Before the readers attach. TRUNCATE needs the other connections idle;
+    // a leftover multi-gigabyte WAL made every listing take tens of seconds.
+    // The frames are usually already in the main file, so this is a truncate
+    // of empty space, not a copy.
+    match store.checkpoint_wal() {
+        Ok(r) => log_sync(&format!(
+            "wal checkpoint on open: busy={} log={} checkpointed={}",
+            r.busy, r.log, r.checkpointed
+        )),
+        Err(e) => log_sync(&format!("wal checkpoint on open: {e}")),
+    }
     // One account row for now; the account model arrives with setup UI.
     let first = match store.first_account() {
         Ok(a) => a,
@@ -299,25 +310,26 @@ pub fn run() {
             &e.to_string(),
         ),
     };
-    // Four more connections, for reading while the sync loop writes. They
+    // Five more connections, for reading while the sync loop writes. They
     // need WAL, which the store asked for above; a filesystem that refused it
     // leaves the store on a rollback journal, where extra connections would
     // contend with the writer rather than run beside it. So a reader that
     // cannot be opened is not fatal: every read falls back to the write
     // connection, as it did before, and the log says so once.
     //
-    // Two share listing and recounts. One is only for a body URL. One is
-    // only for the conversation index, so older cards do not wait behind
-    // a recount and a body does not wait behind a long index.
+    // Two share listing and search. One is only for rail and footer counts,
+    // so a ten-second recount cannot hold a search. One is only for a body
+    // URL. One is only for the conversation index.
     let (readers, readers_live) = match (
         Store::open_secondary(&db),
         Store::open_secondary(&db),
         Store::open_secondary(&db),
         Store::open_secondary(&db),
+        Store::open_secondary(&db),
     ) {
-        (Ok(a), Ok(b), Ok(open), Ok(index)) => ([a, b, open, index], true),
-        (a, b, open, index) => {
-            let why = [a.err(), b.err(), open.err(), index.err()]
+        (Ok(a), Ok(b), Ok(counts), Ok(open), Ok(index)) => ([a, b, counts, open, index], true),
+        (a, b, counts, open, index) => {
+            let why = [a.err(), b.err(), counts.err(), open.err(), index.err()]
                 .into_iter()
                 .flatten()
                 .map(|e| e.to_string())
@@ -330,10 +342,13 @@ pub fn run() {
                 Ok(s) => s,
                 Err(e) => cannot_start("Its mailbox could not be opened.", &db, &e.to_string()),
             };
-            ([stand_in(), stand_in(), stand_in(), stand_in()], false)
+            (
+                [stand_in(), stand_in(), stand_in(), stand_in(), stand_in()],
+                false,
+            )
         }
     };
-    let [read_a, read_b, read_open, read_index] = readers;
+    let [read_a, read_b, read_counts, read_open, read_index] = readers;
 
     // Startup housekeeping: clear temp files left by an interrupted write, then
     // destroy anything whose grace period expired while the app was closed.
@@ -341,6 +356,7 @@ pub fn run() {
     let state = Arc::new(AppState {
         store: Mutex::new(store),
         reads: [Mutex::new(read_a), Mutex::new(read_b)],
+        read_counts: Mutex::new(read_counts),
         read_open: Mutex::new(read_open),
         read_index: Mutex::new(read_index),
         readers_live: AtomicBool::new(readers_live),
@@ -362,6 +378,7 @@ pub fn run() {
         pending_notify: Mutex::new(Vec::new()),
         pending_alerts: Mutex::new(Vec::new()),
         last_sync_ms: std::sync::atomic::AtomicI64::new(0),
+        extraction_gen: std::sync::atomic::AtomicI64::new(0),
         ui_touch_ms: std::sync::atomic::AtomicI64::new(0),
         server_total: std::sync::atomic::AtomicUsize::new(0),
         shown_once: Mutex::new(std::collections::HashSet::new()),

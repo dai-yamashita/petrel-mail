@@ -7,7 +7,7 @@ pub(crate) mod drain;
 use crate::diag::{friendly_sync_error_for, is_imap_parse_error, log_sync};
 use crate::send::{spawn_outbox_clock, spawn_send_worker};
 use crate::state::{AppState, now_ms, stopped, unless_stopped};
-use crate::sync::backfill::spawn_backfill;
+use crate::sync::backfill::{spawn_backfill, yield_to_user};
 use crate::sync::drain::{drain_actions, spawn_drain_worker};
 use petrel_engine::actions::ActionKind;
 use petrel_engine::store::Store;
@@ -60,6 +60,7 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
             // transactions to do it.
             const SLICE: usize = 250;
             let mut total = 0usize;
+            let mut progressed = false;
             loop {
                 if *stop.borrow() {
                     stand_down();
@@ -74,24 +75,54 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                     Ok(p) => {
                         total += p.done;
                         if p.finished {
+                            if total > 0 || progressed {
+                                if total > 0 {
+                                    log_sync(&format!(
+                                        "re-indexed {total} message(s) after an extraction change"
+                                    ));
+                                }
+                                state.extraction_gen.fetch_add(1, Ordering::Relaxed);
+                                // Do not wait for the UI to go quiet first.
+                                // A search in flight marks a touch forever
+                                // relative to this await, and the WAL stays huge.
+                                for _ in 0..20 {
+                                    match state.checkpoint_wal_truncate() {
+                                        Ok(r) if r.busy => {
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                250,
+                                            ))
+                                            .await;
+                                        }
+                                        Ok(r) => {
+                                            log_sync(&format!(
+                                                "wal checkpoint after re-index: busy={} log={} checkpointed={}",
+                                                r.busy, r.log, r.checkpointed
+                                            ));
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            log_sync(&format!(
+                                                "wal checkpoint after re-index: {e}"
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                             break;
                         }
+                        progressed = true;
                     }
                     Err(e) => {
                         log_sync(&format!("re-index failed: {e}"));
                         break;
                     }
                 }
-                // Hand the runtime back so a waiting command actually gets in.
-                // Without this the loop can re-take the lock before anything
-                // else is scheduled, which is the frozen window again with
-                // extra steps.
-                tokio::task::yield_now().await;
-            }
-            if total > 0 {
-                log_sync(&format!(
-                    "re-indexed {total} message(s) after an extraction change"
-                ));
+                // A slice that finishes and immediately retakes the lock
+                // starves listing. Sleep, then wait out a click if one
+                // landed while we were working.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                yield_to_user(&state).await;
             }
         }
 
