@@ -622,6 +622,28 @@ x\r\n";
     }
 
     #[test]
+    fn q_encoded_words_that_split_a_character_merge_too() {
+        // The same い, split after its first byte, but as Q words.
+        let raw = b"From: a@example.com\r\n\
+Subject: =?utf-8?Q?=E3=81=8A=E6=94=AF=E6=89=95=E3?=\r\n\
+ =?utf-8?Q?=81=84?=\r\n\r\n\
+x\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("お支払い"));
+    }
+
+    #[test]
+    fn charset_case_does_not_keep_a_split_run_apart() {
+        // One word says UTF-8, the next utf-8; the run is still one run.
+        let raw = b"From: a@example.com\r\n\
+Subject: =?UTF-8?B?44GK5pSv5omV4w==?=\r\n\
+ =?utf-8?B?gYQ=?=\r\n\r\n\
+x\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("お支払い"));
+    }
+
+    #[test]
     fn encoded_word_in_body_stays_literal() {
         let raw = b"From: a@example.com\r\n\
 Subject: plain\r\n\
