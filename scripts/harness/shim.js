@@ -198,9 +198,34 @@
     snippet: 'my reply',
     date_ms: rows[1].date_ms + 60000,
     unread: false,
+    // Its own subject, as the engine gives it: thread_message reads the
+    // message's stored subject, not the row's. A reading pane that takes its
+    // heading from the conversation's newest message shows this instead of
+    // the row, which in the inbox means a Re: appearing on every answered
+    // conversation. Caught exactly that way once.
+    subject: 'Re: ' + rows[1].subject,
   };
   rows[2].message_count = 2;
   var INDEX_DELAY = Number((String(location.search).match(/[?&]indexDelay=(\d+)/) || [])[1] || 0);
+  // ?repairAfter=N models the re-extraction finishing N ms after launch: the
+  // stored subject of conversation 2 was mojibake and is now repaired, and
+  // extraction_gen moves to say so. The window is supposed to notice from the
+  // status poll and reload the list; this is how that is checked without a
+  // store. The row starts out holding the broken copy.
+  var REPAIR_AFTER = Number((String(location.search).match(/[?&]repairAfter=(\d+)/) || [])[1] || 0);
+  var REPAIRED_SUBJECT = rows[1].subject;
+  if (REPAIR_AFTER) {
+    rows[1].subject = 'Conversation \u00e2\u0080\u0099 2';
+    rows[1].newest.subject = 'Re: ' + rows[1].subject;
+    window.setTimeout(function () {
+      rows[1].subject = REPAIRED_SUBJECT;
+      rows[1].newest.subject = 'Re: ' + REPAIRED_SUBJECT;
+      window.__PETREL_REPAIRED__ = true;
+    }, REPAIR_AFTER);
+  }
+  function extractionGen() {
+    return window.__PETREL_REPAIRED__ ? 1 : 0;
+  }
   function afterIndexDelay(value) {
     if (!INDEX_DELAY) return value;
     return new Promise(function (resolve) { setTimeout(function () { resolve(value); }, INDEX_DELAY); });
@@ -386,6 +411,7 @@
       try { configured = localStorage.getItem('__petrel_unconfigured') !== '1'; } catch (e) {}
       return {
         last_sync_ms: Date.now() - 3 * 60000,
+        extraction_gen: extractionGen(),
         notify: (function () {
           if (location.search.indexOf('ruleNotify=1') === -1) return [];
           window.__STATUS_N__ = (window.__STATUS_N__ || 0) + 1;
@@ -671,7 +697,7 @@
         snippet: row.snippet,
         unread: !!row.unread,
         date_ms: row.date_ms,
-        subject: row.subject,
+        subject: card.subject || row.subject,
         recipients: ['me'],
         recipient_addrs: ['you@example.com'],
         attachments: [

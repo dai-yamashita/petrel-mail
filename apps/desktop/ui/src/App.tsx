@@ -1703,7 +1703,7 @@ export function App() {
       live = false;
       window.clearTimeout(t);
     };
-  }, [status?.count, arrangement, accountEpoch, triageEpoch, setAccounts, setTags]);
+  }, [status?.count, status?.seeding, arrangement, accountEpoch, triageEpoch, setAccounts, setTags]);
 
   // First run: no account can sign in, so there is nothing to show but the
   // way to add one. Decided from the status the app reports, not from an

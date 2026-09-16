@@ -25,7 +25,6 @@ import {
   bodiesToMount,
   COLLAPSED_ROW,
   EXPANDED_ROW_ESTIMATE,
-  headingSubject,
   keepExistingPane,
   nextExpanded,
   olderCards,
@@ -265,8 +264,10 @@ export function Reader({
   extractionGen = 0,
 }: {
   thread: Thread | null;
-  /** Bumps after a re-extraction rewrites stored subjects. The pane
-   *  refetches the newest message so the h1 is not the list row's old copy. */
+  /** Bumps after a re-extraction rewrites stored text. The pane drops the
+   *  open message and fetches it again, so a repaired sender name reaches the
+   *  card. The heading needs no help: the same bump reloads the list, and the
+   *  h1 is the list row's subject. */
   extractionGen?: number;
   /** Reply to one message of the thread rather than to its newest. Absent in
       the popped-out window, which has no composer to open. */
@@ -559,9 +560,7 @@ export function Reader({
   const paintedExpanded =
     newestExpanded && newestId != null ? new Set([...expanded, newestId]) : expanded;
   const mounted = bodiesToMount(paintedExpanded, newestId);
-  const newestDetail = newestId != null ? details.get(newestId) : undefined;
-  const subject =
-    headingSubject(thread?.subject ?? '', newestDetail?.subject) || t('no-subject');
+  const subject = thread?.subject || t('no-subject');
   const walkCards = hold && cards.length > 0 ? cards : newestCard ? [newestCard] : [];
   cardsRef.current = walkCards;
   olderRef.current = older;

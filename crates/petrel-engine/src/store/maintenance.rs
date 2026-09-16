@@ -17,8 +17,11 @@ pub struct WalCheckpoint {
 /// How far one slice of the re-extraction got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReindexProgress {
-    /// Messages rewritten by this slice.
-    pub done: usize,
+    /// Messages this slice read and re-parsed.
+    pub read: usize,
+    /// Of those, the ones whose stored text the new extractor disagreed with.
+    /// The rest were left exactly as they were, and cost no write at all.
+    pub rewritten: usize,
     /// True when there is nothing left and the version has been moved.
     pub finished: bool,
 }
@@ -89,15 +92,19 @@ impl Store {
     ///
     /// Runs when the extraction version moves, and not otherwise: it re-parses
     /// every blob, which is cheap for a few hundred messages and not something
-    /// to do at every launch. Returns how many were rewritten.
+    /// to do at every launch.
     ///
     /// Does not re-thread. A conversation grouped under a garbled subject stays
     /// grouped; only the displayed and indexed text is repaired.
+    ///
+    /// Returns how many messages it read. A row the new extractor agrees with
+    /// is read and not written; `ReindexProgress::rewritten` is the count of
+    /// the ones that actually changed.
     pub fn reindex_bodies(&mut self, blobs: &crate::blob::BlobStore) -> Result<usize> {
         let mut total = 0usize;
         loop {
             let batch = self.reindex_batch(blobs, usize::MAX)?;
-            total += batch.done;
+            total += batch.read;
             if batch.finished {
                 return Ok(total);
             }
@@ -129,7 +136,8 @@ impl Store {
             .unwrap_or(0);
         if held >= Self::EXTRACTION_VERSION {
             return Ok(ReindexProgress {
-                done: 0,
+                read: 0,
+                rewritten: 0,
                 finished: true,
             });
         }
@@ -139,33 +147,32 @@ impl Store {
             .get("reindex_cursor")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        // A leftover cursor belongs to the version that wrote it. A new
-        // extraction must start at id 0, or the first stretch is never
-        // rewritten. The first time we record a target, keep the cursor:
-        // that is an in-flight pass of this same version (the upgrade that
-        // introduced the key).
+        // A leftover cursor belongs to the version that wrote it, so a new
+        // extraction starts at id 0 or the first stretch is never reached.
+        // Unconditionally: a store interrupted mid-pass by the upgrade that
+        // introduced this key has a cursor from the *older* extractor, and
+        // keeping it skipped every row below it for good. Re-reading a
+        // stretch that was already correct costs blob reads and writes
+        // nothing, because a row that has not changed is not written.
         let target: i64 = settings
             .get("reindex_target")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         if target != Self::EXTRACTION_VERSION {
             self.set_setting("reindex_target", &Self::EXTRACTION_VERSION.to_string())?;
-            if target != 0 {
-                self.set_setting("reindex_cursor", "0")?;
-                cursor = 0;
-            }
+            self.set_setting("reindex_cursor", "0")?;
+            cursor = 0;
         }
 
-        let rows: Vec<(i64, String, String, String)> = {
+        let rows: Vec<(i64, String)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, blob_hash, coalesce(subject, ''), coalesce(from_display, '')
-                 FROM messages
+                "SELECT id, blob_hash FROM messages
                  WHERE blob_hash IS NOT NULL AND deleted_at_ms IS NULL AND id > ?1
                  ORDER BY id LIMIT ?2",
             )?;
             let it = stmt.query_map(
                 params![cursor, i64::try_from(limit).unwrap_or(i64::MAX)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             it.collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -184,45 +191,48 @@ impl Store {
             self.set_setting("reindex_cursor", "0")?;
             self.set_setting("reindex_target", &Self::EXTRACTION_VERSION.to_string())?;
             return Ok(ReindexProgress {
-                done: 0,
+                read: 0,
+                rewritten: 0,
                 finished: true,
             });
         }
-        let last_id = rows.last().map(|(id, _, _, _)| *id).unwrap_or(cursor);
-        // Version 6 only repairs encoded-words that became U+FFFD. Reading
-        // every blob on a mailbox of hundreds of thousands holds the lock
-        // for tens of minutes and grows the WAL by gigabytes. Rows whose
-        // stored text has no replacement character are already fine.
-        let fffd_only = held == 5 && Self::EXTRACTION_VERSION == 6;
-        let to_rewrite: Vec<(i64, String)> = rows
-            .iter()
-            .filter(|(_, _, subject, from)| {
-                !fffd_only || subject.contains('\u{FFFD}') || from.contains('\u{FFFD}')
-            })
-            .map(|(id, hash, _, _)| (*id, hash.clone()))
-            .collect();
-        if to_rewrite.is_empty() {
-            self.set_setting("reindex_cursor", &last_id.to_string())?;
-            return Ok(ReindexProgress {
-                done: 0,
-                finished: false,
-            });
-        }
+        let last_id = rows.last().map(|(id, _)| *id).unwrap_or(cursor);
 
         let tx = self.conn.transaction()?;
-        let mut done = 0usize;
+        let mut read = 0usize;
+        let mut rewritten = 0usize;
         {
+            // Both writes carry their own "only if it moved" test, so a row
+            // the new extractor agrees with costs no page of the database and
+            // no page of the write-ahead log.
+            //
+            // Deciding that from the *stored* text instead — "rewrite the rows
+            // that still hold a replacement character" — is what the first
+            // version of this did, and it was wrong. A header folded on a
+            // character boundary inside an ISO-2022-JP run decodes to bare
+            // ASCII with no replacement character anywhere in it, which is the
+            // ordinary shape of the breakage in Japanese mail; those rows were
+            // walked straight past and then marked done for good. The blob has
+            // to be read and parsed to know. What can be skipped is the write,
+            // and the write is what grew the log by gigabytes: five statements
+            // a row, two of them feeding full-text indexes.
             let mut upd_msg = tx.prepare(
                 "UPDATE messages SET from_addr = ?2, from_display = ?3, subject = ?4,
                         subject_norm = ?5, snippet = ?6
-                 WHERE id = ?1",
+                 WHERE id = ?1
+                   AND (from_addr IS NOT ?2 OR from_display IS NOT ?3 OR subject IS NOT ?4
+                        OR subject_norm IS NOT ?5 OR snippet IS NOT ?6)",
             )?;
             let mut upd_fts = tx.prepare(
                 "INSERT INTO fts_content(message_id, subject, body_text, addrs, attachment_names)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(message_id) DO UPDATE SET
                     subject = excluded.subject, body_text = excluded.body_text,
-                    addrs = excluded.addrs, attachment_names = excluded.attachment_names",
+                    addrs = excluded.addrs, attachment_names = excluded.attachment_names
+                 WHERE subject IS NOT excluded.subject
+                    OR body_text IS NOT excluded.body_text
+                    OR addrs IS NOT excluded.addrs
+                    OR attachment_names IS NOT excluded.attachment_names",
             )?;
             let mut del_addr = tx.prepare("DELETE FROM message_addresses WHERE message_id = ?1")?;
             let mut ins_addr = tx.prepare(
@@ -232,13 +242,14 @@ impl Store {
             let mut upd_att = tx.prepare(
                 "UPDATE attachments SET filename = ?3 WHERE message_id = ?1 AND part_id = ?2",
             )?;
-            for (id, hash) in to_rewrite {
+            for (id, hash) in rows {
                 // A blob that will not read is not a reason to abandon the
                 // rest; it keeps whatever text it already had.
                 let Ok(raw) = blobs.read(&hash) else { continue };
                 let Some(parsed) = petrel_mime::parse_message(&raw) else {
                     continue;
                 };
+                read += 1;
                 let text = parsed.index_text();
                 let snippet = preview_of(&text);
                 let subject = parsed.subject.clone().unwrap_or_default();
@@ -259,7 +270,7 @@ impl Store {
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                upd_msg.execute(params![
+                let msg_moved = upd_msg.execute(params![
                     id,
                     parsed.from_addr,
                     parsed.from_display,
@@ -267,7 +278,17 @@ impl Store {
                     subject_norm,
                     snippet,
                 ])?;
-                upd_fts.execute(params![id, &subject, text, addrs_text, attachment_names])?;
+                let fts_moved =
+                    upd_fts.execute(params![id, &subject, text, addrs_text, attachment_names])?;
+                if msg_moved == 0 && fts_moved == 0 {
+                    // Sender, subject, body, addresses and attachment names
+                    // all already say what this parse says. The address rows
+                    // and the attachment filenames are built from the same
+                    // parse as `addrs` and `attachment_names`, in the same
+                    // order, so they agree too — and rewriting them would
+                    // only be a delete and re-insert of identical rows.
+                    continue;
+                }
                 del_addr.execute(params![id])?;
                 for (role, addr, name) in parsed.addresses() {
                     ins_addr.execute(params![id, role, addr, name])?;
@@ -275,7 +296,7 @@ impl Store {
                 for (i, a) in parsed.attachments.iter().enumerate() {
                     upd_att.execute(params![id, i as i64, a.filename])?;
                 }
-                done += 1;
+                rewritten += 1;
             }
         }
         tx.commit()?;
@@ -284,7 +305,8 @@ impl Store {
         // next launch, for ever.
         self.set_setting("reindex_cursor", &last_id.to_string())?;
         Ok(ReindexProgress {
-            done,
+            read,
+            rewritten,
             finished: false,
         })
     }

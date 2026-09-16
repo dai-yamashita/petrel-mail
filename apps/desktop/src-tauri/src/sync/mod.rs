@@ -7,7 +7,7 @@ pub(crate) mod drain;
 use crate::diag::{friendly_sync_error_for, is_imap_parse_error, log_sync};
 use crate::send::{spawn_outbox_clock, spawn_send_worker};
 use crate::state::{AppState, now_ms, stopped, unless_stopped};
-use crate::sync::backfill::{spawn_backfill, yield_to_user};
+use crate::sync::backfill::spawn_backfill;
 use crate::sync::drain::{drain_actions, spawn_drain_worker};
 use petrel_engine::actions::ActionKind;
 use petrel_engine::store::Store;
@@ -73,7 +73,7 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                 };
                 match outcome {
                     Ok(p) => {
-                        total += p.done;
+                        total += p.rewritten;
                         if p.finished {
                             if total > 0 || progressed {
                                 if total > 0 {
@@ -119,10 +119,14 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                     }
                 }
                 // A slice that finishes and immediately retakes the lock
-                // starves listing. Sleep, then wait out a click if one
-                // landed while we were working.
+                // starves listing, so hand the runtime back for a beat.
+                //
+                // A beat, and not "wait until the window has been quiet":
+                // this is a repair, not history backfill. Waiting the user
+                // out lets somebody who keeps working hold a garbled
+                // subject on screen for the whole session, and the lock is
+                // already released between slices either way.
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                yield_to_user(&state).await;
             }
         }
 

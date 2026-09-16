@@ -114,13 +114,3 @@ export function bodiesToMount(
 
   return out;
 }
-
-/** Subject the reading pane puts in the h1.
- *
- *  The list row can still hold a pre-repair copy after a re-extraction.
- *  The hydrated newest message is what the store has now. */
-export function headingSubject(listSubject: string, newestSubject: string | undefined): string {
-  const newest = newestSubject?.trim();
-  if (newest) return newest;
-  return listSubject;
-}

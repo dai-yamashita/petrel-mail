@@ -277,16 +277,20 @@ impl Store {
             // A role, or a folder the user made — by full path or by leaf, so
             // `in:receipts` and `in:projects/petrel` both say what they mean.
             // The parser lowercased the value; the comparisons follow suit.
-            // IN, not a correlated EXISTS. The EXISTS form made the planner
-            // walk the mailbox and probe FTS per row once `in:inbox` was
-            // added to a short token, and the window stopped answering.
+            // EXISTS rather than `m.id IN (…)`. The IN form was tried, on the
+            // theory that the correlated subquery made the planner walk the
+            // mailbox; measured on a real store of twenty-nine thousand it was
+            // slower at every width — 7.4ms against 1.3ms for one exact token,
+            // 92ms against 84ms for the broadest prefix — because it builds the
+            // whole mailbox's placement list whatever the match narrows to.
+            // Both plans open on the FTS match, so neither walks the mailbox.
             sql.push_str(
-                " AND m.id IN (SELECT p.message_id FROM placements p
-                               JOIN folders fol ON fol.id = p.folder_id
-                              WHERE fol.role = ?
-                                 OR lower(fol.path) = ?
-                                 OR lower(fol.path) LIKE '%/' || ?
-                                 OR lower(fol.path) LIKE '%.' || ?)",
+                " AND EXISTS (SELECT 1 FROM placements p JOIN folders f ON f.id = p.folder_id
+                              WHERE p.message_id = m.id
+                                AND (f.role = ?
+                                     OR lower(f.path) = ?
+                                     OR lower(f.path) LIKE '%/' || ?
+                                     OR lower(f.path) LIKE '%.' || ?))",
             );
             for _ in 0..4 {
                 args.push(Box::new(name.clone()));

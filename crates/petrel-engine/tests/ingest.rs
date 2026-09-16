@@ -450,7 +450,7 @@ mod reindex_batches {
     fn a_slice_does_its_share_and_says_there_is_more() {
         let (_d, mut store, blobs) = store_with(10);
         let first = store.reindex_batch(&blobs, 4).unwrap();
-        assert_eq!(first.done, 4);
+        assert_eq!(first.read, 4, "four rows read");
         assert!(!first.finished, "four of ten is not finished");
     }
 
@@ -461,7 +461,7 @@ mod reindex_batches {
         let mut slices = 0;
         loop {
             let p = store.reindex_batch(&blobs, 3).unwrap();
-            seen += p.done;
+            seen += p.read;
             slices += 1;
             if p.finished {
                 break;
@@ -479,7 +479,7 @@ mod reindex_batches {
         while !store.reindex_batch(&blobs, 2).unwrap().finished {}
         // Now current: another pass must do nothing at all.
         let again = store.reindex_batch(&blobs, 2).unwrap();
-        assert_eq!(again.done, 0);
+        assert_eq!(again.read, 0);
         assert!(again.finished);
         assert_eq!(store.reindex_bodies(&blobs).unwrap(), 0);
     }
@@ -517,8 +517,11 @@ mod reindex_batches {
             .unwrap_or(0)
     }
 
+    /// Every row is read; only the ones whose stored text the extractor
+    /// disagrees with are written. That is what keeps the write-ahead log
+    /// small without ever skipping a repair.
     #[test]
-    fn v6_rewrites_only_rows_with_replacement_chars() {
+    fn only_rows_the_extractor_disagrees_with_are_written() {
         let (_d, mut store, blobs) = store_with(4);
         let rows = store.list_recent(0, 10).unwrap();
         let victim = rows[0].id;
@@ -529,8 +532,9 @@ mod reindex_batches {
         store.set_setting("extraction_version", "5").unwrap();
         store.set_setting("reindex_cursor", "0").unwrap();
 
-        let n = store.reindex_bodies(&blobs).unwrap();
-        assert_eq!(n, 1, "clean rows must not be rewritten");
+        let p = store.reindex_batch(&blobs, 100).unwrap();
+        assert_eq!(p.read, 4, "every row is read");
+        assert_eq!(p.rewritten, 1, "only the one that changed is written");
         let after = store.list_recent(0, 10).unwrap();
         let fixed = after.iter().find(|r| r.id == victim).unwrap();
         assert!(!fixed.subject.contains('\u{FFFD}'));
@@ -564,6 +568,46 @@ mod reindex_batches {
         );
     }
 
+    /// The v6 repair must reach a subject that was folded in the middle of an
+    /// ISO-2022-JP run.
+    ///
+    /// A mailer that splits the header on a character boundary and forgets to
+    /// re-open the JIS mode in the second word leaves no replacement character
+    /// at all — the tail decodes as ASCII. That is the ordinary shape of this
+    /// breakage in Japanese mail, and a pass that only looks for U+FFFD walks
+    /// straight past it, then marks the store done for good.
+    #[test]
+    fn a_folded_iso_2022_jp_subject_is_repaired_too() {
+        let dir = TempDir::new().unwrap();
+        let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+        let blobs = BlobStore::open(&dir.path().join("blobs")).unwrap();
+        let account = store.ensure_test_account().unwrap();
+        let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+        // "これは本文です。" cut on a character boundary inside the JIS run.
+        let raw = b"From: Dana <dana@example.com>\r\nTo: me@example.com\r\n\
+Subject: =?ISO-2022-JP?B?GyRCJDM=?=\r\n =?ISO-2022-JP?B?JGwkT0tcSjgkRyQ5ISMbKEI=?=\r\n\
+Date: Tue, 18 Aug 2026 14:02:00 +0000\r\nMessage-ID: <jis@x>\r\nMIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n";
+        let ing = store
+            .ingest_raw(&blobs, account, Some(inbox), Some(1), raw)
+            .unwrap();
+        let id = ing.message_id;
+        // What the previous extractor stored: the tail as bare ASCII, and not
+        // one replacement character anywhere in it.
+        let stale = "こ$l$OK\\J8$G$9!#";
+        assert!(!stale.contains('\u{FFFD}'), "the stale copy is clean ASCII");
+        store
+            .overwrite_extracted(id, stale, "Dana", "body", "body")
+            .unwrap();
+        store.set_setting("extraction_version", "5").unwrap();
+        store.set_setting("reindex_cursor", "0").unwrap();
+
+        store.reindex_bodies(&blobs).unwrap();
+
+        let got = store.thread_message(id).unwrap().unwrap().subject;
+        assert_eq!(got, "これは本文です。", "the fold was never repaired");
+    }
+
     #[test]
     fn checkpoint_wal_truncates() {
         let (_d, store, _blobs) = store_with(3);
@@ -571,17 +615,36 @@ mod reindex_batches {
         assert!(!r.busy, "nothing else is using this file");
     }
 
+    /// A pass interrupted by the upgrade itself starts over.
+    ///
+    /// The cursor belongs to whichever extractor wrote it. Honouring one left
+    /// by the previous version — even once, on the launch that first records a
+    /// target — skips every row below it for good, because the version marker
+    /// moves when the pass reaches the end.
     #[test]
-    fn an_in_flight_v6_pass_keeps_its_cursor() {
+    fn a_cursor_left_by_an_older_extractor_is_not_honoured() {
         let (_d, mut store, blobs) = store_with(10);
+        let ids: Vec<i64> = store
+            .list_recent(0, 20)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        let low = *ids.iter().min().unwrap();
         store.set_setting("extraction_version", "5").unwrap();
-        store.set_setting("reindex_cursor", "5").unwrap();
-        let _ = store.reindex_batch(&blobs, 3).unwrap();
+        store
+            .set_setting("reindex_cursor", &ids[5].to_string())
+            .unwrap();
+
+        let p = store.reindex_batch(&blobs, 3).unwrap();
+
+        assert_eq!(p.read, 3);
         let cursor = setting_i64(&store, "reindex_cursor");
         assert!(
-            cursor > 5,
-            "kept the leftover cursor, then advanced: {cursor}"
+            cursor < ids[5],
+            "resumed past the leftover cursor instead of starting over: {cursor}"
         );
+        assert!(cursor >= low, "cursor went nowhere: {cursor}");
     }
 }
 
