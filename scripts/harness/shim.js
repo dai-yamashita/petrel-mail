@@ -242,6 +242,12 @@
   rows[5].filed = 'sent';
   rows[6].filed = 'sent';
   rows[7].filed = 'drafts';
+  // The leftover reply draft shares conversation 2's thread, as a draft does
+  // once it has been pushed and ingested. Modelled rather than left unthreaded:
+  // an unthreaded draft files only itself, so the fixture that looked fine was
+  // the one case the bug could not appear in. Binning this row used to file
+  // conversation 2's inbox mail and Sent reply along with it.
+  rows[7].thread_id = rows[1].thread_id;
   // One filed into a user folder, so the way back out is exercisable.
   rows[8].filed = 7;
   rows[8].tags = [{ id: 11, name: 'Urgent', colour: '#A8544B' }];
@@ -595,9 +601,20 @@
       return null;
     },
     get_settings: function () {
-      return {};
+      // Kept, not discarded. The real store persists preferences, so a shim
+      // that forgets them cannot show anything a preference drives — the
+      // language among them, which now decides `<html lang>` and with it which
+      // font WebKit picks for a Han character. Preset it with
+      // localStorage.__petrel_settings to open the harness in a language.
+      try { return JSON.parse(localStorage.getItem('__petrel_settings') || '{}'); } catch (e) { return {}; }
     },
-    set_setting: function () {
+    set_setting: function (a) {
+      try {
+        var all = JSON.parse(localStorage.getItem('__petrel_settings') || '{}');
+        if (a.value === '' || a.value == null) delete all[a.key];
+        else all[a.key] = a.value;
+        localStorage.setItem('__petrel_settings', JSON.stringify(all));
+      } catch (e) {}
       return null;
     },
     set_account_color: function () {
@@ -855,9 +872,19 @@
       return null;
     },
     triage: function (a) {
+      var tr = window.__TRIAGE_PROBE__ || { calls: [] };
+      tr.calls.push({ threadId: a.threadId, kind: a.kind, messageId: a.messageId || null });
+      window.__TRIAGE_PROBE__ = tr;
       // Move the fixture the way the engine would, so a view switch after a
       // triage action shows what the real one would show.
-      var row = rows.filter(function (r) { return r.thread_id === a.threadId; })[0];
+      //
+      // `messageId` names one message rather than a conversation, which is what
+      // the window sends from a list of messages. Modelled, not ignored: a shim
+      // that filed the whole thread either way would let the fix look applied
+      // while the engine did the damaging thing.
+      var row = a.messageId
+        ? rows.filter(function (r) { return r.id === a.messageId; })[0]
+        : rows.filter(function (r) { return r.thread_id === a.threadId; })[0];
       if (row) {
         // Remembered for undo_triage, which puts the row back the way the
         // engine restores prior state. Without it the recount after an undo
@@ -1128,7 +1155,14 @@
       nextDraftId += 1;
       return nextDraftId;
     },
-    delete_draft: function () { return null; },
+    delete_draft: function (a) {
+      // The composer's own discard, and the Outbox's. The Drafts list no longer
+      // comes through here: there the bin verb is an ordinary trash of that one
+      // message, which is what every other client does and what leaves an undo.
+      var row = rows.filter(function (r) { return r.id === (a && a.id); })[0];
+      if (row) row.filed = 'gone';
+      return null;
+    },
     // The outbox's side of a send. Without these the send path rejected at
     // the last step and the composer put the draft back — correct behaviour
     // for a failed queue, and indistinguishable from a send that never

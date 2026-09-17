@@ -158,12 +158,29 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     return merged;
   }, [stored]);
 
+  // Which language the interface speaks. "system" follows the Mac, but only as
+  // far as a locale we actually ship: asking for de-AT when only de exists
+  // should give German, and asking for something we have nothing for should
+  // give English rather than a screen of ids.
+  const resolved = resolveLocale(settings.language);
+
   // Applied where the platform, not React, does the work: the theme attribute
   // drives the token blocks, and Intl formatters are rebuilt in one place.
   useEffect(() => {
     const root = document.documentElement;
     if (settings.theme === 'system') root.removeAttribute('data-theme');
     else root.setAttribute('data-theme', settings.theme);
+    // What language the chrome is in, for the platform rather than for us.
+    //
+    // index.html ships `lang="en"` and nothing used to move it. WebKit — which
+    // is what the app runs in — picks the font for a Han character from this
+    // attribute, and Japanese, Simplified Chinese and Traditional Chinese draw
+    // several of the same code points differently. Left at English it resolves
+    // to the Japanese face, so a Simplified Chinese reader saw Japanese glyph
+    // forms. (Chromium ignores the attribute here, so the harness cannot see
+    // this and the real engine has to be asked.) VoiceOver reads from it too:
+    // a Japanese interface was being spoken in an English voice.
+    root.lang = resolved;
     root.style.setProperty('--accent-user', settings.accent);
     root.style.setProperty('--reading-size', `${settings.readingTextSize}px`);
     // The rail's width is a token so the three-pane grid picks it up without
@@ -184,7 +201,7 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     // and adding a line to the body can no longer silently do nothing because
     // its key was left out of the list, which is precisely what happened when
     // the rail width was added here.
-  }, [settings]);
+  }, [settings, resolved]);
 
   useEffect(() => {
     setFormatPrefs({
@@ -208,12 +225,6 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     });
     api.setSetting(key, '').catch(() => {});
   }, []);
-
-  // Which language the interface speaks. "system" follows the Mac, but only as
-  // far as a locale we actually ship: asking for de-AT when only de exists
-  // should give German, and asking for something we have nothing for should
-  // give English rather than a screen of ids.
-  const resolved = resolveLocale(settings.language);
 
   // Set during render, not in an effect. An effect runs after the children have
   // already rendered, so the first paint after a language change would still be
@@ -248,6 +259,41 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
  *  hardcoded its own language, so the English bundle said "System (English)"
  *  even on a Mac set to French, where System would have given French. Right by
  *  coincidence whenever the two agreed, and wrong the moment they did not. */
+/** Which script a region writes Chinese in, for the regions that matter.
+ *
+ *  A platform reports `zh-CN`, not `zh-Hans-CN`, and the locale we ship is
+ *  `zh-Hans`. Without this the Simplified Chinese translation could not be
+ *  reached by "system" at all — `zh-CN` has no `zh` to fall back to, so it
+ *  landed on English. Traditional regions are listed too, so they resolve to a
+ *  `zh-Hant` we do not ship and then honestly give English rather than handing
+ *  a Taiwanese reader Simplified characters. */
+const CHINESE_SCRIPT: Record<string, string> = {
+  CN: 'Hans',
+  SG: 'Hans',
+  MY: 'Hans',
+  TW: 'Hant',
+  HK: 'Hant',
+  MO: 'Hant',
+};
+
+/** The tags to try for one platform language, best first.
+ *
+ *  Longest prefix down to the bare language, because a shipped locale can be
+ *  more specific than the tag's base: `zh-Hans-CN` has to find `zh-Hans`, and
+ *  stopping at `zh` finds nothing. */
+function candidates(tag: string): string[] {
+  const parts = tag.split('-').filter(Boolean);
+  if (parts.length === 0) return [];
+  const out: string[] = [];
+  // A region-only Chinese tag gains the script its region writes.
+  if (parts[0].toLowerCase() === 'zh' && parts.length >= 2) {
+    const script = CHINESE_SCRIPT[parts[1].toUpperCase()];
+    if (script) out.push(`zh-${script}`);
+  }
+  for (let i = parts.length; i > 0; i -= 1) out.push(parts.slice(0, i).join('-'));
+  return out;
+}
+
 export function resolveLocale(setting: string): string {
   const have = new Set(availableLocales());
   const wanted =
@@ -258,9 +304,9 @@ export function resolveLocale(setting: string): string {
         : [];
   for (const tag of wanted) {
     if (!tag) continue;
-    if (have.has(tag)) return tag;
-    const base = tag.split('-')[0];
-    if (base && have.has(base)) return base;
+    for (const candidate of candidates(tag)) {
+      if (have.has(candidate)) return candidate;
+    }
   }
   return 'en';
 }

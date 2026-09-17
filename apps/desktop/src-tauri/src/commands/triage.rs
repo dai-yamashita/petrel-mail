@@ -11,11 +11,19 @@ use tauri::State;
 /// Applies a triage action locally and queues it. Returns the receipt the UI
 /// needs to offer undo, so the frontend holds no state of its own about what it
 /// just did.
+///
+/// `message_id` names one message instead, for the view that lists per message.
+/// Drafts is the only one, and there the conversation is the wrong unit: a
+/// pushed draft shares its conversation's thread, so a verb aimed at the draft
+/// row used to file the whole correspondence. Sent by the window rather than
+/// inferred here, because which view the click came from is the window's to
+/// know. Placement verbs only; the store refuses the rest.
 #[tauri::command(async)]
 pub fn triage(
     thread_id: i64,
     kind: ActionKind,
     target: Option<i64>,
+    message_id: Option<i64>,
     state: State<Arc<AppState>>,
 ) -> Result<ActionReceipt, String> {
     let store = state.store()?;
@@ -23,9 +31,14 @@ pub fn triage(
     // The provider's placement model, not a per-call guess: on Gmail an
     // archive removes one label, on a classic server it replaces the folder.
     let policy = store.placement_policy(account).map_err(|e| e.to_string())?;
-    let receipt = store
-        .apply_thread_action(account, thread_id, kind, target, policy)
-        .map_err(|e| e.to_string())?;
+    let receipt = match message_id {
+        Some(id) => store
+            .apply_message_action(account, id, kind, target, policy)
+            .map_err(|e| e.to_string())?,
+        None => store
+            .apply_thread_action(account, thread_id, kind, target, policy)
+            .map_err(|e| e.to_string())?,
+    };
     // Local change done; ask for it to be delivered. The lock is released as
     // this returns, so the drain is never waiting on the caller.
     state.nudge_drain(account);

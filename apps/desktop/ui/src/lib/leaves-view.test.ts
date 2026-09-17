@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { leavesView } from './leaves-view';
+import { actsOnOneMessage, leavesView, listsPerMessage } from './leaves-view';
 
 describe('leavesView for a move', () => {
   it('takes the row out of the views that are about where mail is filed', () => {
@@ -29,5 +29,37 @@ describe('leavesView for the rest', () => {
     expect(leavesView('unstar', 'starred')).toBe(true);
     expect(leavesView('unstar', 'inbox')).toBe(false);
     expect(leavesView('tag', 'inbox')).toBe(false);
+  });
+});
+
+describe('listsPerMessage', () => {
+  it('is Drafts and nowhere else', () => {
+    expect(listsPerMessage('drafts')).toBe(true);
+    for (const view of [
+      'inbox', 'archive', 'sent', 'spam', 'trash', 'starred', 'snoozed', 'outbox',
+      'folder:Projects', 'tag:Urgent',
+    ]) {
+      expect(listsPerMessage(view)).toBe(false);
+    }
+  });
+});
+
+describe('actsOnOneMessage', () => {
+  it('covers the verbs that say where a message sits', () => {
+    for (const kind of ['trash', 'spam', 'archive', 'move'] as const) {
+      expect(actsOnOneMessage(kind)).toBe(true);
+    }
+  });
+
+  it('leaves the properties of a conversation alone', () => {
+    // The store refuses these one row at a time rather than half-applying them.
+    // Read state in particular runs thread-wide, so a single-row action would
+    // flag the whole conversation and leave undo restoring one flag of several.
+    for (const kind of [
+      'star', 'unstar', 'mark_read', 'mark_unread', 'tag', 'untag', 'snooze',
+      'unsnooze', 'delete_forever',
+    ] as const) {
+      expect(actsOnOneMessage(kind)).toBe(false);
+    }
   });
 });

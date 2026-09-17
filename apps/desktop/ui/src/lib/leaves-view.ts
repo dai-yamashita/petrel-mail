@@ -57,3 +57,34 @@ export function leavesView(kind: ActionKind, view: string): boolean {
   // looking at. The next load has it right.
   return false;
 }
+
+/** Whether this view lists individual messages rather than conversations.
+ *
+ *  Drafts is the only one: a draft is a thing you finish, not a conversation.
+ *  Everywhere else a row stands for a whole correspondence, and a verb aimed at
+ *  it means the correspondence.
+ *
+ *  This is the distinction that made binning a leftover reply draft file the
+ *  whole thread. Triage is a conversation verb and is handed the row's
+ *  `thread_id`; once a draft has been pushed it shares its conversation's
+ *  thread, so the draft's row named every live member. Their mail left the
+ *  inbox, your own replies left Sent, and the toast said only "Moved to Trash".
+ *  A draft that had never been pushed has no thread and filed only itself,
+ *  which is why the path looked correct until somebody tidied up after
+ *  answering something. */
+export function listsPerMessage(view: string): boolean {
+  return view === 'drafts';
+}
+
+/** Whether a verb can be aimed at one message rather than a conversation.
+ *
+ *  Where a message sits is a property of that message. Whether a conversation
+ *  is read, starred, tagged or snoozed is a property of the conversation, and
+ *  the store refuses those one row at a time rather than half-applying them —
+ *  the read state in particular runs thread-wide and would leave undo restoring
+ *  one flag of several. So in Drafts the placement verbs act on the draft and
+ *  the marks still act on the conversation, which is also how a draft row
+ *  behaves in Thunderbird and Apple Mail. */
+export function actsOnOneMessage(kind: ActionKind): boolean {
+  return kind === 'trash' || kind === 'spam' || kind === 'archive' || kind === 'move';
+}

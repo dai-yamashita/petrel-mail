@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { api, type ActionKind, type Thread } from './api';
 import { countDeltas } from './counts';
-import { leavesView } from './leaves-view';
+import { actsOnOneMessage, leavesView, listsPerMessage } from './leaves-view';
 import type { CountMode } from './mailboxes';
 import { t } from './strings';
 
@@ -155,6 +155,9 @@ export function useTriage(opts: {
         );
         return;
       }
+      // In a list of messages, a placement verb means this message. Its own id,
+      // not its thread: that is the whole point.
+      const scope = listsPerMessage(view) && actsOnOneMessage(kind) ? row.id : undefined;
       void api.log(
         JSON.stringify({ kind: 'triage', stage: 'start', k, target, threadId: row.thread_id }),
       );
@@ -241,7 +244,7 @@ export function useTriage(opts: {
 
       setPending(true);
       try {
-        const receipt = await api.triage(row.thread_id, kind, targetId);
+        const receipt = await api.triage(row.thread_id, kind, targetId, scope);
         // Move and archive from a bin used to return this empty receipt while
         // the list had already dropped the row. Treating it as success left
         // the conversation gone here and still in spam the next time search

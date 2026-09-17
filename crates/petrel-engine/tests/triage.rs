@@ -1813,3 +1813,223 @@ fn moving_a_conversation_in_sent_and_spam_takes_the_sent_copy_only() {
     assert_eq!(store.folders_of(ids[0]).unwrap(), vec![dest]);
     assert_eq!(store.folders_of(ids[1]).unwrap(), vec![spam]);
 }
+
+/// Drafts is the one view that lists per message, so a verb aimed at a draft
+/// row means that draft.
+mod one_message_at_a_time {
+    use super::*;
+
+    /// Their message in the inbox, my reply in Sent, and a leftover reply draft
+    /// that has been pushed — so it shares the conversation's thread.
+    fn answered_with_a_leftover_draft(
+        store: &mut Store,
+        blobs: &petrel_engine::blob::BlobStore,
+        account: i64,
+    ) -> (i64, i64, i64, i64, i64, i64) {
+        let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+        let sent = store.ensure_folder(account, "sent", "Sent").unwrap();
+        let drafts = store.ensure_folder(account, "drafts", "Drafts").unwrap();
+        let ids = ingest_reply_chain(store, blobs, account, inbox, 2);
+        store.remove_placement(ids[1], account, "INBOX").unwrap();
+        store.place_message_at(ids[1], sent, 9).unwrap();
+        let raw = "From: b@example.com\r\nTo: a@example.com\r\nSubject: Re: shared chain\r\n\
+Message-ID: <d9@x>\r\nIn-Reply-To: <m0@x>\r\nReferences: <m0@x>\r\n\
+MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nhalf written\r\n";
+        let draft = store
+            .ingest_raw(blobs, account, Some(drafts), Some(700), raw.as_bytes())
+            .unwrap()
+            .message_id;
+        assert_eq!(
+            store.thread_of(draft).unwrap(),
+            store.thread_of(ids[0]).unwrap(),
+            "the fixture's point is that a pushed draft shares the thread"
+        );
+        (ids[0], ids[1], draft, inbox, sent, drafts)
+    }
+
+    fn fresh() -> (
+        tempfile::TempDir,
+        Store,
+        petrel_engine::blob::BlobStore,
+        i64,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+        let account = store.ensure_test_account().unwrap();
+        store.set_active_account(account).unwrap();
+        (dir, store, blobs, account)
+    }
+
+    #[test]
+    fn binning_a_draft_takes_the_draft_and_nothing_else() {
+        let (_d, mut store, blobs, account) = fresh();
+        let (theirs, mine, draft, inbox, sent, _drafts) =
+            answered_with_a_leftover_draft(&mut store, &blobs, account);
+
+        let r = store
+            .apply_message_action(
+                account,
+                draft,
+                ActionKind::Trash,
+                None,
+                PlacementPolicy::Exclusive,
+            )
+            .unwrap();
+
+        assert_eq!(r.message_count, 1, "one draft, not the correspondence");
+        let trash = store.ensure_folder(account, "trash", "trash").unwrap();
+        assert_eq!(store.folders_of(draft).unwrap(), vec![trash]);
+        assert_eq!(
+            store.folders_of(theirs).unwrap(),
+            vec![inbox],
+            "their message stays in the inbox"
+        );
+        assert_eq!(
+            store.folders_of(mine).unwrap(),
+            vec![sent],
+            "my own reply stays in Sent"
+        );
+    }
+
+    #[test]
+    fn only_the_draft_is_queued_for_the_server() {
+        let (_d, mut store, blobs, account) = fresh();
+        let (_theirs, _mine, draft, _inbox, _sent, _drafts) =
+            answered_with_a_leftover_draft(&mut store, &blobs, account);
+
+        let r = store
+            .apply_message_action(
+                account,
+                draft,
+                ActionKind::Trash,
+                None,
+                PlacementPolicy::Exclusive,
+            )
+            .unwrap();
+
+        let queued: Vec<i64> = store
+            .pending_actions(account)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.action_id == r.action_id)
+            .map(|p| p.message_id)
+            .collect();
+        assert_eq!(queued, vec![draft], "the drain must move only the draft");
+    }
+
+    #[test]
+    fn undo_puts_the_draft_back_and_leaves_the_rest_alone() {
+        let (_d, mut store, blobs, account) = fresh();
+        let (theirs, mine, draft, inbox, sent, drafts) =
+            answered_with_a_leftover_draft(&mut store, &blobs, account);
+
+        let r = store
+            .apply_message_action(
+                account,
+                draft,
+                ActionKind::Trash,
+                None,
+                PlacementPolicy::Exclusive,
+            )
+            .unwrap();
+        assert!(store.undo_action(r.action_id).unwrap(), "undoable");
+
+        assert_eq!(
+            store.folders_of(draft).unwrap(),
+            vec![drafts],
+            "the draft is back in Drafts"
+        );
+        assert_eq!(store.folders_of(theirs).unwrap(), vec![inbox]);
+        assert_eq!(store.folders_of(mine).unwrap(), vec![sent]);
+    }
+
+    #[test]
+    fn archiving_and_moving_a_draft_row_take_the_draft_too() {
+        for kind in [ActionKind::Archive, ActionKind::Move] {
+            let (_d, mut store, blobs, account) = fresh();
+            let (theirs, mine, draft, inbox, sent, _drafts) =
+                answered_with_a_leftover_draft(&mut store, &blobs, account);
+            let dest = store.ensure_named_folder(account, "Projects").unwrap();
+            let target = if matches!(kind, ActionKind::Move) {
+                Some(dest)
+            } else {
+                None
+            };
+
+            let r = store
+                .apply_message_action(account, draft, kind, target, PlacementPolicy::Exclusive)
+                .unwrap();
+
+            // Thread-wide, these moved the *other* party's inbox message and
+            // left the draft sitting where it was — the row you aimed at did
+            // not move and a row you did not aim at did.
+            assert_eq!(r.message_count, 1, "{kind:?} touched more than the draft");
+            assert_eq!(
+                store.folders_of(theirs).unwrap(),
+                vec![inbox],
+                "{kind:?} moved their inbox message"
+            );
+            assert_eq!(store.folders_of(mine).unwrap(), vec![sent]);
+            assert_ne!(
+                store.folders_of(draft).unwrap(),
+                Vec::<i64>::new(),
+                "{kind:?} left the draft placed nowhere"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conversation_property_is_refused_rather_than_half_applied() {
+        let (_d, mut store, blobs, account) = fresh();
+        let (_theirs, _mine, draft, _inbox, _sent, _drafts) =
+            answered_with_a_leftover_draft(&mut store, &blobs, account);
+
+        // These reach set_thread_flags, which is conversation-wide by design and
+        // ignores the id list. Allowing one through would flag the whole thread
+        // while recording prior state for a single row, and undo would restore
+        // one flag of several.
+        for kind in [
+            ActionKind::Star,
+            ActionKind::Unstar,
+            ActionKind::MarkRead,
+            ActionKind::MarkUnread,
+            ActionKind::Snooze,
+        ] {
+            let e = store.apply_message_action(
+                account,
+                draft,
+                kind,
+                Some(1),
+                PlacementPolicy::Exclusive,
+            );
+            assert!(e.is_err(), "{kind:?} must be refused, not half applied");
+        }
+    }
+
+    #[test]
+    fn another_accounts_message_is_refused() {
+        let (_d, mut store, blobs, account) = fresh();
+        let (_theirs, _mine, draft, _inbox, _sent, drafts) =
+            answered_with_a_leftover_draft(&mut store, &blobs, account);
+        let other = store.ensure_test_account().unwrap();
+
+        let e = store.apply_message_action(
+            other,
+            draft,
+            ActionKind::Trash,
+            None,
+            PlacementPolicy::Exclusive,
+        );
+
+        assert!(
+            e.is_err(),
+            "a stale id must not file the other account's mail"
+        );
+        assert_eq!(
+            store.folders_of(draft).unwrap(),
+            vec![drafts],
+            "and must not have moved it"
+        );
+    }
+}

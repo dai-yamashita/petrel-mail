@@ -266,51 +266,9 @@ impl Store {
         target: Option<i64>,
         policy: crate::actions::PlacementPolicy,
     ) -> Result<crate::actions::ActionReceipt> {
-        use crate::actions::{ActionKind, ActionPayload, ActionReceipt};
+        use crate::actions::ActionKind;
 
-        // Refused here rather than defaulted to something plausible: a move with
-        // no destination is a bug in the caller, and inventing one would file
-        // mail somewhere nobody asked for.
-        if kind.needs_target() && target.is_none() {
-            return Err(StoreError::Rejected(format!(
-                "{kind:?} needs a target folder or tag"
-            )));
-        }
-
-        // And refused *before* anything is touched if the target is not this
-        // account's to file into.
-        //
-        // Move clears every placement and then files the message in the
-        // destination. There is no transaction around the pair, so a
-        // destination that no longer exists failed on the insert with the
-        // clearing already committed — leaving the message placed nowhere at
-        // all: out of the inbox, out of the folder, out of every view, and
-        // not in the trash either. A filter rule still naming a folder the
-        // user has since deleted did this silently, to every message it
-        // matched.
-        //
-        // Another account's folder is the same instruction wearing a
-        // plausible id: it exists, the insert succeeds, and the mail is filed
-        // next door. Ownership is the question worth asking, and it answers
-        // the deleted case on the way past.
-        //
-        // Checked here rather than mended in the branch because the same
-        // hazard belongs to every caller, and a target this account does not
-        // have is not a move to fix up — it is a move that cannot be
-        // performed.
-        if let Some(id) = target {
-            let unavailable = match kind {
-                ActionKind::Move => !self.account_owns_folder(account_id, id)?,
-                ActionKind::Tag | ActionKind::Untag => !self.account_owns_tag(account_id, id)?,
-                // Snooze's target is an instant, not a row.
-                _ => false,
-            };
-            if unavailable {
-                return Err(StoreError::Rejected(format!(
-                    "{kind:?} names a folder or tag this account does not have"
-                )));
-            }
-        }
+        self.check_action_target(account_id, kind, target)?;
 
         let flag_filter = match kind {
             ActionKind::MarkRead => format!(" AND flags & {} = 0", flags::SEEN),
@@ -417,6 +375,174 @@ impl Store {
                 _ => ids,
             };
         }
+        self.apply_to_messages(
+            account_id,
+            thread_id,
+            ids,
+            kind,
+            target,
+            policy,
+            &flag_filter,
+        )
+    }
+
+    /// Files one message, named by the caller rather than inferred from a
+    /// conversation.
+    ///
+    /// For the view that lists per message. Drafts is the only one: a draft is a
+    /// thing you finish, not a conversation. Triage is otherwise a conversation
+    /// verb, and a draft that has been pushed shares its conversation's thread —
+    /// so binning a leftover reply draft filed every live member, their mail out
+    /// of the inbox and your own replies out of Sent. A draft that had never been
+    /// pushed has no thread and filed only itself, which is why the path looked
+    /// correct until somebody tidied up after answering something.
+    ///
+    /// Placement only. Star and the read-state verbs go through
+    /// `set_thread_flags`, which is conversation-wide on purpose — a
+    /// conversation is read or unread as a unit — and ignores the id list, so
+    /// letting one through here would apply it to the whole thread while
+    /// recording prior state for a single row, and undo would restore one flag
+    /// of several. Refused rather than half-applied. Tag and Snooze are refused
+    /// for the plainer reason that both are conversation properties here.
+    /// Refuses an action whose target is missing, or is not this account's.
+    ///
+    /// Shared by the thread and the single-message entry points: the same hazard
+    /// belongs to every caller, and it has to be answered before anything is
+    /// touched.
+    fn check_action_target(
+        &self,
+        account_id: i64,
+        kind: crate::actions::ActionKind,
+        target: Option<i64>,
+    ) -> Result<()> {
+        use crate::actions::ActionKind;
+
+        // Refused here rather than defaulted to something plausible: a move with
+        // no destination is a bug in the caller, and inventing one would file
+        // mail somewhere nobody asked for.
+        if kind.needs_target() && target.is_none() {
+            return Err(StoreError::Rejected(format!(
+                "{kind:?} needs a target folder or tag"
+            )));
+        }
+
+        // And refused *before* anything is touched if the target is not this
+        // account's to file into.
+        //
+        // Move clears every placement and then files the message in the
+        // destination. There is no transaction around the pair, so a
+        // destination that no longer exists failed on the insert with the
+        // clearing already committed — leaving the message placed nowhere at
+        // all: out of the inbox, out of the folder, out of every view, and
+        // not in the trash either. A filter rule still naming a folder the
+        // user has since deleted did this silently, to every message it
+        // matched.
+        //
+        // Another account's folder is the same instruction wearing a
+        // plausible id: it exists, the insert succeeds, and the mail is filed
+        // next door. Ownership is the question worth asking, and it answers
+        // the deleted case on the way past.
+        //
+        // Checked here rather than mended in the branch because the same
+        // hazard belongs to every caller, and a target this account does not
+        // have is not a move to fix up — it is a move that cannot be
+        // performed.
+        if let Some(id) = target {
+            let unavailable = match kind {
+                ActionKind::Move => !self.account_owns_folder(account_id, id)?,
+                ActionKind::Tag | ActionKind::Untag => !self.account_owns_tag(account_id, id)?,
+                // Snooze's target is an instant, not a row.
+                _ => false,
+            };
+            if unavailable {
+                return Err(StoreError::Rejected(format!(
+                    "{kind:?} names a folder or tag this account does not have"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn apply_message_action(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        kind: crate::actions::ActionKind,
+        target: Option<i64>,
+        policy: crate::actions::PlacementPolicy,
+    ) -> Result<crate::actions::ActionReceipt> {
+        use crate::actions::ActionKind;
+
+        if !matches!(
+            kind,
+            ActionKind::Archive
+                | ActionKind::Trash
+                | ActionKind::Spam
+                | ActionKind::Move
+                | ActionKind::DeleteForever
+        ) {
+            return Err(StoreError::Rejected(format!(
+                "{kind:?} is a property of a conversation, not of one message"
+            )));
+        }
+        self.check_action_target(account_id, kind, target)?;
+
+        // The message has to be this account's, and still be here. A stale id
+        // from a list the store has moved on from must not file somebody else's
+        // mail, and an id from another account is that same instruction wearing
+        // a plausible number — the wall `apply_thread_action` guards for folders
+        // and tags, guarded here for the row itself.
+        let thread_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT coalesce(thread_id, -id) FROM messages
+                  WHERE id = ?1 AND account_id = ?2 AND deleted_at_ms IS NULL",
+                params![message_id, account_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(thread_id) = thread_id else {
+            return Err(StoreError::Rejected(
+                "that message is not this account's, or is already gone".into(),
+            ));
+        };
+
+        self.apply_to_messages(
+            account_id,
+            thread_id,
+            vec![message_id],
+            kind,
+            target,
+            policy,
+            "",
+        )
+    }
+
+    /// Queues one action over a named set of messages, and applies it locally.
+    ///
+    /// Everything from here on is decided by `ids`: the filters are built from
+    /// it, the prior state is captured through those filters so undo restores
+    /// exactly these rows, and the work itself is a loop over them. `thread_id`
+    /// is carried for the payload and for the priors' addressing, not to widen
+    /// what is touched.
+    ///
+    /// Split out of [`Self::apply_thread_action`] so a caller that already
+    /// knows which message it means can reach the same machinery. Choosing
+    /// *which* members of a conversation a verb touches is the part that stayed
+    /// behind, because that question only arises when the caller named a thread.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_to_messages(
+        &self,
+        account_id: i64,
+        thread_id: i64,
+        ids: Vec<i64>,
+        kind: crate::actions::ActionKind,
+        target: Option<i64>,
+        policy: crate::actions::PlacementPolicy,
+        flag_filter: &str,
+    ) -> Result<crate::actions::ActionReceipt> {
+        use crate::actions::{ActionKind, ActionPayload, ActionReceipt};
         if ids.is_empty() {
             return Ok(ActionReceipt {
                 action_id: 0,

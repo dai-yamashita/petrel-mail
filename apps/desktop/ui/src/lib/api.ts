@@ -571,7 +571,12 @@ const mock = {
       })),
   // Fresh objects each call: returning the same reference means React sees no
   // change and the mock silently misreports whether a write took effect.
-  triage: async (_t: number, kind: ActionKind, _target?: number): Promise<ActionReceipt> => ({
+  triage: async (
+    _t: number,
+    kind: ActionKind,
+    _target?: number,
+    _messageId?: number,
+  ): Promise<ActionReceipt> => ({
     action_id: Math.floor(Math.random() * 1e6),
     kind,
     message_count: 1,
@@ -920,8 +925,15 @@ const real = {
   trustSender: (messageId: number) => invoke<string>('trust_sender', { messageId }),
   trustedSenders: () => invoke<string[]>('trusted_senders'),
   untrustSender: (addr: string) => invoke<void>('untrust_sender', { addr }),
-  triage: (threadId: number, kind: ActionKind, target?: number) =>
-    invoke<ActionReceipt>('triage', { threadId, kind, target: target ?? null }),
+  /** `messageId` narrows the action to one message, for a list of messages
+   *  rather than of conversations. Drafts is the only such list. */
+  triage: (threadId: number, kind: ActionKind, target?: number, messageId?: number) =>
+    invoke<ActionReceipt>('triage', {
+      threadId,
+      kind,
+      target: target ?? null,
+      messageId: messageId ?? null,
+    }),
   undoTriage: (actionId: number) => invoke<boolean>('undo_triage', { actionId }),
   /** Absent `account` means the one on screen — see the Rust command. */
   folders: (account?: number) => invoke<Folder[]>('list_folders', { account: account ?? null }),

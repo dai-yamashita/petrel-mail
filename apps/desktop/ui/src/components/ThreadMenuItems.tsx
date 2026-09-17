@@ -54,6 +54,10 @@ export function ThreadMenuItems({
   count, onReply, onForward,
 }: ThreadMenuProps) {
   const inTrash = view === 'trash';
+  // Junk is not something a draft can be: there is no sender to report, because
+  // you wrote it. The verb itself is harmless now that Drafts acts on the one
+  // message, so this is about not offering a gesture with no meaning.
+  const offersSpam = view !== 'drafts';
   const many = (count ?? 1) > 1;
 
   return (
@@ -179,11 +183,13 @@ export function ThreadMenuItems({
 
       {/* Destructive last and visually separated, so the mouse does not pass
           over "move to trash" on its way to something harmless. */}
-      <MenuItem className="menu-item" onClick={() => onAction('spam')}>
-        <Icon icon={ShieldAlert} size={14} />
-        <span className="menu-label">{t('menu-spam')}</span>
-        <span className="menu-key">!</span>
-      </MenuItem>
+      {offersSpam && (
+        <MenuItem className="menu-item" onClick={() => onAction('spam')}>
+          <Icon icon={ShieldAlert} size={14} />
+          <span className="menu-label">{t('menu-spam')}</span>
+          <span className="menu-key">!</span>
+        </MenuItem>
+      )}
       {/* "Move to trash" from inside the trash is a gesture with nowhere to go —
           it reads as broken. There, the same position and the same key mean the
           thing you actually wanted. */}

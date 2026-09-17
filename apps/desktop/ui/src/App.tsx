@@ -1,11 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  api,
-  type ActionKind,
-  type Folder,
-  type OutboxRow,
-  type Status,
-} from './lib/api';
+import { api, type ActionKind, type Folder, type OutboxRow, type Status } from './lib/api';
 import { chips, folderScopeName, hasToken, scopeFor, toggleToken } from './lib/search-chips';
 import { arrangementFor, countFor, countModes, visibleMailboxes } from './lib/mailboxes';
 import { count as fmtCount, fileSize } from './lib/format';
