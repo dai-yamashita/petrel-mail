@@ -38,6 +38,244 @@ pub fn message_origin() -> &'static str {
     }
 }
 
+/// How much of a message the source view shows.
+///
+/// A message with a large attachment is mostly base64, and the bytes worth
+/// reading — the headers, the structure, the encodings — are at the front. A
+/// megabyte reaches well past them and keeps the window from being handed
+/// something it cannot draw. What was left out is said on the page rather than
+/// silently dropped.
+pub const SOURCE_VIEW_CAP: usize = 1024 * 1024;
+
+/// Renders bytes as text without losing any of them.
+///
+/// Not `from_utf8_lossy`. The reason to look at a message's source is usually a
+/// charset or encoding bug, and a replacement character is exactly the evidence
+/// being sought being thrown away — a Shift_JIS body would come out as a row of
+/// question marks that tells you nothing about what was actually stored. Any
+/// byte that is not valid UTF-8 is written as `\xNN` instead, so the view is
+/// reversible and the declared charset can be checked against the real bytes.
+///
+/// Control characters go the same way, which matters for ISO-2022-JP, where the
+/// escape sequences *are* the encoding and are otherwise invisible. Tabs and
+/// newlines stay themselves. A carriage return is dropped when it is the CR of
+/// a CRLF, because every line of a message ends that way and marking all of
+/// them would bury the one that matters; a lone CR is shown.
+fn readable_source(raw: &[u8]) -> (String, bool) {
+    let truncated = raw.len() > SOURCE_VIEW_CAP;
+    let slice = &raw[..raw.len().min(SOURCE_VIEW_CAP)];
+    let mut out = String::with_capacity(slice.len() + 64);
+    let mut i = 0;
+    while i < slice.len() {
+        match std::str::from_utf8(&slice[i..]) {
+            Ok(text) => {
+                push_readable(&mut out, text);
+                break;
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                if good > 0
+                    && let Ok(text) = std::str::from_utf8(&slice[i..i + good])
+                {
+                    push_readable(&mut out, text);
+                }
+                // No length means the bytes ran out mid-character, which the
+                // cap can cause: show the rest as bytes and stop.
+                let bad = e.error_len().unwrap_or(slice.len() - i - good);
+                for b in &slice[i + good..i + good + bad] {
+                    out.push_str(&format!("\\x{b:02X}"));
+                }
+                i += good + bad;
+            }
+        }
+    }
+    (out, truncated)
+}
+
+fn push_readable(out: &mut String, text: &str) {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\r' if chars.peek() == Some(&'\n') => {}
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// The page the source view window loads.
+///
+/// Our chrome around the bytes, not a message document: the source is rendered
+/// as text in a `<pre>`, escaped, under a policy that allows nothing to load
+/// and nothing to run. The blob is hostile input and stays that way — this
+/// window never parses it as HTML, never fetches on its behalf, and the bytes
+/// are never written to a log.
+///
+/// Its colours are the app's own tokens, copied rather than linked because this
+/// document is on the message origin and the stylesheet is not, and a policy
+/// that loads nothing is the point. Copied means they can drift, so they are
+/// listed together here against `styles/tokens.css` rather than sprinkled
+/// through the rules. Fonts are the fallbacks those tokens name: the bundled
+/// faces live on the app's origin and cannot be fetched from this one, which is
+/// the same reason.
+///
+/// `theme` is the Appearance setting, which has three states. An explicit
+/// choice stamps the root and must win in both directions; "system" stamps
+/// nothing and resolves through `prefers-color-scheme`, exactly as the app's
+/// own tokens do. A window that ignored it was light while the app was dark.
+pub fn source_document(raw: &[u8], theme: Option<&str>, nonce: &str) -> String {
+    let (text, truncated) = readable_source(raw);
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    // English, and replaced by the window's own script with whatever the app is
+    // speaking. It stays here as the last resort: a page that somehow loads
+    // without its strings says something true rather than nothing.
+    let note = if truncated {
+        format!(
+            "Showing the first {} of {} bytes as stored.",
+            SOURCE_VIEW_CAP,
+            raw.len()
+        )
+    } else {
+        format!("{} bytes, as stored.", raw.len())
+    };
+    let (shown, total) = (raw.len().min(SOURCE_VIEW_CAP), raw.len());
+    let stamp = match theme {
+        Some("dark") => " data-theme=\"dark\"",
+        Some("light") => " data-theme=\"light\"",
+        _ => "",
+    };
+    format!(
+        r#"<!doctype html><html{stamp}><head><meta charset="utf-8">
+<title data-t="title">Message source</title>
+<style>
+  :root {{
+    --bg: #f7f9f9; --surface: #ffffff; --ink: #182730; --ink2: #54666e;
+    --hair: #d9e1e2;
+    color-scheme: light;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root:not([data-theme='light']) {{
+      --bg: #0f1b21; --surface: #142329; --ink: #e4edee; --ink2: #96a9af;
+      --hair: #24363d;
+      color-scheme: dark;
+    }}
+  }}
+  :root[data-theme='dark'] {{
+    --bg: #0f1b21; --surface: #142329; --ink: #e4edee; --ink2: #96a9af;
+    --hair: #24363d;
+    color-scheme: dark;
+  }}
+  body {{
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--ink);
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  }}
+  .bar {{
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin: 0 0 10px;
+  }}
+  .note {{
+    margin: 0;
+    flex-grow: 1;
+    color: var(--ink2);
+    font-size: 11.5px;
+  }}
+  /* The app's own quiet button: a hairline, the surface behind it, and the
+     secondary ink. Nothing here is the accent, which in this window would be
+     the loudest thing on a page whose subject is somebody else's bytes. */
+  #copy {{
+    flex-shrink: 0;
+    padding: 3px 9px;
+    border: 1px solid var(--hair);
+    border-radius: 5px;
+    background: var(--surface);
+    color: var(--ink2);
+    font: inherit;
+    font-size: 11.5px;
+    cursor: pointer;
+  }}
+  #copy:hover {{ color: var(--ink); }}
+  #copy:focus-visible {{ outline: 2px solid var(--ink2); outline-offset: 1px; }}
+  pre {{
+    margin: 0;
+    padding: 14px 16px;
+    background: var(--surface);
+    border: 1px solid var(--hair);
+    border-radius: 6px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }}
+</style></head>
+<body>
+<div class="bar"><p class="note" id="note" data-shown="{shown}" data-total="{total}" data-capped="{truncated}">{note}</p><button id="copy" type="button">Copy</button></div>
+<pre id="src">{escaped}</pre>
+<script nonce="{nonce}">
+/* Copies what is on screen, escapes and all: this is the view you would paste
+   into a bug report, not the original bytes — saving those is its own thing.
+   Reads textContent and writes it out; it never treats the message as code. */
+(function () {{
+  var button = document.getElementById('copy');
+  var source = document.getElementById('src');
+  /* What the app is speaking, handed over when the window was opened. Every
+     word on this page comes from the same .ftl files the rest of the interface
+     does; the markup only carries English so that a page loaded without them
+     still says something. The count cannot be translated ahead of time — only
+     this side knows it — so the pattern arrives with a {{n}} in it to fill. */
+  var say_ = window.__PETREL_SOURCE__ || {{}};
+  var fill = function (pattern, values) {{
+    return String(pattern).replace(/\{{(\w+)\}}/g, function (whole, key) {{
+      return key in values ? values[key] : whole;
+    }});
+  }};
+  if (say_.title) document.title = say_.title;
+  var note = document.getElementById('note');
+  if (note) {{
+    var capped = note.getAttribute('data-capped') === 'true';
+    var pattern = capped ? say_.bytesCapped : say_.bytes;
+    if (pattern) {{
+      note.textContent = fill(pattern, {{
+        shown: note.getAttribute('data-shown'),
+        total: note.getAttribute('data-total'),
+        n: note.getAttribute('data-total'),
+      }});
+    }}
+  }}
+  var resting = say_.copy || 'Copy';
+  button.textContent = resting;
+  button.addEventListener('click', function () {{
+    var say = function (word) {{
+      button.textContent = word;
+      window.setTimeout(function () {{ button.textContent = resting; }}, 1400);
+    }};
+    try {{
+      navigator.clipboard.writeText(source.textContent).then(
+        function () {{ say('Copied'); }},
+        function () {{ say('Press \u2318C'); }}
+      );
+    }} catch (e) {{
+      /* No clipboard permission, or an engine without it: say so rather than
+         leave a button that looks like it worked. Selecting and copying by
+         hand still works, which is what the fallback names. */
+      say('Press \u2318C');
+    }}
+  }});
+}})();
+</script>
+</body></html>"#
+    )
+}
+
 /// Who may embed a message frame: the app's own window, in every spelling
 /// the platforms give it.
 ///
@@ -234,7 +472,10 @@ fn print_document(
     let cc_line = if cc.is_empty() {
         String::new()
     } else {
-        format!("<div class=\"line\"><span>Cc</span>{}</div>", esc(cc))
+        format!(
+            "<div class=\"line\"><span data-t=\"cc\">Cc</span>{}</div>",
+            esc(cc)
+        )
     };
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
@@ -277,10 +518,10 @@ fn print_document(
 </style></head><body>
 <header>
   <h1>{subject}</h1>
-  <div class="line"><span>From</span>{from}</div>
-  <div class="line"><span>To</span>{to}</div>
+  <div class="line"><span data-t="from">From</span>{from}</div>
+  <div class="line"><span data-t="to">To</span>{to}</div>
   {cc_line}
-  <div class="line"><span>Date</span>{date}</div>
+  <div class="line"><span data-t="date">Date</span>{date}</div>
 </header>
 <div id="petrel-box"><div id="petrel-fit">{body}</div></div>
 <script nonce="{nonce}">
@@ -299,6 +540,15 @@ fn print_document(
   window.addEventListener('load', function () {{
     setTimeout(function () {{
       var box = document.getElementById('petrel-box');
+      /* The header's labels, in whatever the app is speaking. Handed over when
+         the window opened, for the same reason the source window's are: this
+         page is served by the message protocol and has no way to ask. Applied
+         before print() below, so paper never catches them mid-swap. */
+      var said = window.__PETREL_PRINT__ || {{}};
+      Array.prototype.forEach.call(document.querySelectorAll('[data-t]'), function (node) {{
+        var word = said[node.getAttribute('data-t')];
+        if (word) node.textContent = word;
+      }});
       var fit = document.getElementById('petrel-fit');
       if (box && fit) {{
         var avail = box.clientWidth;
@@ -533,6 +783,47 @@ pub fn handle(
 
     // The printable document: same token scheme, same sanitizing, plus the
     // envelope a page needs once it leaves the app.
+    // The stored bytes, as text. No parsing, no sanitizer, no remote content —
+    // this route exists precisely for when the parsed view and the wire
+    // disagree, so it must not go through the thing under suspicion.
+    if let Some(token) = path.strip_prefix("/source/") {
+        let Some(message_id) = tokens.resolve(token) else {
+            return error_response(403, "unknown or expired message token");
+        };
+        let Some(hash) = lookup_blob(message_id) else {
+            return error_response(404, "message body not stored");
+        };
+        let Ok(raw) = blobs.read(&hash) else {
+            return error_response(410, "message body unavailable (failed verification)");
+        };
+        // The Appearance setting rides on the URL, the way the reading frame's
+        // does. Without it this window was light while the app was dark.
+        let query = request.uri().query().unwrap_or("");
+        let theme = query.split('&').find_map(|kv| kv.strip_prefix("theme="));
+        // One nonce for the header and the page: they have to agree or the
+        // script the header admits is not the script the page carries.
+        let source_nonce = new_token();
+        return Response::builder()
+            .status(200)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .header(
+                "Content-Security-Policy",
+                // The one script is ours and fixed, admitted by a nonce the way
+                // the printable page's is. The message itself is escaped text in
+                // a <pre>: it cannot introduce a tag, and could not carry the
+                // nonce if it did.
+                format!(
+                    "default-src 'none'; style-src 'unsafe-inline'; \
+                     script-src 'nonce-{}'; form-action 'none'; base-uri 'none'",
+                    source_nonce
+                ),
+            )
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Referrer-Policy", "no-referrer")
+            .body(source_document(&raw, theme, &source_nonce).into_bytes())
+            .expect("source response");
+    }
+
     if let Some(token) = path.strip_prefix("/print/") {
         let Some(message_id) = tokens.resolve(token) else {
             return error_response(403, "unknown or expired message token");
@@ -705,7 +996,196 @@ pub fn handle(
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameTheme, document, img_src};
+    use super::{FrameTheme, SOURCE_VIEW_CAP, document, img_src, print_document, source_document};
+
+    /// The source page with no explicit theme, which is what most of these are
+    /// about. The theme is exercised on its own below.
+    fn source_document_t(raw: &[u8]) -> String {
+        source_document(raw, None, "test-nonce")
+    }
+
+    /// Every word on these pages is replaceable from the .ftl files.
+    ///
+    /// The markup still carries English, deliberately: a page that somehow
+    /// loaded without its strings should say something true rather than sit
+    /// blank. What matters is that each piece is *marked* so the window's
+    /// script can put the app's own language over it.
+    #[test]
+    fn both_pages_can_be_spoken_in_another_language() {
+        let source = source_document(b"Subject: x\r\n\r\nbody\r\n", None, "n");
+        assert!(
+            source.contains(r#"<title data-t="title">"#),
+            "the title is fixed"
+        );
+        assert!(
+            source.contains(r#"id="note""#),
+            "the byte note cannot be replaced"
+        );
+        assert!(
+            source.contains("__PETREL_SOURCE__"),
+            "no words are handed in"
+        );
+        // The counts are the page's to fill, so the pattern needs somewhere to
+        // put them and the page needs the numbers.
+        assert!(
+            source.contains(r#"data-total="#),
+            "the note has no count to fill in"
+        );
+        assert!(
+            source.contains("data-shown="),
+            "the note has no count for a pattern to use"
+        );
+        assert!(
+            source.contains("bytesCapped"),
+            "the capped pattern is never consulted"
+        );
+
+        let printable = print_document("<p>b</p>", "s", "f", "t", "", "d", "n");
+        for label in ["from", "to", "date"] {
+            assert!(
+                printable.contains(&format!(r#"data-t="{label}""#)),
+                "the {label} label is fixed in English"
+            );
+        }
+        assert!(
+            printable.contains("__PETREL_PRINT__"),
+            "no labels are handed in"
+        );
+    }
+
+    /// The point of a source view is the bytes, so it must not lose any.
+    #[test]
+    fn source_shows_bytes_that_are_not_utf8_rather_than_losing_them() {
+        // A Shift_JIS body. from_utf8_lossy would render this as replacement
+        // characters — the evidence a charset bug is diagnosed from, replaced
+        // by the symptom being investigated.
+        let raw = b"Subject: sjis\r\n\r\n\x82\xb1\x82\xea\r\n";
+        let doc = source_document_t(raw);
+        assert!(doc.contains("\\x82"), "the bytes are not shown in:\n{doc}");
+        assert!(doc.contains("\\xB1"), "the bytes are not shown in:\n{doc}");
+        assert!(
+            !doc.contains('\u{FFFD}'),
+            "a byte was lost to a replacement char"
+        );
+    }
+
+    /// ISO-2022-JP *is* its escape sequences; invisible, they cannot be checked.
+    #[test]
+    fn source_shows_the_control_bytes_an_encoding_is_made_of() {
+        let raw = b"Subject: =?ISO-2022-JP?B?x?=\r\n\r\n\x1b$B$3\x1b(B\r\n";
+        let doc = source_document_t(raw);
+        assert!(
+            doc.contains("\\x1B"),
+            "the escapes are invisible in:\n{doc}"
+        );
+    }
+
+    /// Every line of a message ends CRLF. Marking all of them would bury the
+    /// one line that ends differently, which is the one worth seeing.
+    #[test]
+    fn source_keeps_line_endings_quiet_but_shows_a_lone_carriage_return() {
+        let doc = source_document_t(b"To: a\r\nFrom: b\r\n");
+        assert!(!doc.contains("\\x0D"), "CRLF was marked up in:\n{doc}");
+        let odd = source_document_t(b"To: a\rFrom: b\n");
+        assert!(odd.contains("\\x0D"), "a lone CR went unmarked in:\n{odd}");
+    }
+
+    /// The blob is hostile input and this window never parses it as a document.
+    #[test]
+    fn source_escapes_markup_in_the_message() {
+        let doc = source_document_t(b"Subject: x\r\n\r\n<script>alert(1)</script>\r\n");
+        assert!(!doc.contains("<script>"), "markup survived into the page");
+        assert!(
+            doc.contains("&lt;script&gt;"),
+            "markup was not escaped in:\n{doc}"
+        );
+    }
+
+    /// A message that is mostly a base64 attachment is not worth drawing whole,
+    /// and what was left out is said rather than silently dropped.
+    #[test]
+    fn source_caps_a_huge_message_and_says_so() {
+        let mut raw = b"Subject: big\r\n\r\n".to_vec();
+        raw.resize(SOURCE_VIEW_CAP + 5000, b'A');
+        let doc = source_document(&raw, None, "n");
+        assert!(
+            doc.contains("Showing the first"),
+            "no truncation note in the page"
+        );
+        // Smaller than the message it came from. The slack over the cap is the
+        // page's own chrome — its style and its script — not more of the
+        // message, so the bound is about the cap holding, not an exact size.
+        assert!(
+            doc.len() < raw.len(),
+            "the page is no smaller than the {} byte message: {} bytes",
+            raw.len(),
+            doc.len()
+        );
+        assert!(
+            doc.len() < SOURCE_VIEW_CAP + 16 * 1024,
+            "more than the cap plus chrome was drawn: {} bytes",
+            doc.len()
+        );
+    }
+
+    /// Three states, like the app's own tokens: an explicit choice stamps the
+    /// root and wins in both directions, and "system" stamps nothing.
+    #[test]
+    fn source_page_follows_the_appearance_setting() {
+        let raw = b"Subject: x\r\n\r\nbody\r\n";
+        assert!(source_document(raw, Some("dark"), "n").contains(r#"<html data-theme="dark">"#));
+        assert!(source_document(raw, Some("light"), "n").contains(r#"<html data-theme="light">"#));
+        let system = source_document(raw, None, "n");
+        assert!(
+            system.contains("<html>"),
+            "system must stamp nothing: {system:.80}"
+        );
+        assert!(
+            system.contains("prefers-color-scheme: dark"),
+            "system must still resolve a dark platform"
+        );
+    }
+
+    /// The one script on the page is ours, and the message cannot become one.
+    #[test]
+    fn source_page_admits_only_its_own_script() {
+        // A message that tries to smuggle a tag past the escaping, wearing a
+        // nonce it could only have guessed.
+        let raw = b"Subject: x\r\n\r\n<script nonce=\"n\">alert(1)</script>\r\n";
+        let doc = source_document(raw, None, "n");
+        assert_eq!(
+            doc.matches("<script").count(),
+            1,
+            "the message introduced a script tag:\n{doc}"
+        );
+        assert!(doc.contains("&lt;script"), "the attempt was not escaped");
+        assert!(
+            doc.contains(r#"<script nonce="n">"#),
+            "our own script is missing"
+        );
+    }
+
+    /// The button copies what is drawn, which is the diagnostic view.
+    #[test]
+    fn source_page_offers_a_copy_button() {
+        let doc = source_document(b"Subject: x\r\n\r\nbody\r\n", None, "n");
+        assert!(doc.contains(r#"id="copy""#), "no copy button");
+        assert!(doc.contains("clipboard"), "the button copies nothing");
+        assert!(doc.contains(r#"id="src""#), "nothing for it to copy");
+    }
+
+    /// Nothing loads and nothing runs, whatever the message says.
+    #[test]
+    fn source_page_loads_nothing_from_anywhere() {
+        let doc = source_document_t(b"Subject: x\r\n\r\nbody\r\n");
+        assert!(doc.contains("<pre"), "the source is not rendered as text");
+        // Style and script are both inline, so there is no URL on the page for
+        // a policy to have to refuse in the first place.
+        for reach in ["src=\"http", "src=\"//", "href=\"http", "@import", "url("] {
+            assert!(!doc.contains(reach), "the page reaches for {reach}");
+        }
+        assert!(!doc.contains("<link"), "the page links a stylesheet");
+    }
 
     #[test]
     fn the_printable_page_is_the_envelope_then_the_body_then_the_dialog() {

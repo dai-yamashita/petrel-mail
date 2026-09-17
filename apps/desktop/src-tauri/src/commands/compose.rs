@@ -303,6 +303,12 @@ pub(crate) struct Quoted {
     /// should say what *that* message said.
     to: String,
     subject: String,
+    /// Where the author asks replies to go, when they asked. Read from the
+    /// stored bytes here rather than kept in a column: it is needed at the
+    /// moment somebody hits reply and nowhere else, so it costs one parse of a
+    /// message already being parsed, instead of a schema change and a pass over
+    /// every message ever received.
+    reply_to: Vec<String>,
 }
 
 /// Reads a message back for quoting.
@@ -354,6 +360,11 @@ pub fn quote_message(message_id: i64, state: State<Arc<AppState>>) -> Result<Quo
         date_ms,
         to,
         subject: parsed.subject.clone().unwrap_or_default(),
+        reply_to: parsed
+            .reply_to
+            .iter()
+            .map(|(_, addr)| addr.clone())
+            .collect(),
     })
 }
 

@@ -284,6 +284,53 @@
 .msg-name {
   font-size: 13.5px;
   font-weight: 650;
+  display: flex;
+  align-items: baseline;
+  gap: 0 6px;
+  min-inline-size: 0;
+  /* When the row is too narrow for both, the address takes a line of its own
+     rather than being cut short. It is the part a reader came to check — two
+     people of the same name are told apart by nothing else — so losing its
+     end to an ellipsis defeats putting it here. A line is only spent when
+     there is no room, and only on the message that is open. */
+  flex-wrap: wrap;
+}
+
+/* The name is the identity; the address only tells two people of that name
+   apart. So the address gives up its room first and the name keeps its own —
+   shortening both at once reads as a rendering fault rather than as a fit.
+   This line is narrow: it shares the row with the unsubscribe offer, the time
+   and two buttons, and in a three-pane window it can be 150px.
+
+   The name still yields past 60%, or a long one would push the address and the
+   authentication mark clean out of the header. */
+.msg-name-text {
+  flex-shrink: 0;
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The address and its mark: one flex item, so they wrap together or not at
+   all. The mark sits outside the truncating span inside this, so it cannot be
+   clipped away by an ellipsis. */
+.msg-ident {
+  display: inline-flex;
+  align-items: baseline;
+  flex-shrink: 1;
+  min-inline-size: 0;
+}
+
+.msg-addr {
+  flex-shrink: 1;
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--ink2);
 }
 
 .msg-to {

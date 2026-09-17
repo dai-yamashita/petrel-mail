@@ -241,6 +241,10 @@
   // could not be reproduced, which is exactly what happened with trash.
   rows[5].filed = 'sent';
   rows[6].filed = 'sent';
+  // A long machine sender with a verified mark: the shape that stranded the
+  // pill on a line of its own once the address moved up beside the name.
+  rows[4].from_display = 'runelite-github-app[bot]';
+  rows[4].from_addr = 'notifications@github.example';
   rows[7].filed = 'drafts';
   // The leftover reply draft shares conversation 2's thread, as a draft does
   // once it has been pushed and ingested. Modelled rather than left unthreaded:
@@ -1002,7 +1006,9 @@
     move_rule: function () { return null; },
     unsubscribe_info: function (a) {
       // The newsletter stand-in offers one-click; everything else offers none.
-      return a.messageId === 1
+      // Message 5 is the long machine sender, which is where the unsubscribe
+      // offer, the verified pill and a long address all compete for one row.
+      return a.messageId === 1 || a.messageId === 5
         ? { one_click: true, url: 'https://news.example/u/1', mailto: null }
         : null;
     },
@@ -1154,6 +1160,30 @@
       if (a && a.draftId != null) return a.draftId;
       nextDraftId += 1;
       return nextDraftId;
+    },
+    authentication_info: function (a) {
+      // A pass for the long machine sender, so the verified pill can be seen
+      // where it matters: beside a name and address that already fill the row.
+      if (a && a.messageId === 5) {
+        return { verified: true, domain: 'github.example', spf: 'pass', dkim: 'pass', dmarc: 'pass' };
+      }
+      return null;
+    },
+    eml_filename: function () { return 'Conversation 1.eml'; },
+    save_message_eml: function (a) {
+      var rec = window.__EML_PROBE__ || { saves: [] };
+      rec.saves.push({ id: a && a.messageId, path: a && a.path });
+      window.__EML_PROBE__ = rec;
+      return null;
+    },
+    view_message_source: function (a) {
+      // Recorded rather than opened: the harness has no second window, and the
+      // point a probe needs to check is that the menu asks for the right
+      // message. The document itself is rendered in Rust and tested there.
+      var rec = window.__SOURCE_PROBE__ || { ids: [] };
+      rec.ids.push(a && a.messageId);
+      window.__SOURCE_PROBE__ = rec;
+      return null;
     },
     delete_draft: function (a) {
       // The composer's own discard, and the Outbox's. The Drafts list no longer

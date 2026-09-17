@@ -274,6 +274,13 @@ pub struct ParsedMessage {
     pub from_display: Option<String>,
     pub to: Vec<(Option<String>, String)>,
     pub cc: Vec<(Option<String>, String)>,
+    /// Where the author asks replies to go, when that is not the From address.
+    ///
+    /// RFC 5322 §3.6.2. A list that rewrites it sends your answer to the list;
+    /// a notification address that cannot receive mail uses it to point at one
+    /// that can. Ignoring it addresses the reply at a mailbox nobody reads,
+    /// which is a silent failure — the message leaves, and no one gets it.
+    pub reply_to: Vec<(Option<String>, String)>,
     pub date_ms: Option<i64>,
     pub body_text: String,
     pub body_html: Option<String>,
@@ -480,6 +487,7 @@ pub fn parse_message(raw: &[u8]) -> Option<ParsedMessage> {
         from_display,
         to: addr_lists(msg.all_to()),
         cc: addr_lists(msg.all_cc()),
+        reply_to: addr_list(msg.reply_to()),
         date_ms: msg.date().map(|d| d.to_timestamp() * 1000),
         body_text: msg.body_text(0).map(|c| c.to_string()).unwrap_or_default(),
         body_html: msg.body_html(0).map(|c| c.to_string()),
@@ -906,5 +914,70 @@ iVBORw0KGgo=\r\n\
             ..Default::default()
         };
         assert!(m.index_text().contains("more words"));
+    }
+}
+
+#[cfg(test)]
+mod reply_to {
+    use super::*;
+
+    fn raw(headers: &str) -> Vec<u8> {
+        format!(
+            "From: Jordan Atwood <notifications@github.example>\r\n{headers}\
+To: runelite/plugin-hub <plugin-hub@noreply.github.example>\r\n\
+Subject: Re: a pull request\r\nMIME-Version: 1.0\r\n\
+Content-Type: text/plain\r\n\r\nMerged.\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// The header a notification address uses to point at one that works.
+    #[test]
+    fn reply_to_is_read_when_it_is_there() {
+        let m = parse_message(&raw(
+            "Reply-To: runelite/plugin-hub <reply+abc@reply.github.example>\r\n",
+        ))
+        .expect("parses");
+        assert_eq!(
+            m.reply_to,
+            vec![(
+                Some("runelite/plugin-hub".into()),
+                "reply+abc@reply.github.example".into()
+            )]
+        );
+        // The From is still the author, and still separate from it.
+        assert_eq!(m.from_addr.as_deref(), Some("notifications@github.example"));
+    }
+
+    #[test]
+    fn a_message_without_one_has_none() {
+        let m = parse_message(&raw("")).expect("parses");
+        assert!(
+            m.reply_to.is_empty(),
+            "invented a reply-to: {:?}",
+            m.reply_to
+        );
+    }
+
+    /// The field takes an address list, and a discussion list may name several.
+    #[test]
+    fn several_reply_to_addresses_all_arrive() {
+        let m = parse_message(&raw(
+            "Reply-To: One <one@example.com>, Two <two@example.com>\r\n",
+        ))
+        .expect("parses");
+        let addrs: Vec<&str> = m.reply_to.iter().map(|(_, a)| a.as_str()).collect();
+        assert_eq!(addrs, vec!["one@example.com", "two@example.com"]);
+    }
+
+    /// It is not a participant: keeping it out of the index means no schema
+    /// change and no re-extraction, and searching for a list's reply address
+    /// was never a thing anyone asked for.
+    #[test]
+    fn reply_to_stays_out_of_the_address_index() {
+        let m =
+            parse_message(&raw("Reply-To: <reply+abc@reply.github.example>\r\n")).expect("parses");
+        let roles: Vec<&str> = m.addresses().iter().map(|(r, _, _)| *r).collect();
+        assert!(!roles.contains(&"reply-to"), "roles were {roles:?}");
     }
 }

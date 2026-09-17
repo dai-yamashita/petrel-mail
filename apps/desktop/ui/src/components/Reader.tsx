@@ -9,6 +9,8 @@ import {
   MailOpen,
   MoreVertical,
   Printer,
+  FileCode,
+  Download,
   Reply as ReplyIcon,
   ReplyAll,
   Star,
@@ -129,17 +131,44 @@ function Expanded({
           <span className="avatar" aria-hidden="true">
             {initials(m.from_display, m.from_addr)}
           </span>
+          {/* Who wrote it on one line, who received it on the next.
+              
+              Both used to share the second line: "to <them> · cc <them> ·
+              <sender>". Every item there carried its role except the last one,
+              which was the sender's address sitting after a separator with
+              nothing to say so — read quickly, the "to" governs the lot. The
+              two lines already existed, so putting the sender's address beside
+              the sender's name costs no height and leaves the second line
+              entirely about recipients. */}
           <span className="msg-who">
-            <span className="msg-name">{m.from_display || m.from_addr}</span>
-            <span className="msg-to">
-              {m.to.length > 0 && <>{t('reader-to', { who: m.to.join(', ') })} · </>}
-              {m.cc.length > 0 && <>{t('reader-cc', { who: m.cc.join(', ') })} · </>}
-              <span className="mono">{m.from_addr}</span>
-              {/* Next to the address, because the address is what it makes a
-                  claim about. A mark anywhere else in the header is a mark
-                  about "the message", which is not what it means. */}
-              <SenderAuth messageId={m.id} />
+            <span className="msg-name">
+              <span className="msg-name-text">{m.from_display || m.from_addr}</span>
+              {/* The address and the mark that vouches for it are one thing and
+                  break as one. Loose in the row, the mark was a flex item of its
+                  own and a long sender name left it stranded on a line by
+                  itself, vouching for nothing visible.
+
+                  The address only appears when it is not already the name: a
+                  sender with no display name is shown by their address, and
+                  printing it twice reads as a rendering fault. */}
+              <span className="msg-ident">
+                {m.from_display ? <span className="msg-addr mono">{m.from_addr}</span> : null}
+                {/* Next to the address, because the address is what it makes a
+                    claim about. A mark anywhere else in the header is a mark
+                    about "the message", which is not what it means. Outside the
+                    truncating span, so a long address shortens and the mark
+                    still shows — losing it silently would be the one omission
+                    here that matters. */}
+                <SenderAuth messageId={m.id} />
+              </span>
             </span>
+            {(m.to.length > 0 || m.cc.length > 0) && (
+              <span className="msg-to">
+                {m.to.length > 0 && t('reader-to', { who: m.to.join(', ') })}
+                {m.to.length > 0 && m.cc.length > 0 && ' · '}
+                {m.cc.length > 0 && t('reader-cc', { who: m.cc.join(', ') })}
+              </span>
+            )}
           </span>
         </button>
         {/* Unsubscribe first, then the time. The offer belongs to the sender
@@ -221,11 +250,67 @@ function Expanded({
                 <MenuItem
                   className="menu-item"
                   onClick={() =>
-                    void api.printMessage(m.id).catch((e) => onToast(String(e)))
+                    void api
+                      .printMessage(m.id, {
+                        from: t('print-from'),
+                        to: t('print-to'),
+                        cc: t('print-cc'),
+                        date: t('print-date'),
+                      })
+                      .catch((e) => onToast(String(e)))
                   }
                 >
                   <Icon icon={Printer} size={14} />
                   <span className="menu-label">{t('msg-print')}</span>
+                </MenuItem>
+                {/* The bytes as stored, for when this pane and the wire
+                    disagree. Named for the message rather than "View source",
+                    which in the menu bar means this project's code on GitHub. */}
+                <MenuItem
+                  className="menu-item"
+                  onClick={() =>
+                    void api
+                      .viewMessageSource(m.id, {
+                        title: t('source-title'),
+                        copy: t('source-copy'),
+                        copied: t('source-copied'),
+                        copyManual: t('source-copy-manual'),
+                        // Patterns, not finished sentences: the page fills the
+                        // counts, because only it knows them.
+                        bytes: t('source-bytes', { n: '{n}' }),
+                        bytesCapped: t('source-bytes-capped', {
+                          shown: '{shown}',
+                          total: '{total}',
+                        }),
+                      })
+                      .catch((e) => onToast(String(e)))
+                  }
+                >
+                  <Icon icon={FileCode} size={14} />
+                  <span className="menu-label">{t('msg-view-source')}</span>
+                </MenuItem>
+                {/* The exact bytes, where the source window shows a reading of
+                    them. This is the copy another client opens and a test is
+                    built from. */}
+                <MenuItem
+                  className="menu-item"
+                  onClick={() => {
+                    void (async () => {
+                      try {
+                        const suggested = await api.emlFilename(m.id);
+                        const path = await api.pickSavePath(suggested, 'eml');
+                        // Cancelling is an answer, not a failure.
+                        if (!path) return;
+                        await api.saveMessageEml(m.id, path);
+                        onToast(t('msg-saved-eml'));
+                      } catch (e) {
+                        onToast(String(e));
+                      }
+                    })();
+                  }}
+                >
+                  <Icon icon={Download} size={14} />
+                  <span className="menu-label">{t('msg-save-eml')}</span>
                 </MenuItem>
               </Menu>
             </MenuProvider>

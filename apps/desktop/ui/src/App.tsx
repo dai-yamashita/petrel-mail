@@ -795,11 +795,15 @@ export function App() {
           ? await api.threadMessage(targetId)
           : (await api.threadDetail(row.thread_id, { limit: 1 })).at(-1);
       if (!last) return;
-      const { to, cc } = replyTargets(last, identity?.address ?? '', all);
       // The original, quoted. Fetched rather than taken from the row, which
       // carries a 120-character snippet — a reply quoting a preview would be
       // worse than one quoting nothing.
+      //
+      // Fetched before the recipients are worked out, because it carries the
+      // Reply-To as well: where the author asked replies to go, which is not
+      // always where they came from.
       const quoted = await api.quoteMessage(last.id).catch(() => null);
+      const { to, cc } = replyTargets(last, identity?.address ?? '', all, quoted?.reply_to ?? []);
       openComposer({
         to: to.join(', '),
         cc: cc.join(', '),

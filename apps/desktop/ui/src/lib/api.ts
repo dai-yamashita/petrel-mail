@@ -92,6 +92,20 @@ export type OutboxRow = {
   attachments: number;
 };
 
+/** What the printable page calls the header lines it draws. */
+export type PrintStrings = { from: string; to: string; cc: string; date: string };
+
+/** What the source window says. `bytes` and `bytesCapped` are patterns: only
+ *  that page knows how large the message is, so it fills the counts itself. */
+export type SourceStrings = {
+  title: string;
+  copy: string;
+  copied: string;
+  copyManual: string;
+  bytes: string;
+  bytesCapped: string;
+};
+
 export type Quoted = {
   html: string;
   text: string;
@@ -99,6 +113,8 @@ export type Quoted = {
   date_ms: number;
   to: string;
   subject: string;
+  /** Where the author asked replies to go. Empty when they did not ask. */
+  reply_to: string[];
 };
 
 /** Somebody worth offering while a recipient is typed. */
@@ -601,6 +617,9 @@ const mock = {
   unsubscribeInfo: async () => null,
   authenticationInfo: async () => null,
   printMessage: async () => {},
+  viewMessageSource: async () => {},
+  emlFilename: async () => 'message.eml',
+  saveMessageEml: async () => {},
   listRules: async () => [],
   viewCount: async () => 40,
   saveRule: async () => 1,
@@ -691,7 +710,7 @@ const mock = {
   pickFiles: async (_purpose: 'attach' | 'mail' | 'settings'): Promise<string[]> => [],
   pickSavePath: async (
     _suggested: string,
-    _purpose: 'attachment' | 'mbox' | 'settings',
+    _purpose: 'attachment' | 'mbox' | 'settings' | 'eml',
   ): Promise<string | null> => null,
   installUpdate: async () => {},
   restartForUpdate: async () => {},
@@ -708,6 +727,7 @@ const mock = {
     text: 'The original message, as it was written.',
     from: 'Dana Wu',
     date_ms: Date.now() - 3600_000,
+    reply_to: [],
   }),
   completeAddresses: async (prefix: string): Promise<Correspondent[]> =>
     [
@@ -904,7 +924,7 @@ const real = {
    *  a file on disk. Empty and null mean cancelled. */
   pickFiles: (purpose: 'attach' | 'mail' | 'settings') =>
     invoke<string[]>('pick_files', { purpose }),
-  pickSavePath: (suggested: string, purpose: 'attachment' | 'mbox' | 'settings') =>
+  pickSavePath: (suggested: string, purpose: 'attachment' | 'mbox' | 'settings' | 'eml') =>
     invoke<string | null>('pick_save_path', { suggested, purpose }),
   installUpdate: () => invoke<void>('install_update'),
   restartForUpdate: () => invoke<void>('restart_for_update'),
@@ -951,7 +971,18 @@ const real = {
   deleteRule: (ruleId: number) => invoke<void>('delete_rule', { ruleId }),
   moveRule: (ruleId: number, up: boolean) => invoke<void>('move_rule', { ruleId, up }),
   /** Opens the message's printable page in its own window. */
-  printMessage: (messageId: number) => invoke<void>('print_message', { messageId }),
+  /** The printable page's header labels travel with it: that page is served by
+   *  the message protocol and cannot ask for them itself. */
+  printMessage: (messageId: number, strings: PrintStrings) =>
+    invoke<void>('print_message', { messageId, strings }),
+  /** Opens the stored bytes of one message in their own window. */
+  viewMessageSource: (messageId: number, strings: SourceStrings) =>
+    invoke<void>('view_message_source', { messageId, strings }),
+  /** A filename to suggest for one message, from its subject. */
+  emlFilename: (messageId: number) => invoke<string>('eml_filename', { messageId }),
+  /** Writes one message's exact stored bytes to a chosen path. */
+  saveMessageEml: (messageId: number, path: string) =>
+    invoke<void>('save_message_eml', { messageId, path }),
   /** The List-Unsubscribe offer this message makes, if any. */
   unsubscribeInfo: (messageId: number) =>
     invoke<UnsubInfo | null>('unsubscribe_info', { messageId }),

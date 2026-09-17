@@ -38,6 +38,19 @@ export function replyTargets(
   message: ThreadMessage,
   self: string,
   all: boolean,
+  /** What the message's `Reply-To` named, if it named anything.
+   *
+   *  RFC 5322 §3.6.2: where the author asks replies to go. It is not a
+   *  courtesy — a notification address that cannot receive mail uses it to
+   *  point at one that can, and a discussion list uses it to send your answer
+   *  to the list. Replying to the From address instead sends the message to a
+   *  mailbox nobody reads, which fails silently: it leaves, and nobody gets it.
+   *
+   *  It replaces the sender rather than joining them, which is what the field
+   *  means and what Thunderbird, Apple Mail and Gmail all do. Only for a reply
+   *  to somebody else: following up on your own message still goes to the
+   *  people you wrote to. */
+  replyTo: string[] = [],
 ): { to: string[]; cc: string[] } {
   const mine = self.trim().toLowerCase();
   const seen = new Set<string>([mine]);
@@ -54,12 +67,17 @@ export function replyTargets(
   // message is; addressing yourself gave an empty To and a send that could
   // not go anywhere.
   const own = message.from_addr.trim().toLowerCase() === mine;
-  const to = (own ? (message.recipient_addrs ?? []) : [message.from_addr])
+  const asked = replyTo.filter((a) => a.trim() !== '');
+  const answering = asked.length > 0 ? asked : [message.from_addr];
+  const to = (own ? (message.recipient_addrs ?? []) : answering)
     .map(take)
     .filter((a): a is string => a !== null);
   if (!all) return { to, cc: [] };
 
-  const cc = (message.recipient_addrs ?? [])
+  // Reply-all still reaches everyone the message reached — and the author too,
+  // who is no longer in To once the reply-to replaced them. `take` has already
+  // seen whatever went into To, so nobody is written to twice.
+  const cc = [...(asked.length > 0 && !own ? [message.from_addr] : []), ...(message.recipient_addrs ?? [])]
     .map(take)
     .filter((a): a is string => a !== null);
   return { to, cc };

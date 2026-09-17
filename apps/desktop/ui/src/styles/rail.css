@@ -120,13 +120,27 @@
   flex-shrink: 0;
 }
 
+/* The line box is deliberately roomier than the text needs, and the padding
+   gives back what it takes so the label sits where it did and the box is the
+   same 32px.
+
+   `.rail-scroll .rail-label` clips this element to get an ellipsis on a name
+   too long for the rail, and `overflow: hidden` has no axis: clipping the
+   inline one clips the block one too. At 10px in a 15px line box there was
+   about a pixel of slack under the capitals, which is fine until an engine
+   rounds the line box down or sets the baseline a pixel lower — and then the
+   bottom of MAILBOXES is sliced off. Reported in the shipped app, which runs in
+   the system WebKit; not reproducible in either engine here, at 1x or 2x, with
+   the bundled face or its fallback. So this does not chase the rounding, it
+   leaves enough room that no rounding can reach the edge. */
 .rail-label {
   font-family: var(--mono);
   font-size: 10px;
+  line-height: 18px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--ink3);
-  padding: 12px 9px 5px;
+  padding: 10px 9px 4px;
 }
 
 .rail-item {

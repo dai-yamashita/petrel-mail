@@ -34,6 +34,7 @@ fn open_filters(purpose: &str) -> (&'static str, Vec<(&'static str, &'static [&'
 fn save_filters(purpose: &str) -> (&'static str, Vec<(&'static str, &'static [&'static str])>) {
     match purpose {
         "mbox" => ("Export mail", vec![("Mailbox", &["mbox"][..])]),
+        "eml" => ("Save message", vec![("Mail message", &["eml"][..])]),
         "settings" => ("Save settings", vec![("Petrel settings", &["json"][..])]),
         _ => ("Save attachment", Vec::new()),
     }

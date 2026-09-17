@@ -218,9 +218,21 @@ pub async fn message_url(
 /// loads the message's printable document over the same protocol, so the
 /// same sanitizer, the same CSP and the same remote-content policy govern
 /// what lands on paper — and the page opens straight into the print dialog.
+/// The header labels the printable page shows, from the same `.ftl` files the
+/// rest of the interface uses. See [`SourceStrings`] for why they travel this
+/// way rather than being looked up where the page is built.
+#[derive(serde::Deserialize, serde::Serialize, Default)]
+pub struct PrintStrings {
+    from: String,
+    to: String,
+    cc: String,
+    date: String,
+}
+
 #[tauri::command(async)]
 pub fn print_message(
     message_id: i64,
+    strings: PrintStrings,
     app: tauri::AppHandle,
     state: State<Arc<AppState>>,
 ) -> Result<(), String> {
@@ -241,8 +253,10 @@ pub fn print_message(
     let url: tauri::Url = format!("{}/print/{token}", message_origin())
         .parse()
         .map_err(|e| format!("{e}"))?;
+    let said = serde_json::to_string(&strings).unwrap_or_else(|_| "{}".into());
     WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
         .title("Print")
+        .initialization_script(format!("window.__PETREL_PRINT__ = {said};"))
         // The printed page is a top-level document: nothing it links to may
         // load in its place. Its own script swallows clicks; this is the
         // webview refusing whatever gets past that.
@@ -254,6 +268,162 @@ pub fn print_message(
         .build()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Opens a message's stored bytes in their own window.
+///
+/// The reading pane shows a sanitized, parsed body; this shows what was
+/// actually ingested. When the two disagree — a folded subject, a charset, a
+/// blank line that did not survive — the source is the only way to tell which
+/// layer lost it, and today the only route to it is exporting a whole mailbox
+/// to mbox and opening the file elsewhere.
+///
+/// Over the message protocol like the printable page, for the same reason:
+/// bulk bytes do not belong on the IPC channel, and the token keeps the URL
+/// unguessable and scoped to one message. The window is our chrome around
+/// escaped text under a policy that loads nothing and runs nothing — the blob
+/// is hostile input and is never parsed as a document here.
+/// The words the source window shows, handed over by the window that opens it.
+///
+/// They come from the same `.ftl` files the rest of the interface does. The page
+/// is served by the message protocol and has no way to ask for them itself — it
+/// has no IPC, deliberately — so they travel in the window's own init script.
+/// `bytes` and `bytes_capped` arrive as patterns with a `{n}`, `{shown}` and
+/// `{total}` in them, because only the page knows how large the message is.
+#[derive(serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceStrings {
+    title: String,
+    copy: String,
+    copied: String,
+    copy_manual: String,
+    bytes: String,
+    bytes_capped: String,
+}
+
+#[tauri::command(async)]
+pub fn view_message_source(
+    message_id: i64,
+    strings: SourceStrings,
+    app: tauri::AppHandle,
+    state: State<Arc<AppState>>,
+) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+    let (token, theme) = {
+        let store = state.store_read_open()?;
+        store
+            .blob_hash_for(message_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("message has no stored body")?;
+        // Read here rather than sent by the window, so the setting and the
+        // page cannot disagree, and so a window opened from anywhere gets it.
+        // "system" is left off: the page then resolves it the way the app's
+        // own tokens do, through prefers-color-scheme.
+        let theme = store
+            .settings()
+            .ok()
+            .and_then(|s| s.get("theme").cloned())
+            .filter(|t| t == "dark" || t == "light");
+        (state.tokens.issue(message_id), theme)
+    };
+    let label = format!("source-{message_id}");
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    let query = match &theme {
+        Some(t) => format!("?theme={t}"),
+        None => String::new(),
+    };
+    let url: tauri::Url = format!("{}/source/{token}{query}", message_origin())
+        .parse()
+        .map_err(|e| format!("{e}"))?;
+    // Serialised rather than interpolated by hand: a translation is text
+    // somebody else wrote, and text somebody else wrote does not get pasted
+    // into a script. `textContent` is all the page does with it.
+    let said = serde_json::to_string(&strings).unwrap_or_else(|_| "{}".into());
+    let init = format!("window.__PETREL_SOURCE__ = {said};");
+    let title = if strings.title.is_empty() {
+        "Message source".to_string()
+    } else {
+        strings.title.clone()
+    };
+    WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
+        // Not the subject: a window title is chrome the platform may record,
+        // and no part of a message's text needs to be in it.
+        .title(title)
+        .initialization_script(&init)
+        // Same fence as the print window. Nothing this page names may load in
+        // its place, and there is nothing in it that should try.
+        .on_navigation(crate::print_navigation_allowed)
+        .inner_size(820.0, 900.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Writes one message's stored bytes to a path the person chose.
+///
+/// The exact bytes, and that is the point of it existing beside the source
+/// view: that window renders a *reading* of the message, with anything not
+/// valid UTF-8 written as an escape so a charset can be checked. This is the
+/// message itself — the thing another client will open, a test will be built
+/// from, and a report can carry.
+///
+/// Same shape as saving an attachment, and the same rule: the panel is opened
+/// by `pick_save_path` and only a path that came back from it is accepted, so
+/// the window never names a destination of its own.
+#[tauri::command(async)]
+pub fn save_message_eml(
+    message_id: i64,
+    path: String,
+    state: State<Arc<AppState>>,
+) -> Result<(), String> {
+    let target = state.vetted_path(&path, &[])?;
+    let raw = {
+        let store = state.store_read_open()?;
+        let hash = store
+            .blob_hash_for(message_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("message has no stored body")?;
+        state
+            .blobs
+            .read(&hash)
+            .map_err(|_| "message body unavailable (failed verification)".to_string())?
+    };
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "message.eml".into());
+    // The name, not the path: this string reaches the window and the log.
+    std::fs::write(&target, raw).map_err(|e| format!("could not write {name}: {e}"))?;
+    Ok(())
+}
+
+/// A filename to suggest for one message, from its subject.
+///
+/// The subject, because that is what a person recognises in a folder later, and
+/// it is what every other client suggests. Put through the same scrubber an
+/// attachment's name is: a subject is sender-controlled text and has no more
+/// business deciding a path than a filename does.
+#[tauri::command(async)]
+pub fn eml_filename(message_id: i64, state: State<Arc<AppState>>) -> Result<String, String> {
+    let store = state.store_read_open()?;
+    let subject = store
+        .thread_message(message_id)
+        .map_err(|e| e.to_string())?
+        .map(|m| m.subject)
+        .unwrap_or_default();
+    let trimmed = subject.trim();
+    let stem = if trimmed.is_empty() {
+        "message"
+    } else {
+        trimmed
+    };
+    let cleaned = super::attachments::safe_filename(Some(stem));
+    // The scrubber keeps an extension it recognises; a subject is not a
+    // filename, so whatever it ended in is part of the name and .eml goes on.
+    Ok(format!("{cleaned}.eml"))
 }
 
 /// Tags for the rail. Comes from the account, not from whatever rows happen to

@@ -127,3 +127,55 @@ describe('replying to a message you sent', () => {
     expect(replyTargets(message(), 'you@example.com', false).to).toEqual(['sam@example.com']);
   });
 });
+
+/* RFC 5322 §3.6.2: Reply-To names where the author asks replies to go.
+   Ignoring it is not a cosmetic miss. A GitHub notification arrives From a
+   no-reply address and names a `reply+…@reply.github.com` in Reply-To; a reply
+   sent to the From address is accepted by nobody and posts nothing. The message
+   leaves, and that is the last anyone hears of it. */
+describe('reply honours where the author asked to be answered', () => {
+  const asked = ['reply+abc@reply.github.example'];
+
+  it('writes to the reply-to instead of the sender', () => {
+    expect(replyTargets(message(), 'you@example.com', false, asked)).toEqual({
+      to: ['reply+abc@reply.github.example'],
+      cc: [],
+    });
+  });
+
+  it('still writes to the sender when nothing was asked', () => {
+    expect(replyTargets(message(), 'you@example.com', false, []).to).toEqual(['sam@example.com']);
+  });
+
+  it('keeps the author in the loop on a reply-all', () => {
+    // They are no longer the recipient, but they still wrote it.
+    const { to, cc } = replyTargets(message(), 'you@example.com', true, asked);
+    expect(to).toEqual(['reply+abc@reply.github.example']);
+    expect(cc).toContain('sam@example.com');
+  });
+
+  it('writes to nobody twice', () => {
+    const { to, cc } = replyTargets(message(), 'you@example.com', true, ['sam@example.com']);
+    expect(to).toEqual(['sam@example.com']);
+    expect(cc).not.toContain('sam@example.com');
+  });
+
+  it('never writes to you, whoever asked', () => {
+    const { to, cc } = replyTargets(message(), 'you@example.com', true, ['you@example.com']);
+    expect(to).not.toContain('you@example.com');
+    expect(cc).not.toContain('you@example.com');
+  });
+
+  it('takes every address a list names', () => {
+    const both = ['one@example.com', 'two@example.com'];
+    expect(replyTargets(message(), 'you@example.com', false, both).to).toEqual(both);
+  });
+
+  it('leaves a follow-up to your own message alone', () => {
+    // Answering yourself means writing to the people you wrote to, and a
+    // reply-to on your own message does not change who those are.
+    const mine = { ...message(), from_addr: 'you@example.com' };
+    const { to } = replyTargets(mine, 'you@example.com', false, asked);
+    expect(to).not.toContain('reply+abc@reply.github.example');
+  });
+});
