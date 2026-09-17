@@ -1,9 +1,18 @@
-//! RFC 2047 encoded-word runs split mid-octet.
+//! RFC 2047 encoded-word runs split mid-octet — except ISO-2022-JP.
 //!
 //! mail-parser decodes each `=?charset?B|Q?…?=` independently. When a UTF-8
 //! character is folded across two adjacent Base64 words, the halves decode to
 //! U+FFFD. Thunderbird concatenates the octets first; we rewrite the header
 //! block the same way before handing bytes to mail-parser.
+//!
+//! ISO-2022-JP is the other way around. A Japanese mailer folds on a character
+//! boundary and wraps each fragment as its own `ESC $ B` … `ESC ( B` run.
+//! Concatenating those payloads puts `ESC ( B ESC $ B` in one stream. The
+//! WHATWG decoder mail-parser uses (`encoding_rs`) treats an empty ASCII
+//! stretch between escapes as an error and inserts U+FFFD at every join.
+//! Those runs are decoded independently, then the Unicode is written back as
+//! one UTF-8 word. A fold that actually splits a JIS character — the second
+//! word has no designation — still concatenates octets first.
 
 use base64::alphabet;
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
@@ -19,10 +28,80 @@ fn is_fws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
 }
 
+fn charset_token(charset: &[u8]) -> &[u8] {
+    charset.split(|&c| c == b'*').next().unwrap_or(charset)
+}
+
 fn charset_eq(a: &[u8], b: &[u8]) -> bool {
-    let a = a.split(|&c| c == b'*').next().unwrap_or(a);
-    let b = b.split(|&c| c == b'*').next().unwrap_or(b);
-    a.eq_ignore_ascii_case(b)
+    charset_token(a).eq_ignore_ascii_case(charset_token(b))
+}
+
+fn is_iso2022_jp_family(charset: &[u8]) -> bool {
+    let c = charset_token(charset);
+    c.eq_ignore_ascii_case(b"ISO-2022-JP")
+        || c.eq_ignore_ascii_case(b"ISO-2022-JP-1")
+        || c.eq_ignore_ascii_case(b"ISO-2022-JP-2")
+        || c.eq_ignore_ascii_case(b"ISO-2022-JP-3")
+        || c.eq_ignore_ascii_case(b"ISO-2022-JP-2004")
+        || c.eq_ignore_ascii_case(b"ISO-2022-JP-MS")
+        || c.eq_ignore_ascii_case(b"CSISO2022JP")
+        || c.eq_ignore_ascii_case(b"ISO2022-JP")
+        || c.eq_ignore_ascii_case(b"ISO2022JP")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Iso2022State {
+    Ascii,
+    Roman,
+    Kana,
+    Jis,
+}
+
+fn iso2022_end_state(data: &[u8]) -> Iso2022State {
+    let mut i = 0;
+    let mut state = Iso2022State::Ascii;
+    while i < data.len() {
+        if data[i] != 0x1B {
+            i += 1;
+            continue;
+        }
+        let rest = &data[i..];
+        if rest.starts_with(b"\x1b$B") || rest.starts_with(b"\x1b$@") || rest.starts_with(b"\x1b$A")
+        {
+            state = Iso2022State::Jis;
+            i += 3;
+            continue;
+        }
+        if rest.starts_with(b"\x1b$(D")
+            || rest.starts_with(b"\x1b$(O")
+            || rest.starts_with(b"\x1b$(P")
+        {
+            state = Iso2022State::Jis;
+            i += 4;
+            continue;
+        }
+        if rest.starts_with(b"\x1b(B") {
+            state = Iso2022State::Ascii;
+            i += 3;
+            continue;
+        }
+        if rest.starts_with(b"\x1b(J") || rest.starts_with(b"\x1b(H") {
+            state = Iso2022State::Roman;
+            i += 3;
+            continue;
+        }
+        if rest.starts_with(b"\x1b(I") {
+            state = Iso2022State::Kana;
+            i += 3;
+            continue;
+        }
+        i += 1;
+    }
+    state
+}
+
+fn iso2022_should_cut(prev: &[u8], next: &[u8]) -> bool {
+    iso2022_end_state(prev) != Iso2022State::Jis && next.first() == Some(&0x1B)
 }
 
 struct ParsedWord<'a> {
@@ -127,7 +206,33 @@ fn skip_fws(data: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-fn merge_run(words: &[ParsedWord]) -> Option<Vec<u8>> {
+fn utf8_encoded_word(text: &str) -> Vec<u8> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut out = Vec::with_capacity(10 + b64.len());
+    out.extend_from_slice(b"=?UTF-8?B?");
+    out.extend_from_slice(b64.as_bytes());
+    out.extend_from_slice(b"?=");
+    out
+}
+
+fn merge_iso2022_jp_run(words: &[ParsedWord]) -> Option<Vec<u8>> {
+    let mut groups: Vec<Vec<u8>> = Vec::new();
+    for w in words {
+        let payload = decode_word_payload(w.encoding, w.payload)?;
+        match groups.last_mut() {
+            Some(prev) if !iso2022_should_cut(prev, &payload) => prev.extend(payload),
+            _ => groups.push(payload),
+        }
+    }
+    let mut text = String::new();
+    for group in &groups {
+        let (cow, _, _) = encoding_rs::ISO_2022_JP.decode(group);
+        text.push_str(&cow);
+    }
+    Some(utf8_encoded_word(&text))
+}
+
+fn merge_stateless_run(words: &[ParsedWord]) -> Option<Vec<u8>> {
     let mut merged = Vec::new();
     for w in words {
         merged.extend(decode_word_payload(w.encoding, w.payload)?);
@@ -141,6 +246,17 @@ fn merge_run(words: &[ParsedWord]) -> Option<Vec<u8>> {
     out.extend_from_slice(b64.as_bytes());
     out.extend_from_slice(b"?=");
     Some(out)
+}
+
+fn merge_run(words: &[ParsedWord]) -> Option<Vec<u8>> {
+    if words.is_empty() {
+        return None;
+    }
+    if is_iso2022_jp_family(words[0].charset) {
+        merge_iso2022_jp_run(words)
+    } else {
+        merge_stateless_run(words)
+    }
 }
 
 fn rewrite_header_block(headers: &[u8]) -> Cow<'_, [u8]> {
@@ -246,6 +362,26 @@ body\r\n";
         assert!(
             !text.contains("=?utf-8?B?6KiI55S7?="),
             "second subject word must be gone: {text}"
+        );
+    }
+
+    #[test]
+    fn self_contained_iso_2022_jp_words_become_one_utf8_word() {
+        // Three complete JIS runs. Concatenating their payloads would put
+        // ESC ( B ESC $ B in one stream and encoding_rs would insert U+FFFD.
+        let raw = b"Subject: =?ISO-2022-JP?B?GyRCJDMkbCRPGyhC?=\r\n\
+ =?ISO-2022-JP?B?GyRCJUYlOSVIGyhC?=\r\n\
+ =?ISO-2022-JP?B?GyRCJEckORsoQg==?=\r\n\r\n\
+body\r\n";
+        let out = merge_adjacent_encoded_words(raw);
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("=?UTF-8?B?"),
+            "self-contained JIS runs must be rewritten as UTF-8: {text}"
+        );
+        assert!(
+            !text.contains("ISO-2022-JP"),
+            "original JIS words must be gone: {text}"
         );
     }
 }

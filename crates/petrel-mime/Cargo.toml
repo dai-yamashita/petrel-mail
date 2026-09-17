@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 base64 = "0.22"
+encoding_rs = "0.8"
 mail-parser = { version = "0.11", features = ["full_encoding"] }
 ammonia = "4"
 # Deciding whether a URL is remote by hand missed every shape a browser

@@ -141,34 +141,40 @@ impl Store {
                 finished: true,
             });
         }
-        // Where the last slice stopped. Ordered by id so "after this one" is
-        // a stable place to resume from, whatever else arrives meanwhile.
+        // Newest first. The inbox is what someone looks at after an upgrade,
+        // and an oldest-first walk left today's subjects wrong for the whole
+        // pass — tens of minutes on a real mailbox. The cursor is the next
+        // id to go below; i64::MAX means "start at the top".
         let mut cursor: i64 = settings
             .get("reindex_cursor")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(i64::MAX);
         // A leftover cursor belongs to the version that wrote it, so a new
-        // extraction starts at id 0 or the first stretch is never reached.
-        // Unconditionally: a store interrupted mid-pass by the upgrade that
-        // introduced this key has a cursor from the *older* extractor, and
-        // keeping it skipped every row below it for good. Re-reading a
+        // extraction starts at the newest row or the first stretch is never
+        // reached. An in-progress *ascending* v8 pass is the same class of
+        // leftover: honouring it keeps burning through old mail. Re-reading a
         // stretch that was already correct costs blob reads and writes
         // nothing, because a row that has not changed is not written.
         let target: i64 = settings
             .get("reindex_target")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        if target != Self::EXTRACTION_VERSION {
+        let order = settings
+            .get("reindex_order")
+            .map(String::as_str)
+            .unwrap_or("");
+        if target != Self::EXTRACTION_VERSION || order != "desc" {
             self.set_setting("reindex_target", &Self::EXTRACTION_VERSION.to_string())?;
-            self.set_setting("reindex_cursor", "0")?;
-            cursor = 0;
+            self.set_setting("reindex_order", "desc")?;
+            self.set_setting("reindex_cursor", &i64::MAX.to_string())?;
+            cursor = i64::MAX;
         }
 
         let rows: Vec<(i64, String)> = {
             let mut stmt = self.conn.prepare(
                 "SELECT id, blob_hash FROM messages
-                 WHERE blob_hash IS NOT NULL AND deleted_at_ms IS NULL AND id > ?1
-                 ORDER BY id LIMIT ?2",
+                 WHERE blob_hash IS NOT NULL AND deleted_at_ms IS NULL AND id < ?1
+                 ORDER BY id DESC LIMIT ?2",
             )?;
             let it = stmt.query_map(
                 params![cursor, i64::try_from(limit).unwrap_or(i64::MAX)],
@@ -190,6 +196,7 @@ impl Store {
             self.set_setting("extraction_version", &Self::EXTRACTION_VERSION.to_string())?;
             self.set_setting("reindex_cursor", "0")?;
             self.set_setting("reindex_target", &Self::EXTRACTION_VERSION.to_string())?;
+            self.set_setting("reindex_order", "desc")?;
             return Ok(ReindexProgress {
                 read: 0,
                 rewritten: 0,
