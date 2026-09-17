@@ -57,10 +57,38 @@ function prefixLines(text: string, prefix: string): string {
     .join('\n');
 }
 
+/** Joins blocks with a blank line between them, counting the blank ones.
+ *
+ * A paragraph break is one blank line: that is what marks a paragraph in plain
+ * text, where there is no margin to do it. An empty paragraph the author typed
+ * is one blank line *more*, so n of them read as n + 1.
+ *
+ * Joining with `\n\n` throughout does not give that. An empty block renders as
+ * an empty string with a separator on each side, so every one added two blank
+ * lines rather than one, and a single typed blank line arrived as three. The
+ * first version of this collapsed every run down to one blank instead, which
+ * lost the difference between none and three — and in Japanese, where the blank
+ * line is the paragraph mark rather than decoration, losing it changes what was
+ * written.
+ */
+function joinBlocks(parts: string[]): string {
+  let out = '';
+  let first = true;
+  for (const part of parts) {
+    if (part === '') {
+      out += '\n';
+      continue;
+    }
+    out += first ? part : `\n\n${part}`;
+    first = false;
+  }
+  return out;
+}
+
 function block(node: DocNode): string {
   switch (node.type) {
     case 'doc':
-      return (node.content ?? []).map(block).filter((s) => s !== null).join('\n\n');
+      return joinBlocks((node.content ?? []).map(block).filter((s) => s !== null));
 
     case 'paragraph':
       return inline(node.content);
@@ -72,7 +100,7 @@ function block(node: DocNode): string {
       return inline(node.content);
 
     case 'blockquote':
-      return prefixLines((node.content ?? []).map(block).join('\n\n'), '> ');
+      return prefixLines(joinBlocks((node.content ?? []).map(block)), '> ');
 
     case 'bulletList':
       return (node.content ?? []).map((li) => `- ${listItem(li)}`).join('\n');
@@ -122,7 +150,8 @@ function listItem(node: DocNode): string {
  * the end — an empty paragraph at the bottom of an editor is a thing people
  * leave behind constantly and it should not travel. A blank line in the middle
  * is different: in Japanese (and other CJK) it is how a paragraph is marked,
- * and folding those into one gap lost the break the author typed.
+ * and folding those into one gap lost the break the author typed. How many
+ * survive is [`joinBlocks`]'s business.
  */
 export function plainTextFromDoc(doc: DocNode | null | undefined): string {
   if (!doc) return '';

@@ -325,6 +325,19 @@ fn address_list(list: &[Recipient]) -> mail_builder::headers::address::Address<'
 /// the leftover at the bottom — and they do not travel. An empty paragraph
 /// in the middle is a blank line the author typed. TipTap serialises those
 /// as `<p></p>`, which most clients collapse, so they go out as `<p><br></p>`.
+///
+/// What it is allowed to assume, because this is not an HTML parser and should
+/// not be read as one: the input is balanced and its blocks are the editor's
+/// own. Every route here passes through one of two normalisers first — the
+/// composer serialises its document with `getHTML()`, and a quoted original is
+/// sanitised in petrel-mime before it is spliced in, which reparses and
+/// reserialises it. So tags are closed and paragraphs are not nested.
+///
+/// Deliberately outside its reach: a blank line written as `<div></div>`, which
+/// is how some clients mark one. Those only arrive inside a quoted original, the
+/// gap belongs to the person being quoted rather than to this author, and the
+/// ones that matter carry a `<br>` already. Reaching them would mean parsing
+/// arbitrary HTML here, and the sanitiser is where that work belongs.
 fn html_for_send(html: &str) -> String {
     fill_empty_paragraphs(&strip_edge_empty_paragraphs(html))
 }
@@ -348,9 +361,35 @@ fn open_p(html: &str, i: usize) -> Option<usize> {
     rest.find('>').map(|rel| i + rel + 1)
 }
 
+/// Where this paragraph's `</p>` starts, without allocating.
+///
+/// The first version lowercased the whole remainder of the document on every
+/// call, and the caller calls it once per paragraph — so the cost grew with the
+/// square of the body. Measured in release on a long quoted thread: 0.6ms at
+/// 500 paragraphs, 10ms at 2,000, 147ms at 8,000. All four characters are
+/// ASCII, so a byte scan cannot land inside a multi-byte character and the
+/// index it returns is a character boundary.
 fn close_p(html: &str, from: usize) -> Option<usize> {
-    let rest = html.get(from..)?;
-    rest.to_ascii_lowercase().find("</p>").map(|rel| from + rel)
+    let bytes = html.as_bytes();
+    if from > bytes.len() {
+        return None;
+    }
+    let mut i = from;
+    while i + 4 <= bytes.len() {
+        match bytes[i..].iter().position(|b| *b == b'<') {
+            Some(rel) => i += rel,
+            None => return None,
+        }
+        if i + 4 > bytes.len() {
+            return None;
+        }
+        if bytes[i + 1] == b'/' && bytes[i + 2].eq_ignore_ascii_case(&b'p') && bytes[i + 3] == b'>'
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn parse_p_at(html: &str, i: usize) -> Option<Paragraph> {
@@ -443,16 +482,23 @@ fn strip_edge_empty_paragraphs(html: &str) -> String {
     s
 }
 
+/// Gives a truly empty paragraph a `<br>` so clients keep the line.
+///
+/// Only a truly empty one. A paragraph that already holds breaks needs no help
+/// — it survives collapsing as it is — and rewriting it would throw some away:
+/// `<p><br><br></p>` is two breaks the author typed with shift and return, and
+/// the first version of this replaced the contents wholesale and sent one.
 fn fill_empty_paragraphs(html: &str) -> String {
     let mut out = String::with_capacity(html.len() + 16);
     let mut i = 0;
     while let Some(p) = next_p(html, i) {
         out.push_str(&html[i..p.start]);
         out.push_str(&html[p.start..p.inner_start]);
-        if p_content_is_empty(&html[p.inner_start..p.close]) {
+        let inner = &html[p.inner_start..p.close];
+        if inner.trim().is_empty() {
             out.push_str("<br>");
         } else {
-            out.push_str(&html[p.inner_start..p.close]);
+            out.push_str(inner);
         }
         out.push_str(&html[p.close..p.end]);
         i = p.end;
@@ -1439,6 +1485,49 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert_eq!(unsendable_recipients(&list), vec!["dan", "Dana Wu", "<>"]);
+    }
+
+    /// A paragraph of nothing but breaks is the author's blank line already, and
+    /// rewriting its contents sent fewer than were typed.
+    #[test]
+    fn html_for_send_keeps_every_break_a_paragraph_already_has() {
+        assert_eq!(
+            html_for_send("<p>One.</p><p><br><br></p><p>Two.</p>"),
+            "<p>One.</p><p><br><br></p><p>Two.</p>"
+        );
+        assert_eq!(
+            html_for_send("<p>One.<br><br>still one.</p>"),
+            "<p>One.<br><br>still one.</p>"
+        );
+    }
+
+    /// Cost grows with the body, not with its square.
+    ///
+    /// `close_p` used to lowercase the whole remainder of the document on every
+    /// call, once per paragraph. A long thread's quoted history reaches this
+    /// size, and the bound is loose enough for a debug build on a slow machine
+    /// while still being far under what the quadratic version needed.
+    #[test]
+    fn html_for_send_stays_linear_on_a_long_thread() {
+        let mut big = String::new();
+        for i in 0..8000 {
+            big.push_str(&format!(
+                "<p>line {i} with <a href=\"https://x.example\">a link</a></p>"
+            ));
+        }
+        let started = std::time::Instant::now();
+        let out = html_for_send(&big);
+        let took = started.elapsed();
+        assert_eq!(
+            out.len(),
+            big.len(),
+            "nothing to rewrite, so nothing changed"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "took {took:?} for {} bytes, which is the quadratic scan back",
+            big.len()
+        );
     }
 
     #[test]

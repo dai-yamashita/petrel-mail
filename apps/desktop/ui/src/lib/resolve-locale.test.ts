@@ -6,7 +6,7 @@
  * screen of wrong glyph forms, so the mapping is worth pinning.
  */
 import { describe, expect, it, afterEach, vi } from 'vitest';
-import { resolveLocale } from './settings';
+import { resolveLocale, usesSystemType } from './settings';
 
 const platform = (languages: string[]) => {
   vi.stubGlobal('navigator', { languages, language: languages[0] ?? 'en' });
@@ -81,5 +81,27 @@ describe('resolveLocale', () => {
       expect(resolveLocale(setting)).not.toBe('system');
       expect(resolveLocale(setting)).toMatch(/^[a-z]{2}(-[A-Za-z]+)?$/);
     }
+  });
+});
+
+describe('usesSystemType', () => {
+  it('is on for the locales the bundled faces cannot draw', () => {
+    // The two bundled faces are Latin and Latin-ext only, so a CJK interface
+    // was being set in two typefaces at once: ours for the ASCII, the system's
+    // for the letters beside it.
+    for (const locale of ['ja', 'ko', 'zh-Hans', 'zh-Hant', 'zh-CN']) {
+      expect(usesSystemType(locale)).toBe(true);
+    }
+  });
+
+  it('is off where the bundled faces have every letter', () => {
+    for (const locale of ['en', 'de', 'es', 'fr', 'pt-BR', 'en-GB']) {
+      expect(usesSystemType(locale)).toBe(false);
+    }
+  });
+
+  it('answers on the language, not the region', () => {
+    expect(usesSystemType('JA')).toBe(true);
+    expect(usesSystemType('ja-JP')).toBe(true);
   });
 });

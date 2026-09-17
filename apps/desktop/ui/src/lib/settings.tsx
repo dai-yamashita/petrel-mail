@@ -181,6 +181,15 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     // this and the real engine has to be asked.) VoiceOver reads from it too:
     // a Japanese interface was being spoken in an English voice.
     root.lang = resolved;
+    // Our faces, or the platform's. Set as inline style on the same element the
+    // tokens are declared on, so it wins without a second rule to keep in step.
+    if (usesSystemType(resolved)) {
+      root.style.setProperty('--body', SYSTEM_TYPE);
+      root.style.setProperty('--display', SYSTEM_TYPE);
+    } else {
+      root.style.removeProperty('--body');
+      root.style.removeProperty('--display');
+    }
     root.style.setProperty('--accent-user', settings.accent);
     root.style.setProperty('--reading-size', `${settings.readingTextSize}px`);
     // The rail's width is a token so the three-pane grid picks it up without
@@ -292,6 +301,29 @@ function candidates(tag: string): string[] {
   }
   for (let i = parts.length; i > 0; i -= 1) out.push(parts.slice(0, i).join('-'));
   return out;
+}
+
+/** The stack the platform draws its own interface with. */
+const SYSTEM_TYPE = '-apple-system, BlinkMacSystemFont, system-ui, sans-serif';
+
+/** Whether the interface should be set in the platform's font rather than ours.
+ *
+ *  The two bundled faces cover Latin and Latin-ext only — that is what keeps
+ *  them to 205KB and lets them ship offline — so a Japanese, Korean or Chinese
+ *  interface draws its letters from the system stack whatever we do. What it
+ *  used to do was draw them from *both*: Public Sans for the ASCII in a string
+ *  and a system face for the CJK beside it, two typefaces of different weight
+ *  and x-height on the same line. That is the unevenness issue 37 reported,
+ *  though not the cause it proposed — the leading measured identical.
+ *
+ *  So for those locales the whole interface uses the platform's font, which is
+ *  one typeface throughout and the one the rest of the machine is set in. The
+ *  reading pane has always been on this stack, so the chrome now agrees with
+ *  the message rather than differing from it. Latin locales keep the bundled
+ *  faces, and nothing is downloaded either way. */
+export function usesSystemType(locale: string): boolean {
+  const base = locale.split('-')[0].toLowerCase();
+  return base === 'ja' || base === 'ko' || base === 'zh';
 }
 
 export function resolveLocale(setting: string): string {

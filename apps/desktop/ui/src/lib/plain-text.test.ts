@@ -61,12 +61,28 @@ describe('plainTextFromDoc', () => {
   });
 
   /* A blank line between sentences is a paragraph mark in CJK, not leftover
-     chrome. Collapsing three-or-more newlines used to fold it away. */
-  it('keeps a blank paragraph between sentences', () => {
-    expect(plainTextFromDoc(doc(p(t('One.')), p(), p(t('Two.'))))).toBe('One.\n\n\n\nTwo.');
-    expect(plainTextFromDoc(doc(p(t('One.')), p(), p(), p(t('Two.'))))).toBe(
-      'One.\n\n\n\n\n\nTwo.',
+     chrome. Collapsing three-or-more newlines used to fold every run down to
+     one blank, so none, one and three typed blank lines all read the same.
+
+     Counted, not merely preserved: a paragraph break is one blank line because
+     plain text has no margin to mark it with, and each empty paragraph the
+     author typed is one more. Simply dropping the collapse doubled them — a
+     single typed blank line arrived as three. */
+  it('keeps a blank paragraph between sentences, one line per paragraph', () => {
+    const blanks = (out: string) => out.split('\n').filter((l) => l === '').length;
+    expect(blanks(plainTextFromDoc(doc(p(t('One.')), p(t('Two.')))))).toBe(1);
+    expect(blanks(plainTextFromDoc(doc(p(t('One.')), p(), p(t('Two.')))))).toBe(2);
+    expect(blanks(plainTextFromDoc(doc(p(t('One.')), p(), p(), p(t('Two.')))))).toBe(3);
+    expect(blanks(plainTextFromDoc(doc(p(t('One.')), p(), p(), p(), p(t('Two.')))))).toBe(4);
+    expect(plainTextFromDoc(doc(p(t('One.')), p(), p(t('Two.'))))).toBe('One.\n\n\nTwo.');
+  });
+
+  /* The gap inside a quote is the original author's too. */
+  it('counts blank lines inside a quote as well', () => {
+    const quoted = plainTextFromDoc(
+      doc({ type: 'blockquote', content: [p(t('One.')), p(), p(t('Two.'))] }),
     );
+    expect(quoted).toBe('> One.\n>\n>\n> Two.');
   });
 
   it('survives a node it has never seen without losing the words', () => {
