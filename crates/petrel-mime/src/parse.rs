@@ -442,6 +442,102 @@ fn id_list(value: &HeaderValue<'_>) -> Vec<String> {
     }
 }
 
+/// The body, decoded ourselves when its charset is one the Encoding Standard
+/// refuses.
+///
+/// mail-parser reads the charset off the part and hands the bytes to the same
+/// decoder that answers those four with a single U+FFFD, so a Korean message
+/// arrives as one replacement character and nothing else. When the part says
+/// one of them, its transfer-decoded bytes are taken straight from the part and
+/// put through our own machine instead. Every other charset is left exactly
+/// where it was: this is a narrow exception, not a second body pipeline.
+fn body_of(msg: &mail_parser::Message<'_>, parsed: &[u8], html: bool) -> Option<String> {
+    let part = if html {
+        msg.html_bodies().next()
+    } else {
+        msg.text_bodies().next()
+    };
+    if let Some(part) = part
+        && let Some(charset) = part.content_type().and_then(|ct| ct.attribute("charset"))
+        && crate::legacy_cjk::is_replacement_charset(charset)
+    {
+        // Not `part.contents()`. mail-parser has already put those bytes
+        // through the decoder that answers this charset with one U+FFFD, so by
+        // here the message is gone. The part says where it sits and how it was
+        // transferred, which is enough to go back to what actually arrived.
+        let (from, to) = (part.offset_body as usize, part.offset_end as usize);
+        if let Some(slice) = parsed.get(from..to.min(parsed.len()))
+            && let Some(text) =
+                crate::legacy_cjk::decode(charset, &undo_transfer(part.encoding, slice))
+        {
+            return Some(text);
+        }
+    }
+    if html {
+        msg.body_html(0).map(|c| c.to_string())
+    } else {
+        msg.body_text(0).map(|c| c.to_string())
+    }
+}
+
+/// Undoes the transfer encoding, which is the only thing between the wire and
+/// the charset. Ordinarily mail-parser does this and we never see it; it is
+/// needed here because the charset decode has to be ours and the two happen
+/// together. Anything that will not decode is passed through rather than
+/// dropped — a body that arrives slightly wrong beats one that does not arrive.
+fn undo_transfer(encoding: mail_parser::Encoding, bytes: &[u8]) -> Vec<u8> {
+    use base64::Engine as _;
+
+    match encoding {
+        mail_parser::Encoding::Base64 => {
+            let tight: Vec<u8> = bytes
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(&tight)
+                .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&tight))
+                .unwrap_or_else(|_| bytes.to_vec())
+        }
+        mail_parser::Encoding::QuotedPrintable => {
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut i = 0;
+            let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+            while i < bytes.len() {
+                if bytes[i] != b'=' {
+                    out.push(bytes[i]);
+                    i += 1;
+                    continue;
+                }
+                match (bytes.get(i + 1).copied(), bytes.get(i + 2).copied()) {
+                    // A soft line break carries nothing.
+                    (Some(b'\r'), Some(b'\n')) => i += 3,
+                    (Some(b'\n'), _) => i += 2,
+                    (Some(hi), Some(lo)) => match (hex(hi), hex(lo)) {
+                        (Some(hi), Some(lo)) => {
+                            out.push((hi << 4) | lo);
+                            i += 3;
+                        }
+                        // Not an escape after all: an equals sign is an
+                        // equals sign.
+                        _ => {
+                            out.push(b'=');
+                            i += 1;
+                        }
+                    },
+                    _ => {
+                        out.push(b'=');
+                        i += 1;
+                    }
+                }
+            }
+            out
+        }
+        mail_parser::Encoding::None => bytes.to_vec(),
+    }
+}
+
 /// Parses raw RFC822. Returns `None` only when the bytes yield no message at
 /// all; malformed-but-present mail parses with whatever could be salvaged.
 pub fn parse_message(raw: &[u8]) -> Option<ParsedMessage> {
@@ -491,8 +587,8 @@ pub fn parse_message(raw: &[u8]) -> Option<ParsedMessage> {
         cc: addr_lists(msg.all_cc()),
         reply_to: addr_list(msg.reply_to()),
         date_ms: msg.date().map(|d| d.to_timestamp() * 1000),
-        body_text: msg.body_text(0).map(|c| c.to_string()).unwrap_or_default(),
-        body_html: msg.body_html(0).map(|c| c.to_string()),
+        body_text: body_of(&msg, parsed, false).unwrap_or_default(),
+        body_html: body_of(&msg, parsed, true),
         attachments,
         list_id: msg.header_raw("List-Id").map(|v| {
             let v = v.trim();
@@ -999,5 +1095,139 @@ Content-Type: text/plain\r\n\r\nMerged.\r\n"
             parse_message(&raw("Reply-To: <reply+abc@reply.github.example>\r\n")).expect("parses");
         let roles: Vec<&str> = m.addresses().iter().map(|(r, _, _)| *r).collect();
         assert!(!roles.contains(&"reply-to"), "roles were {roles:?}");
+    }
+}
+
+/// The four charsets the Encoding Standard answers with a single U+FFFD.
+///
+/// Not a theoretical gap: ISO-2022-KR was the registered charset for Korean
+/// mail for years, so it is what an old archive is written in. Before this, the
+/// subject and the body of such a message both arrived as one replacement
+/// character — not garbled, gone.
+#[cfg(test)]
+mod replacement_charsets {
+    use super::*;
+
+    #[test]
+    fn a_korean_subject_and_body_both_read() {
+        let raw = b"From: a@example.com\r\n\
+Subject: =?ISO-2022-KR?B?G yRCKUM=?=\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=ISO-2022-KR\r\n\
+Content-Transfer-Encoding: 8bit\r\n\r\n\
+\x1b$)CHello \x0eGQ1[\x0f!\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert!(
+            m.body_text.contains("한글"),
+            "the body was lost: {:?}",
+            m.body_text
+        );
+        assert!(
+            !m.body_text.trim().starts_with('\u{FFFD}'),
+            "the body is still a replacement character: {:?}",
+            m.body_text
+        );
+    }
+
+    #[test]
+    fn a_korean_encoded_word_subject_reads() {
+        // "한글" as ISO-2022-KR inside one encoded-word.
+        let raw = b"From: a@example.com\r\n\
+Subject: =?ISO-2022-KR?B?DkdRMVsP?=\r\n\
+MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nx\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("한글"));
+    }
+
+    #[test]
+    fn an_hz_body_reads() {
+        let raw = b"From: a@example.com\r\nSubject: hz\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=HZ-GB-2312\r\n\
+Content-Transfer-Encoding: 7bit\r\n\r\n\
+Hi ~{VPND~}!\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert!(m.body_text.contains("中文"), "body was {:?}", m.body_text);
+    }
+
+    /// The charsets that were already fine must not have moved.
+    #[test]
+    fn the_working_charsets_are_untouched() {
+        let raw = b"From: a@example.com\r\nSubject: =?EUC-KR?B?x9Gx2w==?=\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=EUC-KR\r\n\
+Content-Transfer-Encoding: 8bit\r\n\r\n\xc7\xd1\xb1\xdb\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("한글"));
+        assert!(m.body_text.contains("한글"), "body was {:?}", m.body_text);
+    }
+}
+
+#[cfg(test)]
+mod replacement_charset_transfers {
+    use super::*;
+    use base64::Engine as _;
+
+    fn message(transfer: &str, body: &[u8]) -> Vec<u8> {
+        let mut raw = format!(
+            "From: a@example.com\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=ISO-2022-KR\r\n\
+Content-Transfer-Encoding: {transfer}\r\n\r\n"
+        )
+        .into_bytes();
+        raw.extend_from_slice(body);
+        raw.extend_from_slice(b"\r\n");
+        raw
+    }
+
+    /// The charset decode is ours, so undoing the transfer has to be too.
+    #[test]
+    fn it_reads_through_every_transfer_encoding() {
+        let korean: &[u8] = b"\x1b$)C\x0eGQ1[\x0f";
+        let plain = message("8bit", korean);
+        assert!(parse_message(&plain).unwrap().body_text.contains("한글"));
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(korean);
+        let encoded = message("base64", b64.as_bytes());
+        assert!(
+            parse_message(&encoded).unwrap().body_text.contains("한글"),
+            "base64 body was {:?}",
+            parse_message(&encoded).unwrap().body_text
+        );
+
+        // Quoted-printable, with a soft break in the middle of the run.
+        let qp = message("quoted-printable", b"=1B$)C=0EGQ=\r\n1[=0F");
+        assert!(
+            parse_message(&qp).unwrap().body_text.contains("한글"),
+            "quoted-printable body was {:?}",
+            parse_message(&qp).unwrap().body_text
+        );
+    }
+
+    /// One part of a multipart message, not the whole thing.
+    #[test]
+    fn it_finds_the_part_inside_a_multipart() {
+        let raw = b"From: a@example.com\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain; charset=ISO-2022-KR\r\n\r\n\
+\x1b$)C\x0eGQ1[\x0f\r\n\
+--b\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n\
+<p>plain ascii</p>\r\n--b--\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert!(m.body_text.contains("한글"), "text was {:?}", m.body_text);
+        // The other part was never ours and must be untouched.
+        assert!(
+            m.body_html.as_deref().unwrap_or("").contains("plain ascii"),
+            "html was {:?}",
+            m.body_html
+        );
+    }
+
+    /// A message that says one of these and then carries nothing is still a
+    /// message; it must not come back as a parse failure.
+    #[test]
+    fn an_empty_body_is_still_a_message() {
+        let m = parse_message(&message("8bit", b"")).expect("parses");
+        assert!(m.body_text.trim().is_empty(), "body was {:?}", m.body_text);
     }
 }

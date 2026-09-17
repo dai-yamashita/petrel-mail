@@ -1679,12 +1679,14 @@ impl Store {
     /// extraction reaches only new mail — everything already held keeps
     /// whatever the old code produced. This is the version that says otherwise.
     ///
-    /// 8: self-contained ISO-2022-JP encoded-words were concatenated, and
-    /// encoding_rs inserted U+FFFD at every `ESC ( B ESC $ B` join. Version 7
-    /// asked every row again because version 6 had skipped subjects with no
-    /// replacement character (a fold inside a JIS run decodes to bare ASCII).
-    /// A row the extractor now agrees with is still not written.
-    pub const EXTRACTION_VERSION: i64 = 8;
+    /// 9: ISO-2022-KR, ISO-2022-CN and HZ-GB-2312 decode to text rather than
+    /// to the single U+FFFD the Encoding Standard answers them with, so mail
+    /// held in them has a subject and a body again instead of one replacement
+    /// character. 8 was the ISO-2022-JP join: self-contained encoded-words were
+    /// concatenated and encoding_rs inserted U+FFFD at every `ESC ( B ESC $ B`.
+    /// A row the extractor now agrees with is still not written, so a store
+    /// with none of this costs the read and no database pages.
+    pub const EXTRACTION_VERSION: i64 = 9;
 
     /// The blob backing a message, for the reading pane to fetch and render.
     /// Who sent a message and when — the two facts an attribution line needs.

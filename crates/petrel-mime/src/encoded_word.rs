@@ -248,6 +248,28 @@ fn merge_stateless_run(words: &[ParsedWord]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Decodes a run whose charset the Encoding Standard refuses, and writes the
+/// text back as one UTF-8 word.
+///
+/// Each word is decoded on its own and the results joined. These encodings
+/// announce their state per field in practice, and a word that carries its own
+/// shift is complete; concatenating payloads first would be the ISO-2022-JP
+/// mistake in another alphabet.
+fn replacement_charset_run(words: &[ParsedWord]) -> Option<Vec<u8>> {
+    let first = words.first()?;
+    let label = std::str::from_utf8(first.charset).ok()?;
+    if !crate::legacy_cjk::is_replacement_charset(label) {
+        return None;
+    }
+    let mut text = String::new();
+    for w in words {
+        let payload = decode_word_payload(w.encoding, w.payload)?;
+        let label = std::str::from_utf8(w.charset).ok()?;
+        text.push_str(&crate::legacy_cjk::decode(label, &payload)?);
+    }
+    Some(utf8_encoded_word(&text))
+}
+
 fn merge_run(words: &[ParsedWord]) -> Option<Vec<u8>> {
     if words.is_empty() {
         return None;
@@ -283,6 +305,17 @@ fn rewrite_header_block(headers: &[u8]) -> Cow<'_, [u8]> {
 
             let span_start = run[0].start;
             let span_end = run[run.len() - 1].end;
+            // A charset the Encoding Standard answers with a single U+FFFD.
+            // Decoded here and written back as UTF-8, because mail-parser is
+            // about to hand these bytes to that same refusal. One word is
+            // enough — unlike a split run, there is nothing to merge, the
+            // whole field is simply lost without this.
+            if let Some(rewritten) = replacement_charset_run(&run) {
+                let buf = out.get_or_insert_with(|| headers[..span_start].to_vec());
+                buf.extend_from_slice(&rewritten);
+                pos = span_end;
+                continue;
+            }
             if run.len() >= 2
                 && let Some(merged) = merge_run(&run)
             {

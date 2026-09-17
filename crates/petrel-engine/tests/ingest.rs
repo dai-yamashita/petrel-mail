@@ -818,3 +818,51 @@ Content-Type: text/plain; charset=utf-8\r\n\r\nthe rutabaga numbers are in\r\n";
         "re-extracted text never reached the search index"
     );
 }
+
+/// Korean mail held from before the decoder existed.
+///
+/// ISO-2022-KR was the registered charset for Korean mail for years, and the
+/// Encoding Standard answers it with a single U+FFFD — so both the subject and
+/// the body of an archived message were not garbled but gone. Re-extraction is
+/// what reaches mail already held.
+#[test]
+fn reindex_repairs_a_korean_message_that_had_no_decoder() {
+    let (_dir, mut store, blobs, account) = setup();
+    let raw = b"From: a@example.jp\r\nTo: me@example.com\r\n\
+Subject: =?ISO-2022-KR?B?DkdRMVsP?=\r\n\
+Date: Tue, 18 Aug 2026 14:02:00 +0000\r\n\
+Message-ID: <kr@example.com>\r\nMIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=ISO-2022-KR\r\n\
+Content-Transfer-Encoding: 8bit\r\n\r\n\
+\x1b$)C\x0eGQ1[\x0f\r\n";
+    let out = store
+        .ingest_raw(&blobs, account, None, Some(1), raw)
+        .expect("ingest");
+
+    // What was stored before there was anything to decode it with.
+    store
+        .overwrite_extracted(
+            out.message_id,
+            "\u{FFFD}",
+            "\u{FFFD}",
+            "\u{FFFD}",
+            "\u{FFFD}",
+        )
+        .expect("plant the old extraction");
+    store
+        .set_setting("extraction_version", "8")
+        .expect("roll back");
+
+    assert_eq!(store.reindex_bodies(&blobs).expect("reindex"), 1);
+
+    let rows = store.list_recent(0, 10).expect("list");
+    let row = rows.iter().find(|r| r.id == out.message_id).expect("row");
+    assert_eq!(row.subject, "한글");
+    assert!(!row.subject.contains('\u{FFFD}'));
+    let hits = store.search("한글", 10).expect("search");
+    assert!(
+        hits.iter().any(|h| h.message_id == out.message_id),
+        "the repaired subject must be searchable"
+    );
+    store.fts_integrity_check().expect("index consistent");
+}
