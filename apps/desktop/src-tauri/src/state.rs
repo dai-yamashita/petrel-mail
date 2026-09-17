@@ -73,6 +73,16 @@ pub(crate) struct AppState {
     /// One drain at a time. Two overlapping passes would both read the same
     /// queued rows and deliver each change twice.
     pub(crate) draining: AtomicBool,
+    /// Held while a re-extraction walks the store.
+    ///
+    /// One walk, however many accounts are signed in. Which extraction a
+    /// message was indexed by is a property of the store, not of an account,
+    /// and the pass is driven by a single cursor — so a second walker does not
+    /// repeat the first one's rows, it interleaves with them. Both would then
+    /// reach the end, bump the generation, and checkpoint, for twice the lock
+    /// pressure and two list reloads. The first account to get there does the
+    /// work and the others leave it alone.
+    pub(crate) reindexing: AtomicBool,
     /// Drafts edited since their last push to the server, for the 30-second
     /// debounce. A draft in here has exactly one push task sleeping on it.
     pub(crate) draft_dirty: Mutex<std::collections::HashSet<i64>>,
@@ -561,6 +571,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Arc<AppState> {
         caps: Mutex::new(std::collections::HashMap::new()),
         outbox: Mutex::new(Vec::new()),
         draining: AtomicBool::new(false),
+        reindexing: AtomicBool::new(false),
         draft_dirty: Mutex::new(std::collections::HashSet::new()),
         folder_sync_inflight: Mutex::new(HashSet::new()),
         folder_synced_at: Mutex::new(HashMap::new()),

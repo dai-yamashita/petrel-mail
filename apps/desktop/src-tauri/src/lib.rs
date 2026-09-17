@@ -372,6 +372,7 @@ pub fn run() {
         caps: Mutex::new(std::collections::HashMap::new()),
         outbox: Mutex::new(Vec::new()),
         draining: AtomicBool::new(false),
+        reindexing: AtomicBool::new(false),
         draft_dirty: Mutex::new(std::collections::HashSet::new()),
         folder_sync_inflight: Mutex::new(std::collections::HashSet::new()),
         folder_synced_at: Mutex::new(std::collections::HashMap::new()),

@@ -194,7 +194,13 @@ impl Store {
             // longest the lock was ever held, and it was rebuilding an index
             // that was already correct.
             self.set_setting("extraction_version", &Self::EXTRACTION_VERSION.to_string())?;
-            self.set_setting("reindex_cursor", "0")?;
+            // The top, not zero. The walk goes downwards now, so zero is the
+            // floor and means "nothing left below" — which is true at the end
+            // of a pass but reads as a bug, and would be one the moment
+            // anything resumed from it without resetting first. The version
+            // change is what actually starts the next pass over, and it sets
+            // this too; writing the same thing here keeps the two agreeing.
+            self.set_setting("reindex_cursor", &i64::MAX.to_string())?;
             self.set_setting("reindex_target", &Self::EXTRACTION_VERSION.to_string())?;
             self.set_setting("reindex_order", "desc")?;
             return Ok(ReindexProgress {
