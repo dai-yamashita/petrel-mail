@@ -23,15 +23,16 @@
 //! the ASCII and GB2312 parts of the same message still read. Losing part of a
 //! message beats losing all of it.
 //!
+//! Which charsets reach here at all, and what happens to a name nobody can
+//! place, is [`crate::charset`]'s decision rather than this module's.
+//!
 //! Every byte is hostile input. The machines below index only through `get`
 //! and slice patterns, advance on every branch, and allocate in proportion to
 //! the input — there is no path that can panic or fail to terminate.
 
 /// Whether this is a charset the Encoding Standard answers with U+FFFD.
 pub fn is_replacement_charset(label: &str) -> bool {
-    let label = label.trim().trim_matches('"');
-    // The language tag RFC 2231 allows on a charset is not part of the name.
-    let label = label.split('*').next().unwrap_or(label);
+    let label = crate::charset::name(label);
     [
         "iso-2022-kr",
         "iso2022-kr",
@@ -54,8 +55,7 @@ pub fn decode(label: &str, bytes: &[u8]) -> Option<String> {
     if !is_replacement_charset(label) {
         return None;
     }
-    let label = label.trim().trim_matches('"');
-    let label = label.split('*').next().unwrap_or(label);
+    let label = crate::charset::name(label);
     if label.eq_ignore_ascii_case("hz-gb-2312")
         || label.eq_ignore_ascii_case("hz-gb2312")
         || label.eq_ignore_ascii_case("hz")

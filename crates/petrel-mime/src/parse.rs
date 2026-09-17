@@ -442,15 +442,17 @@ fn id_list(value: &HeaderValue<'_>) -> Vec<String> {
     }
 }
 
-/// The body, decoded ourselves when its charset is one the Encoding Standard
-/// refuses.
+/// The body, decoded ourselves when its charset is one the parser gets wrong.
 ///
-/// mail-parser reads the charset off the part and hands the bytes to the same
-/// decoder that answers those four with a single U+FFFD, so a Korean message
-/// arrives as one replacement character and nothing else. When the part says
-/// one of them, its transfer-decoded bytes are taken straight from the part and
-/// put through our own machine instead. Every other charset is left exactly
-/// where it was: this is a narrow exception, not a second body pipeline.
+/// mail-parser reads the charset off the part and hands the bytes to a decoder
+/// that fails it in one of two ways. A refused charset answers with a single
+/// U+FFFD, so a Korean message arrives as one replacement character and
+/// nothing else. A charset whose name it cannot resolve is read as UTF-8
+/// instead, so a Japanese message from a Windows mailer arrives as a row of
+/// replacement characters. In both cases the part's transfer-decoded bytes are
+/// taken straight from the part and put through our own decoder. Every charset
+/// the parser handles correctly is left exactly where it was: this is a narrow
+/// exception, not a second body pipeline.
 fn body_of(msg: &mail_parser::Message<'_>, parsed: &[u8], html: bool) -> Option<String> {
     let part = if html {
         msg.html_bodies().next()
@@ -459,16 +461,16 @@ fn body_of(msg: &mail_parser::Message<'_>, parsed: &[u8], html: bool) -> Option<
     };
     if let Some(part) = part
         && let Some(charset) = part.content_type().and_then(|ct| ct.attribute("charset"))
-        && crate::legacy_cjk::is_replacement_charset(charset)
+        && crate::charset::decodes_here(charset)
     {
-        // Not `part.contents()`. mail-parser has already put those bytes
-        // through the decoder that answers this charset with one U+FFFD, so by
-        // here the message is gone. The part says where it sits and how it was
+        // Not `part.contents()`. mail-parser has already spent those bytes on
+        // the decoder that gets this charset wrong, so by here the message is
+        // gone or garbled. The part says where it sits and how it was
         // transferred, which is enough to go back to what actually arrived.
         let (from, to) = (part.offset_body as usize, part.offset_end as usize);
         if let Some(slice) = parsed.get(from..to.min(parsed.len()))
             && let Some(text) =
-                crate::legacy_cjk::decode(charset, &undo_transfer(part.encoding, slice))
+                crate::charset::decode(charset, &undo_transfer(part.encoding, slice))
         {
             return Some(text);
         }
@@ -1160,6 +1162,218 @@ Content-Transfer-Encoding: 8bit\r\n\r\n\xc7\xd1\xb1\xdb\r\n";
         let m = parse_message(raw).expect("parses");
         assert_eq!(m.subject.as_deref(), Some("한글"));
         assert!(m.body_text.contains("한글"), "body was {:?}", m.body_text);
+    }
+}
+
+/// The other way a charset fails: not refused, but unrecognised. `encoding_rs`
+/// resolves labels from a fixed list, and the vendor spellings Windows mailers
+/// send are not on it. An unresolvable label falls back to reading the bytes as
+/// UTF-8, so these messages were garbled rather than erased — a row of
+/// replacement characters where Japanese, Korean or Chinese text should be.
+#[cfg(test)]
+mod vendor_charset_names {
+    use super::*;
+
+    #[test]
+    fn a_cp932_subject_and_body_both_read() {
+        let raw = b"From: a@example.com\r\n\
+Subject: =?CP932?B?grGC6g==?=\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=CP932\r\n\
+Content-Transfer-Encoding: 8bit\r\n\r\n\
+\x82\xb1\x82\xea\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("これ"));
+        assert!(m.body_text.contains("これ"), "body was {:?}", m.body_text);
+        assert!(
+            !m.body_text.contains('\u{FFFD}'),
+            "body still garbled: {:?}",
+            m.body_text
+        );
+    }
+
+    #[test]
+    fn the_korean_and_chinese_vendor_names_read_too() {
+        for (label, b64, bytes, want) in [
+            ("CP949", "x9Gx2w==", &b"\xc7\xd1\xb1\xdb"[..], "한글"),
+            ("UHC", "x9Gx2w==", &b"\xc7\xd1\xb1\xdb"[..], "한글"),
+            ("CP936", "1tDOxA==", &b"\xd6\xd0\xce\xc4"[..], "中文"),
+            ("CP950", "pKSk5Q==", &b"\xa4\xa4\xa4\xe5"[..], "中文"),
+            ("windows-950", "pKSk5Q==", &b"\xa4\xa4\xa4\xe5"[..], "中文"),
+        ] {
+            let mut raw = Vec::new();
+            raw.extend_from_slice(b"From: a@example.com\r\n");
+            raw.extend_from_slice(format!("Subject: =?{label}?B?{b64}?=\r\n").as_bytes());
+            raw.extend_from_slice(b"MIME-Version: 1.0\r\n");
+            raw.extend_from_slice(
+                format!("Content-Type: text/plain; charset={label}\r\n").as_bytes(),
+            );
+            raw.extend_from_slice(b"Content-Transfer-Encoding: 8bit\r\n\r\n");
+            raw.extend_from_slice(bytes);
+            raw.extend_from_slice(b"\r\n");
+            let m = parse_message(&raw).expect("parses");
+            assert_eq!(m.subject.as_deref(), Some(want), "{label} subject");
+            assert!(
+                m.body_text.contains(want),
+                "{label} body was {:?}",
+                m.body_text
+            );
+        }
+    }
+
+    /// A lone encoded-word is normally left alone, because there is nothing to
+    /// rejoin. That is exactly the case this used to miss: nothing to merge,
+    /// but still a name the parser cannot resolve.
+    #[test]
+    fn a_single_encoded_word_is_enough_to_need_rescuing() {
+        let raw = b"From: a@example.com\r\nSubject: =?CP932?B?grGC6g==?=\r\n\
+MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nx\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("これ"));
+    }
+
+    /// An ISO-2022-JP extension names sets we have no table for, but its
+    /// common case is the base one. Before this a lone word in it showed the
+    /// reader raw escape sequences.
+    #[test]
+    fn an_iso_2022_jp_extension_reads_its_base_repertoire() {
+        let raw = b"From: a@example.com\r\nSubject: =?ISO-2022-JP-2?B?GyRCJDMkbBsoQg==?=\r\n\
+MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nx\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("これ"));
+    }
+
+    /// The reason the run is rejoined before it is decoded rather than after.
+    /// Here the encoder split これ down the middle, so the second byte of the
+    /// first character is in one word and its partner is in the next.
+    #[test]
+    fn a_character_split_across_two_words_survives() {
+        let raw = b"From: a@example.com\r\n\
+Subject: =?CP932?B?grGC?= =?CP932?B?6g==?=\r\n\
+MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nx\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("これ"));
+    }
+
+    /// The names that already resolved must decode exactly as before.
+    #[test]
+    fn the_names_the_parser_knows_are_untouched() {
+        let raw = b"From: a@example.com\r\nSubject: =?Shift_JIS?B?grGC6g==?=\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=Shift_JIS\r\n\
+Content-Transfer-Encoding: 8bit\r\n\r\n\x82\xb1\x82\xea\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("これ"));
+        assert!(m.body_text.contains("これ"), "body was {:?}", m.body_text);
+    }
+
+    /// Plain UTF-8 under an unknown label still reads, because reading it as
+    /// UTF-8 was the fallback all along. Nothing here may break that.
+    #[test]
+    fn utf8_under_a_name_we_cannot_map_is_still_read_as_utf8() {
+        let raw = "From: a@example.com\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=x-nonsense-9\r\n\r\nこれ\r\n";
+        let m = parse_message(raw.as_bytes()).expect("parses");
+        assert!(m.body_text.contains("これ"), "body was {:?}", m.body_text);
+    }
+}
+
+/// The names nobody can place, where the old answer was to read the bytes as
+/// UTF-8 and replace whatever would not decode. That threw the message away
+/// twice over: the reader saw nothing and the index kept nothing.
+#[cfg(test)]
+mod unplaceable_charsets {
+    use super::*;
+
+    fn message(charset: &str, body: &[u8]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"From: a@example.com\r\nSubject: t\r\nMIME-Version: 1.0\r\n");
+        raw.extend_from_slice(
+            format!("Content-Type: text/plain; charset={charset}\r\n").as_bytes(),
+        );
+        raw.extend_from_slice(b"Content-Transfer-Encoding: 8bit\r\n\r\n");
+        raw.extend_from_slice(body);
+        raw.extend_from_slice(b"\r\n");
+        raw
+    }
+
+    /// `unknown-8bit` is RFC 1428's way of saying the sender does not know
+    /// either. Western text is much the likeliest thing behind it.
+    #[test]
+    fn latin1_under_an_unknown_label_reads_correctly() {
+        let m = parse_message(&message("unknown-8bit", b"caf\xe9 na\xefve")).expect("parses");
+        assert!(
+            m.body_text.contains("café naïve"),
+            "body was {:?}",
+            m.body_text
+        );
+        assert!(!m.body_text.contains('\u{FFFD}'), "body was replaced");
+    }
+
+    #[test]
+    fn utf8_under_an_unknown_label_is_still_utf8() {
+        let m = parse_message(&message("x-nonsense-9", "日本語".as_bytes())).expect("parses");
+        assert!(m.body_text.contains("日本語"), "body was {:?}", m.body_text);
+    }
+
+    /// Not readable, but not destroyed either: the bytes survive into the
+    /// index and View Source, which U+FFFD does not allow.
+    #[test]
+    fn a_charset_with_no_table_here_is_preserved_rather_than_replaced() {
+        let m = parse_message(&message("euc-tw", b"\xa4\xa4\xa4\xe5")).expect("parses");
+        assert!(
+            !m.body_text.contains('\u{FFFD}'),
+            "bytes destroyed: {:?}",
+            m.body_text
+        );
+    }
+
+    #[test]
+    fn utf7_reads_in_the_body_and_the_subject() {
+        let raw = b"From: a@example.com\r\nSubject: =?UTF-7?Q?+ZeVnLIqe-?=\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=UTF-7\r\n\
+Content-Transfer-Encoding: 7bit\r\n\r\n\
+Hi Mom -+Jjo--!\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.subject.as_deref(), Some("日本語"));
+        assert!(
+            m.body_text.contains("Hi Mom -\u{263A}-!"),
+            "body was {:?}",
+            m.body_text
+        );
+    }
+
+    /// A body that really was UTF-8 and lost a byte must keep the rest of its
+    /// text rather than be thrown wholesale at windows-1252.
+    #[test]
+    fn a_clipped_utf8_body_keeps_the_text_around_the_damage() {
+        let mut body = "Ready for review, and the rest reads fine. "
+            .as_bytes()
+            .to_vec();
+        body.extend_from_slice(b"\xe2\x80");
+        body.extend_from_slice(b" Ask Ren\xc3\xa9e about the rollout schedule.");
+        let m = parse_message(&message("unknown-8bit", &body)).expect("parses");
+        assert!(
+            m.body_text.contains("Ready for review"),
+            "{:?}",
+            m.body_text
+        );
+        assert!(m.body_text.contains("Renée"), "mangled: {:?}", m.body_text);
+        assert!(
+            !m.body_text.contains("â€"),
+            "fell to 1252: {:?}",
+            m.body_text
+        );
+    }
+
+    /// Nothing above may reach a charset the parser handles perfectly well.
+    #[test]
+    fn the_names_the_parser_knows_are_untouched() {
+        let m = parse_message(&message("iso-8859-1", b"caf\xe9")).expect("parses");
+        assert!(m.body_text.contains("café"), "body was {:?}", m.body_text);
+        let u = parse_message(&message("utf-8", "日本語".as_bytes())).expect("parses");
+        assert!(u.body_text.contains("日本語"), "body was {:?}", u.body_text);
     }
 }
 

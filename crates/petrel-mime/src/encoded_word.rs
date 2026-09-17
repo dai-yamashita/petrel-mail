@@ -36,6 +36,14 @@ fn charset_eq(a: &[u8], b: &[u8]) -> bool {
     charset_token(a).eq_ignore_ascii_case(charset_token(b))
 }
 
+/// Whether the parser would fail to place this charset and read the bytes as
+/// UTF-8 whatever they are.
+fn charset_needs_mapping(charset: &[u8]) -> bool {
+    std::str::from_utf8(charset_token(charset))
+        .ok()
+        .is_some_and(|label| !crate::charset::resolvable(label))
+}
+
 fn is_iso2022_jp_family(charset: &[u8]) -> bool {
     let c = charset_token(charset);
     c.eq_ignore_ascii_case(b"ISO-2022-JP")
@@ -238,6 +246,18 @@ fn merge_stateless_run(words: &[ParsedWord]) -> Option<Vec<u8>> {
         merged.extend(decode_word_payload(w.encoding, w.payload)?);
     }
     let charset = words[0].charset;
+    // Writing the run back under a name the parser cannot resolve would leave
+    // it to be read as UTF-8 further down, which turns the legacy bytes we
+    // just carefully rejoined into replacement characters. Where the name is
+    // one we can map, decode here and write UTF-8 back instead. Rejoining
+    // first and decoding once is what makes this safe: a character split
+    // across two encoded words is whole again by the time it is read.
+    if let Ok(label) = std::str::from_utf8(charset)
+        && !crate::charset::resolvable(label)
+        && let Some(text) = crate::charset::decode(label, &merged)
+    {
+        return Some(utf8_encoded_word(&text));
+    }
     let b64 = base64::engine::general_purpose::STANDARD.encode(&merged);
     let mut out = Vec::with_capacity(2 + charset.len() + 4 + b64.len() + 2);
     out.extend_from_slice(b"=?");
@@ -316,7 +336,12 @@ fn rewrite_header_block(headers: &[u8]) -> Cow<'_, [u8]> {
                 pos = span_end;
                 continue;
             }
-            if run.len() >= 2
+            // Two or more words may have split a character between them, so
+            // they are rejoined. A single word normally needs nothing — but if
+            // its charset is a name the parser cannot resolve, leaving it
+            // alone means it is read as UTF-8 and garbled, so it goes through
+            // the same door to come back out as UTF-8.
+            if (run.len() >= 2 || charset_needs_mapping(run[0].charset))
                 && let Some(merged) = merge_run(&run)
             {
                 let buf = out.get_or_insert_with(|| headers[..span_start].to_vec());

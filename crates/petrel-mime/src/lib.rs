@@ -5,8 +5,10 @@
 //! malformed message must degrade, not crash the engine), and **never lose the
 //! original** (parsing produces a view; the raw bytes stay the source of truth).
 
+pub mod charset;
 mod encoded_word;
 pub mod legacy_cjk;
+pub mod utf7;
 
 pub mod darken;
 pub mod ical;

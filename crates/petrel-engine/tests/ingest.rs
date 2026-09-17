@@ -484,6 +484,103 @@ fn reindex_repairs_legacy_charset_columns() {
     store.fts_integrity_check().expect("index consistent");
 }
 
+/// A Windows mailer's own name for Shift_JIS. The Encoding Standard does not
+/// list it, and an unresolvable charset is read as UTF-8, so this arrived as a
+/// row of replacement characters rather than as Japanese.
+fn cp932_mail() -> Vec<u8> {
+    let mut raw = b"From: =?CP932?B?ie+LY4LMjI8=?= <info@example.jp>\r\n\
+To: me@example.com\r\n\
+Subject: =?CP932?B?ie+LY4LMjI8=?=\r\n\
+Date: Tue, 18 Aug 2026 14:02:00 +0000\r\n\
+Message-ID: <cp932@example.jp>\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=CP932\r\n\
+Content-Transfer-Encoding: 8bit\r\n\r\n"
+        .to_vec();
+    raw.extend_from_slice(b"\x82\xb1\x82\xea\x82\xcd\x96\x7b\x95\xb6\x82\xc5\x82\xb7\x81\x42\r\n");
+    raw
+}
+
+#[test]
+fn cp932_ingests_readable_and_searchable() {
+    let (_dir, mut store, blobs, account) = setup();
+    let out = store
+        .ingest_raw(&blobs, account, None, Some(1), &cp932_mail())
+        .expect("ingest");
+
+    let rows = store.list_recent(0, 10).expect("list");
+    let row = rows.iter().find(|r| r.id == out.message_id).expect("row");
+    assert_eq!(row.subject, "会議の件");
+    assert_eq!(row.from_display, "会議の件");
+    assert!(!row.subject.contains('\u{FFFD}'), "subject still garbled");
+    assert!(
+        row.snippet.contains("本文"),
+        "snippet was {:?}",
+        row.snippet
+    );
+    let hits = store.search("会議", 10).expect("search");
+    assert!(hits.iter().any(|h| h.message_id == out.message_id));
+    store.fts_integrity_check().expect("index consistent");
+}
+
+#[test]
+fn reindex_repairs_vendor_charset_columns() {
+    let (_dir, mut store, blobs, account) = setup();
+    let out = store
+        .ingest_raw(&blobs, account, None, Some(1), &cp932_mail())
+        .expect("ingest");
+
+    // What the extractor wrote before the name was mapped: the charset would
+    // not resolve, so the bytes were read as UTF-8 and most of them are not
+    // valid UTF-8. List rows and search both saw this.
+    let garbled = String::from_utf8_lossy(b"\x89\xef\x8b\x63\x82\xcc\x8c\x8f").into_owned();
+    let garbled_body = String::from_utf8_lossy(
+        b"\x82\xb1\x82\xea\x82\xcd\x96\x7b\x95\xb6\x82\xc5\x82\xb7\x81\x42",
+    )
+    .into_owned();
+    assert!(
+        garbled.contains('\u{FFFD}'),
+        "fixture is not the old output"
+    );
+    store
+        .overwrite_extracted(
+            out.message_id,
+            &garbled,
+            &garbled,
+            &garbled_body,
+            &garbled_body,
+        )
+        .expect("plant stale extraction");
+    store
+        .set_setting("extraction_version", "9")
+        .expect("roll version back");
+
+    let stale = store.list_recent(0, 10).expect("list");
+    let stale_row = stale.iter().find(|r| r.id == out.message_id).expect("row");
+    assert_eq!(stale_row.subject, garbled);
+    assert!(
+        store.search("会議", 10).expect("search").is_empty(),
+        "garbled CJK must not match until reindex"
+    );
+
+    let n = store.reindex_bodies(&blobs).expect("reindex");
+    assert_eq!(n, 1);
+    assert_eq!(store.reindex_bodies(&blobs).expect("second pass"), 0);
+
+    let rows = store.list_recent(0, 10).expect("list");
+    let row = rows.iter().find(|r| r.id == out.message_id).expect("row");
+    assert_eq!(row.subject, "会議の件");
+    assert_eq!(row.from_display, "会議の件");
+    assert!(
+        row.snippet.contains("本文"),
+        "snippet was {:?}",
+        row.snippet
+    );
+    let hits = store.search("会議", 10).expect("search");
+    assert!(hits.iter().any(|h| h.message_id == out.message_id));
+    store.fts_integrity_check().expect("index consistent");
+}
+
 /// The re-extraction in slices, and what survives being interrupted.
 ///
 /// The whole pass is about ninety seconds on a real mailbox, and it runs
