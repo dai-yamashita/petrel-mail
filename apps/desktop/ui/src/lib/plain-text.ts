@@ -118,9 +118,11 @@ function listItem(node: DocNode): string {
 /**
  * The whole document as text.
  *
- * Trailing whitespace is trimmed per line and the result ends without a run of
- * blank lines, because an empty paragraph at the end of an editor is a thing
- * people leave behind constantly and it should not travel.
+ * Trailing spaces on each line go, and so do blank paragraphs at the start or
+ * the end — an empty paragraph at the bottom of an editor is a thing people
+ * leave behind constantly and it should not travel. A blank line in the middle
+ * is different: in Japanese (and other CJK) it is how a paragraph is marked,
+ * and folding those into one gap lost the break the author typed.
  */
 export function plainTextFromDoc(doc: DocNode | null | undefined): string {
   if (!doc) return '';
@@ -128,6 +130,5 @@ export function plainTextFromDoc(doc: DocNode | null | undefined): string {
     .split('\n')
     .map((line) => line.replace(/[ \t]+$/, ''))
     .join('\n')
-    .replace(/\n{3,}/g, '\n\n')
     .trim();
 }

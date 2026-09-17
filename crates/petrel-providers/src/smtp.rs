@@ -319,6 +319,148 @@ fn address_list(list: &[Recipient]) -> mail_builder::headers::address::Address<'
     )
 }
 
+/// Prepares composer HTML for the wire.
+///
+/// Empty paragraphs at the start or end are editor chrome — the caret park,
+/// the leftover at the bottom — and they do not travel. An empty paragraph
+/// in the middle is a blank line the author typed. TipTap serialises those
+/// as `<p></p>`, which most clients collapse, so they go out as `<p><br></p>`.
+fn html_for_send(html: &str) -> String {
+    fill_empty_paragraphs(&strip_edge_empty_paragraphs(html))
+}
+
+struct Paragraph {
+    start: usize,
+    inner_start: usize,
+    close: usize,
+    end: usize,
+}
+
+fn open_p(html: &str, i: usize) -> Option<usize> {
+    let rest = html.get(i..)?;
+    if !rest.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("<p")) {
+        return None;
+    }
+    let next = *rest.as_bytes().get(2)?;
+    if next != b'>' && !next.is_ascii_whitespace() {
+        return None;
+    }
+    rest.find('>').map(|rel| i + rel + 1)
+}
+
+fn close_p(html: &str, from: usize) -> Option<usize> {
+    let rest = html.get(from..)?;
+    rest.to_ascii_lowercase().find("</p>").map(|rel| from + rel)
+}
+
+fn parse_p_at(html: &str, i: usize) -> Option<Paragraph> {
+    let inner_start = open_p(html, i)?;
+    let close = close_p(html, inner_start)?;
+    let end = close + 4;
+    if !html.get(close..end)?.eq_ignore_ascii_case("</p>") {
+        return None;
+    }
+    Some(Paragraph {
+        start: i,
+        inner_start,
+        close,
+        end,
+    })
+}
+
+fn next_p(html: &str, from: usize) -> Option<Paragraph> {
+    let mut i = from;
+    while let Some(rel) = html.get(i..)?.find('<') {
+        let at = i + rel;
+        if let Some(p) = parse_p_at(html, at) {
+            return Some(p);
+        }
+        i = at + 1;
+    }
+    None
+}
+
+fn p_content_is_empty(inner: &str) -> bool {
+    let mut rest = inner.trim();
+    if rest.is_empty() {
+        return true;
+    }
+    while !rest.is_empty() {
+        let s = rest.trim_start();
+        if s.is_empty() {
+            return true;
+        }
+        if !s.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("<br")) {
+            return false;
+        }
+        let Some(gt) = s.find('>') else {
+            return false;
+        };
+        rest = &s[gt + 1..];
+    }
+    true
+}
+
+fn first_p(html: &str) -> Option<(usize, usize, bool)> {
+    let p = next_p(html, 0)?;
+    Some((
+        p.start,
+        p.end,
+        p_content_is_empty(&html[p.inner_start..p.close]),
+    ))
+}
+
+fn last_p(html: &str) -> Option<(usize, usize, bool)> {
+    let mut last = None;
+    let mut i = 0;
+    while let Some(p) = next_p(html, i) {
+        last = Some((
+            p.start,
+            p.end,
+            p_content_is_empty(&html[p.inner_start..p.close]),
+        ));
+        i = p.end;
+    }
+    last
+}
+
+fn strip_edge_empty_paragraphs(html: &str) -> String {
+    let mut s = html.trim().to_string();
+    while let Some((start, end, empty)) = first_p(&s) {
+        if empty && s[..start].trim().is_empty() {
+            s = s[end..].trim_start().to_string();
+            continue;
+        }
+        break;
+    }
+    while let Some((start, end, empty)) = last_p(&s) {
+        if empty && s[end..].trim().is_empty() {
+            s = s[..start].trim_end().to_string();
+            continue;
+        }
+        break;
+    }
+    s
+}
+
+fn fill_empty_paragraphs(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 16);
+    let mut i = 0;
+    while let Some(p) = next_p(html, i) {
+        out.push_str(&html[i..p.start]);
+        out.push_str(&html[p.start..p.inner_start]);
+        if p_content_is_empty(&html[p.inner_start..p.close]) {
+            out.push_str("<br>");
+        } else {
+            out.push_str(&html[p.inner_start..p.close]);
+        }
+        out.push_str(&html[p.close..p.end]);
+        i = p.end;
+    }
+    out.push_str(&html[i..]);
+    out
+}
+
 /// Wraps an HTML body in a document, if it is not one already.
 ///
 /// The composer produces a fragment — `<p>…</p>`, the contenteditable's own
@@ -416,7 +558,7 @@ impl Outgoing {
         let (html, inline) = match &self.body_html {
             Some(html) => {
                 let (rewritten, inline) = extract_inline_images(html, &message_id);
-                (Some(as_document(&rewritten)), inline)
+                (Some(as_document(&html_for_send(&rewritten))), inline)
             }
             None => (None, Vec::new()),
         };
@@ -1297,6 +1439,35 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert_eq!(unsendable_recipients(&list), vec!["dan", "Dana Wu", "<>"]);
+    }
+
+    #[test]
+    fn html_for_send_keeps_an_interior_blank_line() {
+        assert_eq!(
+            html_for_send("<p>One.</p><p></p><p>Two.</p>"),
+            "<p>One.</p><p><br></p><p>Two.</p>"
+        );
+        assert_eq!(
+            html_for_send("<p>One.</p><p><br></p><p></p><p>Two.</p>"),
+            "<p>One.</p><p><br></p><p><br></p><p>Two.</p>"
+        );
+    }
+
+    #[test]
+    fn html_for_send_drops_edge_empty_paragraphs() {
+        assert_eq!(
+            html_for_send("<p></p><p>Done.</p><p></p><p><br></p>"),
+            "<p>Done.</p>"
+        );
+        assert_eq!(html_for_send("<p></p><p></p>"), "");
+    }
+
+    #[test]
+    fn html_for_send_does_not_touch_a_pre_or_a_worded_paragraph() {
+        assert_eq!(
+            html_for_send("<pre>x</pre><p>hello</p>"),
+            "<pre>x</pre><p>hello</p>"
+        );
     }
 
     #[test]
