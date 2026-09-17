@@ -273,6 +273,21 @@ fn iso_2022_jp_ingests_readable_and_searchable() {
 }
 
 /// Folded UTF-8 encoded-word Subject that splits い across two Base64 words.
+/// これは / テスト / です — each a complete ISO-2022-JP encoded-word.
+fn folded_self_contained_iso_2022_jp_mail() -> Vec<u8> {
+    b"From: info@example.jp\r\n\
+To: me@example.com\r\n\
+Subject: =?ISO-2022-JP?B?GyRCJDMkbCRPGyhC?=\r\n\
+ =?ISO-2022-JP?B?GyRCJUYlOSVIGyhC?=\r\n\
+ =?ISO-2022-JP?B?GyRCJEckORsoQg==?=\r\n\
+Date: Tue, 18 Aug 2026 14:02:00 +0000\r\n\
+Message-ID: <iso2022jp-fold@example.jp>\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\r\n\
+body\r\n"
+        .to_vec()
+}
+
 fn split_subject_utf8_mail() -> Vec<u8> {
     b"From: billing@example.com\r\n\
 To: me@example.com\r\n\
@@ -284,6 +299,72 @@ MIME-Version: 1.0\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\r\n\
 Payment confirmed.\r\n"
         .to_vec()
+}
+
+#[test]
+fn folded_self_contained_iso_2022_jp_ingests_readable_and_searchable() {
+    let (_dir, mut store, blobs, account) = setup();
+    let raw = folded_self_contained_iso_2022_jp_mail();
+    let out = store
+        .ingest_raw(&blobs, account, None, Some(1), &raw)
+        .expect("ingest");
+
+    let rows = store.list_recent(0, 10).expect("list");
+    let row = rows.iter().find(|r| r.id == out.message_id).expect("row");
+    assert_eq!(row.subject, "これはテストです");
+    assert!(
+        !row.subject.contains('\u{FFFD}'),
+        "complete JIS runs must not grow replacement chars"
+    );
+
+    let hits = store.search("テスト", 10).expect("search");
+    assert!(
+        hits.iter().any(|h| h.message_id == out.message_id),
+        "CJK search must find the decoded subject"
+    );
+
+    let stored = blobs.read(&out.blob_hash).expect("read blob");
+    assert_eq!(stored, raw, "rewrite is parse-only; raw bytes unchanged");
+    store.fts_integrity_check().expect("index consistent");
+}
+
+#[test]
+fn reindex_repairs_iso_2022_jp_join_fffd() {
+    let (_dir, mut store, blobs, account) = setup();
+    let out = store
+        .ingest_raw(
+            &blobs,
+            account,
+            None,
+            Some(1),
+            &folded_self_contained_iso_2022_jp_mail(),
+        )
+        .expect("ingest");
+
+    // What the v7 extractor stored: the Japanese is right, and a replacement
+    // character sits at each encoded-word join.
+    let garbled = "これは\u{FFFD}テスト\u{FFFD}です";
+    store
+        .overwrite_extracted(out.message_id, garbled, garbled, "body", "body")
+        .expect("plant stale extraction");
+    store
+        .set_setting("extraction_version", "7")
+        .expect("roll version back");
+
+    let stale = store.list_recent(0, 10).expect("list");
+    let stale_row = stale.iter().find(|r| r.id == out.message_id).expect("row");
+    assert_eq!(stale_row.subject, garbled);
+
+    let n = store.reindex_bodies(&blobs).expect("reindex");
+    assert_eq!(n, 1);
+
+    let rows = store.list_recent(0, 10).expect("list");
+    let row = rows.iter().find(|r| r.id == out.message_id).expect("row");
+    assert_eq!(row.subject, "これはテストです");
+    assert!(!row.subject.contains('\u{FFFD}'));
+    let hits = store.search("テスト", 10).expect("search");
+    assert!(hits.iter().any(|h| h.message_id == out.message_id));
+    store.fts_integrity_check().expect("index consistent");
 }
 
 #[test]
@@ -560,7 +641,7 @@ mod reindex_batches {
         assert_eq!(
             setting_i64(&store, "reindex_cursor"),
             first_three,
-            "must restart from id 0, not continue past the leftover cursor"
+            "must restart from the newest, not continue past the leftover cursor"
         );
         assert_eq!(
             setting_i64(&store, "reindex_target"),
@@ -624,13 +705,14 @@ Content-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n";
     #[test]
     fn a_cursor_left_by_an_older_extractor_is_not_honoured() {
         let (_d, mut store, blobs) = store_with(10);
-        let ids: Vec<i64> = store
+        let mut ids: Vec<i64> = store
             .list_recent(0, 20)
             .unwrap()
             .iter()
             .map(|r| r.id)
             .collect();
-        let low = *ids.iter().min().unwrap();
+        ids.sort();
+        let low = ids[0];
         store.set_setting("extraction_version", "5").unwrap();
         store
             .set_setting("reindex_cursor", &ids[5].to_string())
@@ -640,11 +722,50 @@ Content-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n";
 
         assert_eq!(p.read, 3);
         let cursor = setting_i64(&store, "reindex_cursor");
-        assert!(
-            cursor < ids[5],
-            "resumed past the leftover cursor instead of starting over: {cursor}"
+        // Newest first: leftover ids[5] is ignored; the three highest ids
+        // move the cursor to the floor of that slice.
+        assert_eq!(
+            cursor, ids[7],
+            "resumed from the leftover cursor {cursor} instead of the newest"
         );
         assert!(cursor >= low, "cursor went nowhere: {cursor}");
+    }
+
+    /// Today's mail is what is on screen. An oldest-first pass left it
+    /// garbled until the last slice.
+    #[test]
+    fn the_first_slice_repairs_the_newest_garbled_subject() {
+        let (_d, mut store, blobs) = store_with(8);
+        let rows = store.list_recent(0, 10).unwrap();
+        let newest = rows.iter().map(|r| r.id).max().unwrap();
+        let oldest = rows.iter().map(|r| r.id).min().unwrap();
+        store
+            .overwrite_extracted(newest, "new\u{FFFD}", "ok", "s", "s")
+            .unwrap();
+        store
+            .overwrite_extracted(oldest, "old\u{FFFD}", "ok", "s", "s")
+            .unwrap();
+        store.set_setting("extraction_version", "7").unwrap();
+        store.set_setting("reindex_target", "8").unwrap();
+        store.set_setting("reindex_cursor", "0").unwrap();
+
+        let p = store.reindex_batch(&blobs, 3).unwrap();
+        assert_eq!(p.read, 3);
+        assert!(
+            p.rewritten >= 1,
+            "the newest garbled row must be in slice 1"
+        );
+        let after = store.list_recent(0, 10).unwrap();
+        let new_row = after.iter().find(|r| r.id == newest).unwrap();
+        assert!(
+            !new_row.subject.contains('\u{FFFD}'),
+            "newest subject still garbled after the first slice"
+        );
+        let old_row = after.iter().find(|r| r.id == oldest).unwrap();
+        assert!(
+            old_row.subject.contains('\u{FFFD}'),
+            "oldest should wait for a later slice"
+        );
     }
 }
 

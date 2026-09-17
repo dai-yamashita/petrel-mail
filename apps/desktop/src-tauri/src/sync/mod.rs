@@ -3,12 +3,16 @@
 pub(crate) mod backfill;
 pub(crate) mod drafts;
 pub(crate) mod drain;
+pub(crate) mod reindex;
 
 use crate::diag::{friendly_sync_error_for, is_imap_parse_error, log_sync};
 use crate::send::{spawn_outbox_clock, spawn_send_worker};
 use crate::state::{AppState, now_ms, stopped, unless_stopped};
 use crate::sync::backfill::spawn_backfill;
 use crate::sync::drain::{drain_actions, spawn_drain_worker};
+use crate::sync::reindex::{
+    run_startup as reindex_startup, spawn_remainder as spawn_reindex_remainder,
+};
 use petrel_engine::actions::ActionKind;
 use petrel_engine::store::Store;
 use petrel_providers::imap::ImapConfig;
@@ -42,92 +46,13 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
         };
 
         // Mail already held was indexed by whatever the extraction did then.
-        // When that improves, the improvement has to be applied backwards or it
-        // only ever reaches mail that has not arrived yet.
-        //
-        // A slice at a time, and the lock goes back between them. The whole
-        // pass is about ninety seconds on a mailbox of twenty-eight thousand,
-        // and every command the window issues — listing a folder, counting
-        // anything, opening a message — waits on this same lock. Held for the
-        // duration it is a minute and a half of frozen app, on the first
-        // launch after an upgrade.
-        {
-            // Measured on a mailbox of twenty-eight thousand: about 650ms of
-            // work per slice, worst case 1.9s. That worst case is one unusually
-            // large message rather than the slice size — quartering the slice
-            // only took it to 1.5s — so there is nothing to win by going
-            // smaller, and it would cost a hundred and seventy more
-            // transactions to do it.
-            const SLICE: usize = 250;
-            let mut total = 0usize;
-            let mut progressed = false;
-            loop {
-                if *stop.borrow() {
-                    stand_down();
-                    return;
-                }
-                let outcome = match state.store.lock() {
-                    Ok(mut store) => store.reindex_batch(&state.blobs, SLICE),
-                    // Another thread panicked holding it; nothing to do here.
-                    Err(_) => break,
-                };
-                match outcome {
-                    Ok(p) => {
-                        total += p.rewritten;
-                        if p.finished {
-                            if total > 0 || progressed {
-                                if total > 0 {
-                                    log_sync(&format!(
-                                        "re-indexed {total} message(s) after an extraction change"
-                                    ));
-                                }
-                                state.extraction_gen.fetch_add(1, Ordering::Relaxed);
-                                // Do not wait for the UI to go quiet first.
-                                // A search in flight marks a touch forever
-                                // relative to this await, and the WAL stays huge.
-                                for _ in 0..20 {
-                                    match state.checkpoint_wal_truncate() {
-                                        Ok(r) if r.busy => {
-                                            tokio::time::sleep(std::time::Duration::from_millis(
-                                                250,
-                                            ))
-                                            .await;
-                                        }
-                                        Ok(r) => {
-                                            log_sync(&format!(
-                                                "wal checkpoint after re-index: busy={} log={} checkpointed={}",
-                                                r.busy, r.log, r.checkpointed
-                                            ));
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            log_sync(&format!(
-                                                "wal checkpoint after re-index: {e}"
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        progressed = true;
-                    }
-                    Err(e) => {
-                        log_sync(&format!("re-index failed: {e}"));
-                        break;
-                    }
-                }
-                // A slice that finishes and immediately retakes the lock
-                // starves listing, so hand the runtime back for a beat.
-                //
-                // A beat, and not "wait until the window has been quiet":
-                // this is a repair, not history backfill. Waiting the user
-                // out lets somebody who keeps working hold a garbled
-                // subject on screen for the whole session, and the lock is
-                // already released between slices either way.
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
+        // A few newest slices repair what is on screen; the rest must not
+        // sit in front of the first fetch — on a large store that delay is
+        // how receiving looks like it has stopped.
+        let reindex_done = reindex_startup(&state, &mut stop).await;
+        if *stop.borrow() {
+            stand_down();
+            return;
         }
 
         let mut has_move = false;
@@ -317,6 +242,9 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
         // History fills in behind the present, on its own clock — see
         // spawn_backfill for why it is not part of the poll loop.
         spawn_backfill(Arc::clone(&state), account, cfg.clone(), stop.clone());
+        if !reindex_done {
+            spawn_reindex_remainder(Arc::clone(&state), stop.clone());
+        }
 
         // From here on the account is watched rather than polled, on two
         // clocks that answer two different questions.

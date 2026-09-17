@@ -447,7 +447,9 @@ fn id_list(value: &HeaderValue<'_>) -> Vec<String> {
 pub fn parse_message(raw: &[u8]) -> Option<ParsedMessage> {
     // mail-parser decodes each encoded-word to a string. Adjacent words that
     // split a UTF-8 character (い folded as E3 | 81 84) become U+FFFD unless
-    // the octets are concatenated first. The blob is not rewritten.
+    // the octets are concatenated first. Adjacent ISO-2022-JP words that are
+    // each a complete JIS run must *not* be concatenated — that is the other
+    // U+FFFD, from encoding_rs seeing ESC ( B ESC $ B. The blob is not rewritten.
     let rewritten = merge_adjacent_encoded_words(raw);
     let parsed = rewritten.as_ref();
     let msg = MessageParser::default().parse(parsed)?;
@@ -638,6 +640,24 @@ Subject: =?utf-8?Q?=E3=81=8A=E6=94=AF=E6=89=95=E3?=\r\n\
 x\r\n";
         let m = parse_message(raw).expect("parses");
         assert_eq!(m.subject.as_deref(), Some("お支払い"));
+    }
+
+    #[test]
+    fn self_contained_iso_2022_jp_folds_do_not_insert_fffd() {
+        // これは / テスト / です, each a complete ESC $ B … ESC ( B run.
+        // Concatenating the payloads is what inserts U+FFFD at the two joins.
+        let raw = b"From: a@example.com\r\n\
+Subject: =?ISO-2022-JP?B?GyRCJDMkbCRPGyhC?=\r\n\
+ =?ISO-2022-JP?B?GyRCJUYlOSVIGyhC?=\r\n\
+ =?ISO-2022-JP?B?GyRCJEckORsoQg==?=\r\n\r\n\
+x\r\n";
+        let m = parse_message(raw).expect("parses");
+        let subject = m.subject.as_deref().expect("subject");
+        assert_eq!(subject, "これはテストです");
+        assert!(
+            !subject.contains('\u{FFFD}'),
+            "complete JIS runs must not grow replacement chars: {subject:?}"
+        );
     }
 
     #[test]

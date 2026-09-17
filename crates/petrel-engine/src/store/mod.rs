@@ -1679,14 +1679,12 @@ impl Store {
     /// extraction reaches only new mail — everything already held keeps
     /// whatever the old code produced. This is the version that says otherwise.
     ///
-    /// 7 rather than 6, for no change to extraction at all: version 6's pass
-    /// shipped briefly with a shortcut that rewrote only rows still holding a
-    /// replacement character, and a header folded inside an ISO-2022-JP run
-    /// leaves none. Those stores finished the pass, marked themselves done and
-    /// kept the mojibake. Bumping asks them again, and a row the extractor now
-    /// agrees with is not written, so the second pass costs reads and no
-    /// database pages.
-    pub const EXTRACTION_VERSION: i64 = 7;
+    /// 8: self-contained ISO-2022-JP encoded-words were concatenated, and
+    /// encoding_rs inserted U+FFFD at every `ESC ( B ESC $ B` join. Version 7
+    /// asked every row again because version 6 had skipped subjects with no
+    /// replacement character (a fold inside a JIS run decodes to bare ASCII).
+    /// A row the extractor now agrees with is still not written.
+    pub const EXTRACTION_VERSION: i64 = 8;
 
     /// The blob backing a message, for the reading pane to fetch and render.
     /// Who sent a message and when — the two facts an attribution line needs.
