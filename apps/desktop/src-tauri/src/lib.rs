@@ -677,6 +677,7 @@ pub fn run() {
             commands::mail::sync_mailbox,
             commands::mail::watch_mailbox,
             commands::mail::thread_by_id,
+            commands::mail::thread_in_view,
             commands::windows::open_external,
             commands::compose::stage_attachment,
             commands::compose::stage_forwarded_attachments,

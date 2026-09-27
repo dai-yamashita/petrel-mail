@@ -14,6 +14,8 @@ export type ThreadFetchers = {
     beforeThreadId?: number,
   ) => Promise<Thread[]>;
   search: (query: string, sort?: string, ascending?: boolean) => Promise<Thread[]>;
+  /** One conversation as the view lists it; see `refreshHead`. */
+  threadInView?: (view: string, threadId: number) => Promise<Thread | null>;
 };
 
 /** First listing page — offset zero, no keyset cursor. */
@@ -22,7 +24,8 @@ export function firstPageCall(view: string, sort: Sort): Parameters<ThreadFetche
   return [view, 0, LIST_PAGE, wire.key, wire.ascending];
 }
 
-/** Next listing page — cursor taken from the last loaded row. */
+/** Next listing page — cursor taken from `last`, the row the page before it
+ *  ended on. */
 export function loadMoreCall(view: string, sort: Sort, last: Thread): Parameters<ThreadFetchers['threads']> {
   const wire = wireSort(sort);
   return [view, 0, LIST_PAGE, wire.key, wire.ascending, last.date_ms, last.thread_id];
@@ -41,19 +44,77 @@ export function replaceLoadHasMore(query: string, rowCount: number): boolean {
  *  so the tail goes with it. A full page, sorted by date, also says which
  *  tail rows have gone: anything newer than its last row that it does not
  *  list was deleted or filed elsewhere by another client. Other sorts have no
- *  such range, so their tails are kept as they were. */
+ *  such range, so their tails are kept as they were.
+ *
+ *  `keep` is the open conversation, which the page does not list and which
+ *  will be asked after by itself (see `refreshHead`). Its row stays, whatever
+ *  the range says, and stays where it was — after the row it followed —
+ *  whatever it now sorts by, for as long as it is open. Put after the page,
+ *  the row being read went off the screen, J and K went on from there, and
+ *  once its new date was written in, the next page was asked for after it.
+ *  Further down than the first page, it is in the tail already, in order. */
 export function mergeHead(
   prev: Thread[],
   incoming: Thread[],
   order: { byDate: boolean; ascending: boolean } = { byDate: false, ascending: false },
+  keep: number | null = null,
 ): Thread[] {
   if (incoming.length < LIST_PAGE) return incoming;
   const covered = new Set(incoming.map((t) => t.thread_id));
   const edge = incoming[incoming.length - 1].date_ms;
   const insidePage = (t: Thread) =>
     order.byDate && (order.ascending ? t.date_ms < edge : t.date_ms > edge);
-  const rest = prev.filter((t) => !covered.has(t.thread_id) && !insidePage(t));
-  return [...incoming, ...rest];
+  const at =
+    keep == null || covered.has(keep) ? -1 : prev.findIndex((t) => t.thread_id === keep);
+  const held = at >= 0 && (at < incoming.length || insidePage(prev[at])) ? prev[at] : undefined;
+  const rest = prev.filter((t) => t !== held && !covered.has(t.thread_id) && !insidePage(t));
+  const merged = [...incoming, ...rest];
+  if (!held) return merged;
+  // After the nearest row above it that this refresh left where it was.
+  //
+  // A row a reply renumbered has moved, up the page or past it, and the row
+  // being read went with it: to the top, out of sight, with J going on from
+  // there. So a row counts only under the id it had. And where the rows
+  // after it are still on the page, only a row still on the page counts: one
+  // the page no longer lists went past it, and is stale in the tail. Where
+  // those rows went past the page too — a short window that more than a page
+  // of mail arrived in at once — its neighbours are tail rows, and they do.
+  const listed = new Map(merged.map((t, i) => [t.thread_id, i]));
+  const unmoved = (t: Thread): number => {
+    const j = listed.get(t.thread_id);
+    return j !== undefined && merged[j].id === t.id ? j : -1;
+  };
+  const below = prev.slice(at + 1).find((t) => unmoved(t) >= 0);
+  const onPage = below === undefined || covered.has(below.thread_id);
+  let to = 0;
+  for (let i = at - 1; i >= 0; i -= 1) {
+    const j = unmoved(prev[i]);
+    if (j >= 0 && (!onPage || covered.has(prev[i].thread_id))) {
+      to = j + 1;
+      break;
+    }
+  }
+  return [...merged.slice(0, to), held, ...merged.slice(to)];
+}
+
+/** Which rows came back under a new id, old id to new.
+ *
+ *  A conversation is listed under its newest message in the view, so a reply
+ *  landing in one gives its row a new id. The conversation is the same one,
+ *  and whatever pointed at the old row — the one open, the selection — should
+ *  point at the new. A row whose id is still listed has not moved, and a
+ *  conversation that left the list has nothing to point at. Only for lists of
+ *  conversations: in Drafts a row is a message, and two can share a thread. */
+export function renumbered(prev: Thread[], next: Thread[]): Map<number, number> {
+  const ids = new Set(next.map((t) => t.id));
+  const byThread = new Map(next.map((t) => [t.thread_id, t.id]));
+  const moved = new Map<number, number>();
+  for (const t of prev) {
+    if (ids.has(t.id)) continue;
+    const now = byThread.get(t.thread_id);
+    if (now != null) moved.set(t.id, now);
+  }
+  return moved;
 }
 
 export function appendPage(
@@ -112,6 +173,12 @@ export type WindowSink = {
   items: () => Thread[];
   setItems: (next: Thread[] | ((prev: Thread[]) => Thread[])) => void;
   setHasMore: (more: boolean) => void;
+  /** Where the next page starts: the last row a page delivered, as it was
+   *  delivered. Not the window's last row, which can be the open
+   *  conversation kept in place with a date from somewhere else in the view:
+   *  asking for the page after that one, the newest, got nothing and ended
+   *  the list. */
+  setPageEnd: (row: Thread | null) => void;
   bumpReplace: () => void;
   /** A background load that could not be made. The rows on screen are still
    *  the rows; the notice says the newest may be missing. */
@@ -129,18 +196,53 @@ export async function refreshHead(
   sort: Sort,
   wanted: () => boolean,
   sink: WindowSink,
+  openThread: () => number | null = () => null,
 ): Promise<void> {
   try {
     const rows = await fetchers.threads(...firstPageCall(view, sort));
     if (!wanted()) return;
     const wasEmpty = sink.items().length === 0;
+    // The open conversation, where a full first page does not reach it. A
+    // page that misses it says nothing true about it. Sorted by anything but
+    // newest first, a reply can carry it past the page, where its row was
+    // taken for gone, closing it on the person reading it, or kept stale, so
+    // the reply never showed. Newest first, a message joining it outside the
+    // view — your own reply, filed in Sent — changes the row without moving
+    // it, and further down than the page, that never showed either. So its
+    // row stays, and is asked after by itself.
+    const open = openThread();
+    const askAfter =
+      open != null &&
+      fetchers.threadInView != null &&
+      rows.length === LIST_PAGE &&
+      !rows.some((t) => t.thread_id === open);
     sink.setItems((cur) =>
-      mergeHead(cur, rows, { byDate: sort.key === 'date', ascending: sort.ascending }),
+      mergeHead(
+        cur,
+        rows,
+        { byDate: sort.key === 'date', ascending: sort.ascending },
+        askAfter ? open : null,
+      ),
     );
+    // A full page leaves the next one where the last page left it; the rows
+    // past this one are still those.
+    if (wasEmpty || rows.length < LIST_PAGE) sink.setPageEnd(rows[rows.length - 1] ?? null);
     if (wasEmpty) {
       sink.setHasMore(rows.length === LIST_PAGE);
       sink.bumpReplace();
     }
+    if (!askAfter || open == null || !fetchers.threadInView) return;
+    const fresh = await fetchers.threadInView(view, open);
+    if (!wanted()) return;
+    sink.setItems((cur) => {
+      const at = cur.findIndex((t) => t.thread_id === open);
+      if (at < 0) return cur;
+      if (fresh == null) return [...cur.slice(0, at), ...cur.slice(at + 1)];
+      if (JSON.stringify(fresh) === JSON.stringify(cur[at])) return cur;
+      const next = cur.slice();
+      next[at] = fresh;
+      return next;
+    });
   } catch (err: unknown) {
     if (wanted()) sink.failed(String(err));
   }
@@ -161,6 +263,7 @@ export async function pageMore(
     if (!wanted()) return;
     const { items: next, reachedEnd } = appendPage(sink.items(), rows);
     sink.setItems(next);
+    if (rows.length > 0) sink.setPageEnd(rows[rows.length - 1]);
     if (reachedEnd) sink.setHasMore(false);
   } catch (err: unknown) {
     if (wanted()) sink.failed(String(err));
@@ -182,6 +285,9 @@ export function useThreadWindow(args: {
   /** A background page or refresh that failed. The rows stay; this is where
    *  the failure is said. */
   onRefreshFailed?: (error: string) => void;
+  /** The conversation open in the reader, read when a refresh lands; see
+   *  `refreshHead`. */
+  openThread?: () => number | null;
 }): {
   items: Thread[];
   setItems: React.Dispatch<React.SetStateAction<Thread[]>>;
@@ -197,7 +303,8 @@ export function useThreadWindow(args: {
    *  the array is new. */
   replaceEpoch: number;
 } {
-  const { query, view, sort, accountEpoch, messageCount, mailGen, fetchers, onRefreshFailed } = args;
+  const { query, view, sort, accountEpoch, messageCount, mailGen, fetchers, onRefreshFailed, openThread } =
+    args;
 
   const [items, setItems] = useState<Thread[]>([]);
   const [loading, setLoading] = useState(true);
@@ -225,6 +332,12 @@ export function useThreadWindow(args: {
   const failedRef = useRef(onRefreshFailed);
   failedRef.current = onRefreshFailed;
 
+  const openThreadRef = useRef(openThread);
+  openThreadRef.current = openThread;
+
+  // The row the last page ended on; see `WindowSink.setPageEnd`.
+  const pageEnd = useRef<Thread | null>(null);
+
   const loadMoreInFlight = useRef(false);
   const messageCountRef = useRef(messageCount);
   const mailGenRef = useRef(mailGen);
@@ -242,6 +355,9 @@ export function useThreadWindow(args: {
     items: () => itemsRef.current,
     setItems: (next) => setItems(next),
     setHasMore: (more) => setHasMore(more),
+    setPageEnd: (row) => {
+      pageEnd.current = row;
+    },
     bumpReplace: () => setReplaceEpoch((n) => n + 1),
     failed: (e) => failedRef.current?.(e),
   });
@@ -276,6 +392,7 @@ export function useThreadWindow(args: {
         .then(({ items: rows, hasMore: more }) => {
           if (!live || gen.current !== myGen) return;
           setItems(rows);
+          pageEnd.current = rows[rows.length - 1] ?? null;
           setHasMore(more);
           setReplaceEpoch((n) => n + 1);
           setLoading(false);
@@ -325,6 +442,7 @@ export function useThreadWindow(args: {
       was.sort,
       () => live && stillWanted(was, asked()),
       sink.current,
+      () => openThreadRef.current?.() ?? null,
     );
 
     return () => {
@@ -336,7 +454,7 @@ export function useThreadWindow(args: {
     if (queryRef.current.trim() || !hasMoreRef.current || loadMoreInFlight.current) return;
 
     const current = itemsRef.current;
-    const last = current[current.length - 1];
+    const last = pageEnd.current ?? current[current.length - 1];
     if (!last) return;
 
     loadMoreInFlight.current = true;

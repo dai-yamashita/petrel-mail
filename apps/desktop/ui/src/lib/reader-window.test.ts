@@ -7,6 +7,7 @@ import {
   keepExistingPane,
   nextExpanded,
   olderCards,
+  pinnedSplit,
   previewCard,
 } from './reader-window';
 import type { Thread } from './api';
@@ -138,5 +139,47 @@ describe('olderCards', () => {
     expect(olderCards({ index: [card(10), card(99)], newestId: 99 }).map((c) => c.id)).toEqual([
       10,
     ]);
+  });
+});
+
+describe('pinnedSplit', () => {
+  const card = (id: number) => ({
+    id,
+    from_display: '',
+    from_addr: '',
+    snippet: '',
+    date_ms: id,
+    unread: false,
+  });
+  const ids = (s: { older: { id: number }[]; pinned: { id: number }[] }) => ({
+    older: s.older.map((c) => c.id),
+    pinned: s.pinned.map((c) => c.id),
+  });
+
+  it('pins the newest alone while nothing has landed since the conversation opened', () => {
+    expect(ids(pinnedSplit({ index: [card(1), card(2), card(3)], newestId: 3, pinFrom: 3 }))).toEqual({
+      older: [1, 2],
+      pinned: [3],
+    });
+  });
+
+  it('keeps the message being read below the stack when a reply lands after it', () => {
+    // 3 was the newest when it opened; 4 and then 5 arrived while it was open.
+    expect(
+      ids(pinnedSplit({ index: [card(1), card(2), card(3), card(4), card(5)], newestId: 5, pinFrom: 3 })),
+    ).toEqual({ older: [1, 2], pinned: [3, 4, 5] });
+  });
+
+  it('pins the newest alone before it knows where to start, or when that message is gone', () => {
+    const index = [card(1), card(2), card(3)];
+    expect(ids(pinnedSplit({ index, newestId: 3, pinFrom: null }))).toEqual({ older: [1, 2], pinned: [3] });
+    expect(ids(pinnedSplit({ index, newestId: 3, pinFrom: 99 }))).toEqual({ older: [1, 2], pinned: [3] });
+  });
+
+  it('has nothing in the stack for a one-message conversation', () => {
+    expect(ids(pinnedSplit({ index: [card(7)], newestId: 7, pinFrom: 7 }))).toEqual({
+      older: [],
+      pinned: [7],
+    });
   });
 });

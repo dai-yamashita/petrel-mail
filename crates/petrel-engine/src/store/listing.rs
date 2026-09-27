@@ -237,6 +237,33 @@ impl Store {
         )?;
         Ok(rows.into_iter().next())
     }
+
+    /// One conversation as a view lists it: the row `list_threads` would give
+    /// it — its id the conversation's newest message *in the view* — found by
+    /// its id rather than by paging to it.
+    ///
+    /// The list folds a fresh first page into what it has loaded. Sorted by
+    /// anything but newest first, a conversation that just gained a reply can
+    /// sit beyond that page, and the row loaded for it goes stale, or is taken
+    /// for gone; the open one, with the person reading it. This is how the
+    /// list asks after that one. `None` when the conversation has nothing in
+    /// the view, and for Drafts, which lists messages rather than
+    /// conversations.
+    pub fn thread_in_view(&self, view: &ListView, thread_id: i64) -> Result<Option<ThreadListing>> {
+        if matches!(view, ListView::Folder(r) if r == "drafts") {
+            return Ok(None);
+        }
+        let account = self.active_account()?.unwrap_or(-1);
+        let rows = self.rows_for_keys(
+            account,
+            &view.predicate("messages"),
+            &view.predicate("m"),
+            false,
+            &[thread_id],
+            view.bound().map(str::to_string),
+        )?;
+        Ok(rows.into_iter().next())
+    }
 }
 
 /// One listing's shape: the predicates, the page, and how rows group.

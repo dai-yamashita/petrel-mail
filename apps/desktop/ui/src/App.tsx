@@ -33,7 +33,7 @@ import {
 import { repaintTag } from './lib/tag-paint';
 import { mergeOrder } from './lib/reorder';
 import { Rail } from './components/Rail';
-import { useKeyboard } from './lib/useKeyboard';
+import { dialogOpen, useKeyboard } from './lib/useKeyboard';
 import { useAppMenu } from './lib/menu';
 import { useTriage, type UndoOffer } from './lib/useTriage';
 import { TitleBar } from './components/TitleBar';
@@ -89,7 +89,8 @@ import { useMessageLinks, type HomographRisk } from './lib/links';
 import { RowMenu } from './components/RowMenu';
 import { Toast } from './components/Toast';
 import { MessageList } from './components/MessageList';
-import { useThreadWindow } from './lib/useThreadWindow';
+import { renumbered, useThreadWindow } from './lib/useThreadWindow';
+import { listsPerMessage } from './lib/leaves-view';
 import { LIST_PAGE } from './lib/list-page';
 import { Reader } from './components/Reader';
 import { Outbox } from './components/Outbox';
@@ -136,6 +137,12 @@ const ALERT_TEXT: Record<string, StringId> = {
  *  and a screen reader is left nowhere. */
 function focusListAfterRender() {
   requestAnimationFrame(() => document.querySelector<HTMLElement>('.scroller')?.focus());
+}
+
+/** Drawn and not hidden: a pane the full-window reader has put away is
+ *  neither, and focus sent there goes nowhere. */
+function onScreen(el: HTMLElement): boolean {
+  return el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
 }
 
 /** The same when the pane-off reader closed by itself, only if focus went
@@ -502,7 +509,7 @@ export function App() {
   );
 
   const listFetchers = useMemo(
-    () => ({ threads: api.threads, search: api.search }),
+    () => ({ threads: api.threads, search: api.search, threadInView: api.threadInView }),
     [],
   );
   const extractionGenRef = useRef<number | null>(null);
@@ -518,6 +525,9 @@ export function App() {
     // the rows, and one poll that could not get a page is not a reason to
     // take forty conversations away.
     onRefreshFailed: (e) => notify(t('list-refresh-failed', { error: e })),
+    // Read when a refresh lands, so the open conversation is looked after
+    // wherever the sort puts it. Not in Drafts, where rows are messages.
+    openThread: () => (listsPerMessage(view) ? null : (activeRef.current?.thread_id ?? null)),
   });
   const searchRef = useRef<HTMLInputElement>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -769,10 +779,49 @@ export function App() {
   // rest of the app uses.
   const [rowMenu, setRowMenu] = useState<{ id: number; x: number; y: number } | null>(null);
 
-  useEffect(() => {
-    // The matches belonged to the conversation that just closed.
-    setFinding(false);
-  }, [activeId]);
+  // A conversation is listed under its newest message in the view, so a reply
+  // landing in the one that is open gives its row a new id. Looked up by the
+  // old id, it was lost: the pane went to "Nothing selected", the pane-off
+  // reader closed, and a selection held a row no longer drawn, which E still
+  // archived. So when the list changes under them, the open row, the
+  // selection and its ends follow their conversations to the new rows — here,
+  // before anything is drawn, so nothing sees the conversation closed for a
+  // frame on the way. `followed` tells the reading effects below that this
+  // was staying, not arriving.
+  //
+  // One that leaves the list is closed: coming back later, under any id, is
+  // new mail rather than the conversation still open. Within one window (a
+  // replaced one picks its own, below), in lists of conversations only, and
+  // never in the middle of a batch, whose cursor lands when it is done.
+  const followed = useRef<{ from: number; to: number } | null>(null);
+  const [listSeen, setListSeen] = useState({ items, epoch: replaceEpoch });
+  if (listSeen.items !== items) {
+    setListSeen({ items, epoch: replaceEpoch });
+    if (listSeen.epoch === replaceEpoch && !listsPerMessage(view)) {
+      const moved = renumbered(listSeen.items, items);
+      const follow = (id: number) => moved.get(id) ?? id;
+      if (activeId != null && moved.has(activeId)) {
+        followed.current = { from: activeId, to: follow(activeId) };
+        setActiveId(follow(activeId));
+      } else if (
+        activeId != null &&
+        !triage.batching &&
+        listSeen.items.some((m) => m.id === activeId) &&
+        !items.some((m) => m.id === activeId)
+      ) {
+        setActiveId(null);
+      }
+      if (moved.size > 0) {
+        if ([...selected].some((id) => moved.has(id))) setSelected(new Set([...selected].map(follow)));
+        if (anchor != null && moved.has(anchor)) setAnchor(follow(anchor));
+        if (rangeEnd != null && moved.has(rangeEnd)) setRangeEnd(follow(rangeEnd));
+        // A picker or row menu open on a row that moved: its choice goes to
+        // the conversation, not to a row no longer drawn, where it did nothing.
+        if (pickerFor?.some((id) => moved.has(id))) setPickerFor(pickerFor.map(follow));
+        if (rowMenu && moved.has(rowMenu.id)) setRowMenu({ ...rowMenu, id: follow(rowMenu.id) });
+      }
+    }
+  }
 
   const [pendingDelete, setPendingDelete] = useState<number[] | null>(null);
   // A draft opened while a foreign revision of it stands on the server.
@@ -938,10 +987,13 @@ export function App() {
     },
     cyclePanes: (backwards) => {
       // F6 is the platform convention for moving between panes, and the only
-      // route into the rail without a pointer.
+      // route into the rail without a pointer. The panes on screen only: a
+      // reader filling the window hides the rail and the list, and F6 went to
+      // them and left focus nowhere.
       const panes = [railRef.current, listRef.current?.querySelector('.scroller'), document.querySelector('.reader')]
-        .filter(Boolean) as HTMLElement[];
+        .filter((p): p is HTMLElement => p instanceof HTMLElement && onScreen(p));
       if (panes.length === 0) return;
+      if (panes.length === 1 && panes[0].contains(document.activeElement)) return;
       const at = panes.findIndex((p) => p.contains(document.activeElement));
       const next = (at + (backwards ? -1 : 1) + panes.length) % panes.length;
       const target = panes[next];
@@ -1005,10 +1057,14 @@ export function App() {
     popOut: () => {
       // One window per conversation, so this takes the cursor's row rather
       // than the selection: opening eleven windows from one keystroke is not
-      // what anybody meant by it.
-      if (activeId == null) return;
+      // what anybody meant by it. By the row's conversation, as the reader's
+      // button and the row menu open it: the row's own id is its newest
+      // message, which the window took for a conversation and showed another
+      // one, or none.
+      const row = activeRef.current;
+      if (!row) return;
       void api
-        .popoutMessage(activeId)
+        .popoutMessage(row.thread_id)
         .catch((e) => setToast(t('popout-failed', { error: String(e) })));
     },
     undo: () => {
@@ -1091,7 +1147,18 @@ export function App() {
     openPalette: () => setPaletteOpen(true),
     openHelp: () => setHelpOpen(true),
     openSettings: () => setSettingsOpen('appearance'),
-    focusSearch: () => searchRef.current?.focus(),
+    focusSearch: () => {
+      // The field is in the list, which a reader filling the window hides:
+      // back to the list first, then into the field, as the palette's search
+      // does. `/` did nothing there.
+      if (fullReader || overlayOpen) {
+        setReaderOverlay(false);
+        setReaderFull(false);
+        requestAnimationFrame(() => searchRef.current?.focus());
+        return;
+      }
+      searchRef.current?.focus();
+    },
   });
 
   // The macOS menu bar, driving the same functions as everything above it. Its
@@ -1100,8 +1167,13 @@ export function App() {
   // pane.
   useAppMenu({
     newMessage: startCompose,
-    openSettings: () => setSettingsOpen('appearance'),
-    openHelp: () => setHelpOpen(true),
+    // Not over a dialog already up, as ⌘K is not: see `dialogOpen`.
+    openSettings: () => {
+      if (!dialogOpen()) setSettingsOpen('appearance');
+    },
+    openHelp: () => {
+      if (!dialogOpen()) setHelpOpen(true);
+    },
     // The same call ⌘F makes, guarded the same way: with no reading pane or
     // nothing open there is nothing to search, and a find bar that could never
     // match anything is worse than a menu item that declines.
@@ -1171,12 +1243,22 @@ export function App() {
   }, [query, view, viewName, status?.count, locale]);
 
   const active = useMemo(() => items.find((m) => m.id === activeId) ?? null, [items, activeId]);
+  useEffect(() => {
+    // The matches belonged to the conversation that just closed. Keyed on the
+    // conversation, not its row: a reply landing in it renumbers the row, and
+    // closed the bar under the person typing in it.
+    setFinding(false);
+  }, [active?.thread_id]);
   // With no reading pane, Enter opens the conversation over the list: the
   // window given to it, as reader-only gives it with the pane on. The overlay
   // had no layout of its own, and drew the message in the rail's column with
   // the list squeezed to nothing.
   const overlayOpen =
     settings.layout === 'off' && readerOverlay && active != null && !opensComposer(view);
+  // The pane's own full window: only while something is open. Filling the
+  // window with an empty reading pane would hide the list to show nothing.
+  const fullReader =
+    readerFull && active != null && settings.layout !== 'off' && !opensComposer(view);
   // Closed when nothing is left open in it: the last conversation archived
   // from under it, or one a sync took out of the list. At once, so it is never
   // left open with nothing in it, to spring back over whatever row is picked
@@ -1196,14 +1278,16 @@ export function App() {
   useEffect(() => setReaderOverlay(false), [view, query, settings.layout]);
   // Into the message as it opens there, and as J and K move it along: the list
   // is gone from the window, and focus left on it had nowhere to be. Never out
-  // of something being typed into — a reply open over it, a field, a dialog.
+  // of something being typed into — a reply open over it, a field, a dialog —
+  // and on moving to another conversation, not on a reply renumbering this
+  // one's row.
   useEffect(() => {
     if (!overlayOpen) return;
     const h = requestAnimationFrame(() => {
       if (focusIsFree()) document.querySelector<HTMLElement>('.reader-body')?.focus();
     });
     return () => cancelAnimationFrame(h);
-  }, [overlayOpen, active?.id]);
+  }, [overlayOpen, active?.thread_id]);
   const pickerIds = useMemo(
     () => pickerFor ?? targets(selected, activeId),
     [pickerFor, selected, activeId],
@@ -1977,6 +2061,13 @@ export function App() {
   // stop on is marked read without having to leave it.
   const autoRead = useRef<number | null>(null);
   const previousId = useRef<number | null>(null);
+  // The conversation open when a reply landed in it, until the reply is read
+  // or the conversation left: leaving it does not read what was never seen.
+  const replyUnseen = useRef<number | null>(null);
+  // What the open conversation has on screen opened, as the Reader says: a
+  // reply can reach the pane before the list catches up with it, and one the
+  // pane already showed has been seen.
+  const shown = useRef<{ thread: number | null; ids: Set<number> }>({ thread: null, ids: new Set() });
   const activeRef = useRef(active);
   activeRef.current = active;
   const itemsRef = useRef(items);
@@ -1991,6 +2082,18 @@ export function App() {
   // re-runs this, and the conversation then on screen is read as usual.
   const gathering = selected.size > 0;
   useEffect(() => {
+    // The same conversation under a new row (the follow above): a reply
+    // landed in it while it was open. That is staying, not arriving, so
+    // nothing is read — not on a dwell, and not on leaving later (see
+    // `replyUnseen`), since the reply has not been seen until its card is
+    // opened — and a hold on it holds on. Taken whatever happens below, so a
+    // later opening still counts as arriving.
+    const stayed =
+      activeRef.current != null && followed.current?.to === activeRef.current.id
+        ? followed.current
+        : null;
+    followed.current = null;
+    if (stayed) triageRef.current.carryHold(stayed.from, stayed.to);
     // With no reading pane, walking the list with J and K is not reading it;
     // a conversation opened over the list is. Closing it is leaving it, which
     // reads it as moving on to another does, however soon. Forgetting it then
@@ -2001,44 +2104,64 @@ export function App() {
       previousId.current = null;
       if (!gathering && leaving != null) {
         const row = itemsRef.current.find((m) => m.id === leaving);
-        if (row?.unread && !triageRef.current.isHeldUnread(leaving)) {
+        if (row?.unread && !triageRef.current.isHeldUnread(leaving) && replyUnseen.current !== leaving) {
           autoRead.current = leaving;
           void triageRef.current.run('mark_read', leaving, undefined, true);
         }
       }
+      if (replyUnseen.current === leaving) replyUnseen.current = null;
       return;
     }
     const current = activeRef.current;
-    const leaving = previousId.current;
-    previousId.current = current?.id ?? null;
+    if (stayed && current) {
+      previousId.current = current.id;
+      // Unless the pane already showed the reply, opened: then it has been
+      // seen, and reads on the dwell below as if it had arrived with it.
+      const seen = shown.current.thread === current.thread_id && shown.current.ids.has(current.newest.id);
+      if (!seen) {
+        replyUnseen.current = current.id;
+        return;
+      }
+    } else {
+      const leaving = previousId.current;
+      previousId.current = current?.id ?? null;
 
-    // The one you just left.
-    if (!gathering && leaving != null && leaving !== current?.id) {
-      const row = itemsRef.current.find((m) => m.id === leaving);
-      if (row?.unread && !triageRef.current.isHeldUnread(leaving)) {
-        autoRead.current = leaving;
-        void triageRef.current.run('mark_read', leaving, undefined, true);
+      // The one you just left.
+      if (leaving != null && leaving !== current?.id) {
+        if (!gathering) {
+          const row = itemsRef.current.find((m) => m.id === leaving);
+          if (row?.unread && !triageRef.current.isHeldUnread(leaving) && replyUnseen.current !== leaving) {
+            autoRead.current = leaving;
+            void triageRef.current.run('mark_read', leaving, undefined, true);
+          }
+        }
+        // Left, whether or not it was read on the way out: coming back to it
+        // is arriving, and reads it as any arrival does.
+        if (replyUnseen.current === leaving) replyUnseen.current = null;
+      }
+
+      // Arriving at a conversation that was being held unread ends the hold:
+      // you asked to come back to it, and this is coming back. Without this a
+      // conversation marked unread once could never be marked read by reading
+      // it again — and testing the rule by marking something unread first would
+      // look exactly like the rule being broken.
+      if (current && leaving !== current.id) {
+        triageRef.current.releaseHeldUnread(current.id);
       }
     }
 
-    // Arriving at a conversation that was being held unread ends the hold:
-    // you asked to come back to it, and this is coming back. Without this a
-    // conversation marked unread once could never be marked read by reading
-    // it again — and testing the rule by marking something unread first would
-    // look exactly like the rule being broken.
-    if (current && leaving !== current.id) {
-      triageRef.current.releaseHeldUnread(current.id);
-    }
-
-    // And the one you are on, if you stay.
+    // And the one you are on, if you stay — unless what is unread in it is a
+    // reply that landed while it was open, which waits to be opened.
     if (gathering || !current || autoRead.current === current.id) return;
+    if (replyUnseen.current === current.id) return;
     if (!current.unread) {
       autoRead.current = current.id;
       return;
     }
     const id = current.id;
     const h = setTimeout(() => {
-      if (triageRef.current.isHeldUnread(id)) return;
+      // Not twice: opening an unread card inside the dwell has read it.
+      if (triageRef.current.isHeldUnread(id) || autoRead.current === id) return;
       autoRead.current = id;
       void triageRef.current.run('mark_read', id, undefined, true);
     }, 900);
@@ -2353,10 +2476,7 @@ export function App() {
       <div
         className="shell"
         data-layout={
-          // Only while something is open. Filling the window with an empty
-          // reading pane would hide the list to show nothing.
-          (readerFull && active && settings.layout !== 'off' && !opensComposer(view)) ||
-          overlayOpen
+          fullReader || overlayOpen
             ? 'reader-only'
             : settings.layout === 'off'
               ? 'no-reader'
@@ -2935,6 +3055,21 @@ export function App() {
           view={view}
           onToast={setToast}
           later={later}
+          // Opening a message not yet read reads the conversation: how a reply
+          // that landed while it was open gets read once somebody opens it.
+          // The list row says whether anything is still unread; a card's own
+          // flag is from when the conversation was fetched.
+          onOpenUnread={() => {
+            const row = activeRef.current;
+            if (!row?.unread || triage.isHeldUnread(row.id)) return;
+            autoRead.current = row.id;
+            if (replyUnseen.current === row.id) replyUnseen.current = null;
+            void triage.run('mark_read', row.id, undefined, true);
+          }}
+          onShown={(thread, id) => {
+            if (shown.current.thread !== thread) shown.current = { thread, ids: new Set() };
+            shown.current.ids.add(id);
+          }}
           onComposeMailto={(to, subject) => {
             openComposer({
               to,

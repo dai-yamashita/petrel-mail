@@ -813,6 +813,10 @@ const mock = {
   },
   threadById: async (threadId: number): Promise<Thread | null> =>
     mockRows(500).find((r: Thread) => r.thread_id === threadId) ?? null,
+  threadInView: async (view: string, threadId: number): Promise<Thread | null> => {
+    void view;
+    return mockRows(500).find((r: Thread) => r.thread_id === threadId) ?? null;
+  },
   threadDetail: async (
     threadId: number,
     opts?: { limit?: number; beforeDateMs?: number; beforeId?: number },
@@ -893,6 +897,9 @@ const real = {
           : null,
     }),
   threadById: (threadId: number) => invoke<Thread | null>('thread_by_id', { threadId }),
+  /** One conversation as `view` lists it, or null when it has nothing there. */
+  threadInView: (view: string, threadId: number) =>
+    invoke<Thread | null>('thread_in_view', { view, threadId }),
   openExternal: (url: string) => invoke<void>('open_external', { url }),
   discoverAccount: (address: string) => invoke<Discovered | null>('discover_account', { address }),
   guessServers: (address: string) => invoke<[Server, Server] | null>('guess_servers', { address }),

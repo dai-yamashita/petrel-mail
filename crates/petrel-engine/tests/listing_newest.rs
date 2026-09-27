@@ -128,3 +128,152 @@ fn a_one_message_conversation_is_its_own_newest() {
     assert!(rows[0].newest.unread, "fresh mail is unread");
     assert_eq!(rows[0].newest.from_display, "Sam");
 }
+
+/// One conversation asked for by id within a view: the same row the view's
+/// listing gives it, so a list that asks after the open conversation this way
+/// cannot come to disagree with one that paged to it.
+mod in_view {
+    use super::*;
+
+    fn answered() -> (tempfile::TempDir, Store, BlobStore, i64, i64, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("petrel.db")).unwrap();
+        let blobs = BlobStore::open(&dir.path().join("blobs")).unwrap();
+        let account = store.ensure_test_account().unwrap();
+        let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+        let sent = store.ensure_folder(account, "sent", "Sent").unwrap();
+        let theirs = store
+            .ingest_raw(
+                &blobs,
+                account,
+                Some(inbox),
+                Some(1),
+                &msg(
+                    "Sam <sam@example.com>",
+                    "a@example.com",
+                    None,
+                    "Sat, 5 Sep 2026 10:00:00 +0000",
+                    "hello",
+                ),
+            )
+            .unwrap();
+        let mine = store
+            .ingest_raw(
+                &blobs,
+                account,
+                Some(sent),
+                Some(1),
+                &msg(
+                    "Me <me@example.com>",
+                    "b@example.com",
+                    Some("a@example.com"),
+                    "Sat, 5 Sep 2026 11:00:00 +0000",
+                    "my reply",
+                ),
+            )
+            .unwrap();
+        (dir, store, blobs, inbox, theirs.message_id, mine.message_id)
+    }
+
+    #[test]
+    fn is_the_row_the_view_lists_for_it() {
+        let (_dir, store, _blobs, _inbox, theirs, mine) = answered();
+        for view in ["inbox", "sent"] {
+            let listed = store
+                .list_threads(&ListView::parse(view), 0, 50, newest_first())
+                .unwrap();
+            let row = &listed[0];
+            let found = store
+                .thread_in_view(&ListView::parse(view), row.thread_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.id, row.id, "{view}: the view's own message");
+            assert_eq!(found.thread_id, row.thread_id);
+            assert_eq!(found.message_count, row.message_count);
+            assert_eq!(found.unread, row.unread);
+            assert_eq!(found.newest.id, row.newest.id);
+            assert_eq!(found.subject, row.subject);
+        }
+        let inbox_row = store
+            .thread_in_view(&ListView::parse("inbox"), thread_of(&store, theirs))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inbox_row.id, theirs,
+            "in the inbox, the other side's message"
+        );
+        assert_eq!(inbox_row.newest.id, mine, "its newest is still the reply");
+    }
+
+    #[test]
+    fn follows_a_reply_that_lands_in_the_view() {
+        let (_dir, mut store, blobs, inbox, theirs, _mine) = answered();
+        let thread = thread_of(&store, theirs);
+        let again = store
+            .ingest_raw(
+                &blobs,
+                store.active_account().unwrap().unwrap(),
+                Some(inbox),
+                Some(2),
+                &msg(
+                    "Sam <sam@example.com>",
+                    "c@example.com",
+                    Some("b@example.com"),
+                    "Sat, 5 Sep 2026 12:00:00 +0000",
+                    "and again",
+                ),
+            )
+            .unwrap();
+        let found = store
+            .thread_in_view(&ListView::parse("inbox"), thread)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.id, again.message_id,
+            "the row moves to the newest inbox message"
+        );
+        let listed = store
+            .list_threads(&ListView::parse("inbox"), 0, 50, newest_first())
+            .unwrap();
+        assert_eq!(listed[0].id, found.id, "as the listing has it");
+        // Counted within the view, as the listing counts: the reply in Sent
+        // belongs to the conversation, not to the inbox.
+        assert_eq!(found.message_count, listed[0].message_count);
+        assert_eq!(found.message_count, 2);
+    }
+
+    #[test]
+    fn has_nothing_for_a_conversation_outside_the_view() {
+        let (_dir, store, _blobs, _inbox, theirs, _mine) = answered();
+        let thread = thread_of(&store, theirs);
+        assert!(
+            store
+                .thread_in_view(&ListView::parse("trash"), thread)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .thread_in_view(&ListView::parse("inbox"), 987_654)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .thread_in_view(&ListView::parse("drafts"), thread)
+                .unwrap()
+                .is_none(),
+            "Drafts lists messages, not conversations"
+        );
+    }
+
+    fn thread_of(store: &Store, message_id: i64) -> i64 {
+        store
+            .list_threads(&ListView::parse("inbox"), 0, 50, newest_first())
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == message_id || r.newest.id == message_id)
+            .map(|r| r.thread_id)
+            .expect("the conversation is in the inbox")
+    }
+}

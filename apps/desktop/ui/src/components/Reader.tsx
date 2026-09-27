@@ -29,7 +29,7 @@ import {
   EXPANDED_ROW_ESTIMATE,
   keepExistingPane,
   nextExpanded,
-  olderCards,
+  pinnedSplit,
   previewCard,
 } from '../lib/reader-window';
 import { FindBar } from './FindBar';
@@ -351,6 +351,8 @@ export function Reader({
   onToast,
   later,
   onComposeMailto,
+  onOpenUnread,
+  onShown,
   extractionGen = 0,
 }: {
   thread: Thread | null;
@@ -371,6 +373,13 @@ export function Reader({
    *  window, which has no Undo to take; `onToast` answers there. */
   later?: () => (text: string) => void;
   onComposeMailto?: (to: string, subject: string) => void;
+  /** A message not yet read was opened: its card expanded by a click, or by
+   *  `[` and `]`. How a reply that landed while the conversation was open
+   *  gets read — when it is opened, not when it arrives. */
+  onOpenUnread?: () => void;
+  /** The messages on screen opened, for the conversation shown: a reply the
+   *  list catches up with after the pane already showed it has been seen. */
+  onShown?: (threadId: number, messageId: number) => void;
   /** Which view is open, so the destructive action can mean the right thing. */
   view: string;
   /** Reading pane has the window to itself. */
@@ -395,6 +404,9 @@ export function Reader({
   const [details, setDetails] = useState<Map<number, ThreadMessage>>(() => new Map());
   const [loadedThreadId, setLoadedThreadId] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
+  // The message that was the conversation's newest when it opened. It and
+  // everything after it are drawn below the virtual stack (see `pinned`).
+  const [pinFrom, setPinFrom] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Which message [ and ] move from. Separate from `expanded` because you can
   // have several open at once and still be reading one of them.
@@ -413,6 +425,10 @@ export function Reader({
   threadIdRef.current = thread?.thread_id;
   const detailsRef = useRef(details);
   detailsRef.current = details;
+  const onOpenUnreadRef = useRef(onOpenUnread);
+  onOpenUnreadRef.current = onOpenUnread;
+  const onShownRef = useRef(onShown);
+  onShownRef.current = onShown;
   const extractionGenRef = useRef(extractionGen);
 
   // With the other hooks, above the empty-pane early return: a hook called
@@ -509,6 +525,7 @@ export function Reader({
       setDetails(new Map());
       setExpanded(new Set([openId]));
       setFocused(openId);
+      setPinFrom(null);
       void api
         .threadMessage(openId)
         .then((fat) => {
@@ -529,6 +546,7 @@ export function Reader({
         if (!hold && last) {
           setExpanded(new Set([last.id]));
           setFocused(last.id);
+          setPinFrom(last.id);
         }
         api.log(`thread_index ok thread=${requested} messages=${index.length}`);
         if (!last) return;
@@ -617,12 +635,24 @@ export function Reader({
       const newestId = newestIdRef.current;
       setExpanded((prev) => nextExpanded({ prev, add: target.id, newestId }));
       hydrate(target.id);
+      if (target.unread) onOpenUnreadRef.current?.();
       const olderAt = olderRef.current.findIndex((m) => m.id === target.id);
       if (olderAt >= 0) {
         virtualizerRef.current?.scrollToIndex(olderAt, { align: 'auto' });
       } else {
-        document.getElementById(`msg-body-${target.id}`)?.scrollIntoView({
-          block: 'nearest',
+        // A card below the stack, found by the card rather than its body: a
+        // collapsed card has no body until this opens it, and a reply that
+        // landed below the message being read opened out of sight, thousands
+        // of pixels down, and was read there. After the render that opens it,
+        // and only when it starts off the screen or low on it.
+        requestAnimationFrame(() => {
+          const body = bodyRef.current;
+          const card = body?.querySelector<HTMLElement>(
+            `.reader-newest[data-msg="${target.id}"]`,
+          );
+          if (!body || !card) return;
+          const top = card.getBoundingClientRect().top - body.getBoundingClientRect().top;
+          if (top < 0 || top > body.clientHeight / 2) card.scrollIntoView({ block: 'start' });
         });
       }
     };
@@ -647,10 +677,13 @@ export function Reader({
       ? (cards.find((c) => c.id === conversationNewestId) ?? previewCard(thread))
       : previewCard(thread)
     : null;
-  const older =
+  const split =
     hold && conversationNewestId != null
-      ? olderCards({ index: cards, newestId: conversationNewestId })
-      : [];
+      ? pinnedSplit({ index: cards, newestId: conversationNewestId, pinFrom })
+      : null;
+  const older = split ? split.older : [];
+  // Drawn below the stack: see `pinnedSplit`.
+  const pinned = split && split.pinned.length > 0 ? split.pinned : newestCard ? [newestCard] : [];
   const newestExpanded = Boolean(thread && (!hold || (newestId != null && expanded.has(newestId))));
   const paintedExpanded =
     newestExpanded && newestId != null ? new Set([...expanded, newestId]) : expanded;
@@ -683,6 +716,16 @@ export function Reader({
   useEffect(() => {
     virtualizer.measure();
   }, [expanded, virtualizer]);
+
+  // What is on screen opened, said once per change rather than per render.
+  const shownThread = thread?.thread_id ?? null;
+  const shownIds = [...paintedExpanded].join(',');
+  useEffect(() => {
+    if (shownThread == null || !onShownRef.current) return;
+    for (const id of shownIds.split(',')) {
+      if (id) onShownRef.current(shownThread, Number(id));
+    }
+  }, [shownThread, shownIds]);
 
   // A new conversation starts with the row on screen. Older rows arriving
   // above it grow the stack; add that growth to scrollTop so the pinned
@@ -850,6 +893,7 @@ export function Reader({
                         nextExpanded({ prev, add: card.id, newestId }),
                       );
                       hydrate(card.id);
+                      if (card.unread) onOpenUnread?.();
                     }}
                   />
                 )}
@@ -857,16 +901,16 @@ export function Reader({
             );
           })}
         </div>
-        {newestCard && (
-          // Keyed by message so a change of newest, rare as it is, mounts a
-          // fresh card rather than handing one message's frame state to
-          // another.
-          <div className="reader-newest" key={newestCard.id}>
-            {newestExpanded ? (
+        {pinned.map((card) => (
+          // Keyed by message, each: a message joining these mounts a card of
+          // its own rather than taking over another's frame state, and the one
+          // being read keeps its frame when a reply lands after it.
+          <div className="reader-newest" key={card.id} data-msg={card.id}>
+            {paintedExpanded.has(card.id) ? (
               <Expanded
-                m={messageFromCard(newestCard, subject, details.get(newestCard.id))}
-                focused={focused === newestCard.id}
-                mountBody={mounted.has(newestCard.id)}
+                m={messageFromCard(card, subject, details.get(card.id))}
+                focused={focused === card.id}
+                mountBody={mounted.has(card.id)}
                 onReply={onReplyTo}
                 onForward={onForwardFrom}
                 onToast={onToast}
@@ -875,25 +919,24 @@ export function Reader({
                 onCollapse={() =>
                   setExpanded((prev) => {
                     const next = new Set(prev);
-                    next.delete(newestCard.id);
+                    next.delete(card.id);
                     return next;
                   })
                 }
               />
             ) : (
               <Collapsed
-                m={newestCard}
+                m={card}
                 onExpand={() => {
-                  setFocused(newestCard.id);
-                  setExpanded((prev) =>
-                    nextExpanded({ prev, add: newestCard.id, newestId }),
-                  );
-                  hydrate(newestCard.id);
+                  setFocused(card.id);
+                  setExpanded((prev) => nextExpanded({ prev, add: card.id, newestId }));
+                  hydrate(card.id);
+                  if (card.unread) onOpenUnread?.();
                 }}
               />
             )}
           </div>
-        )}
+        ))}
 
         {/* These answer the newest message, which is what the conversation's
             Reply means everywhere — the per-message controls in each header

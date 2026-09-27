@@ -448,5 +448,10 @@ export function useTriage(opts: {
      *  this way, and without it a conversation marked unread once could never
      *  be marked read by reading it. */
     releaseHeldUnread: (id: number) => heldUnread.current.delete(id),
+    /** Moves that request to the conversation's new row: a reply landing in
+     *  it gives the row a new id, and it is still the one asked about. */
+    carryHold: (from: number, to: number) => {
+      if (heldUnread.current.delete(from)) heldUnread.current.add(to);
+    },
   };
 }

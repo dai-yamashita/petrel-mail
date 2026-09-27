@@ -113,6 +113,24 @@ describe('every option', () => {
     }
   });
 
+  it('has a key of its own, even where two share an instant', () => {
+    // Sunday 23 August: Tomorrow and Next week are both Monday at 8. After
+    // 8pm on a weekday, Later today and Tomorrow are both tomorrow at 8. The
+    // picker keys its rows by `key`, so each still gets a row of its own.
+    for (const iso of ['2026-08-23T10:00:00', '2026-08-19T21:30:00']) {
+      const options = snoozeOptions(at(iso));
+      expect(new Set(options.map((o) => o.id)).size, iso).toBeLessThan(options.length);
+      expect(new Set(options.map((o) => o.key)).size, iso).toBe(options.length);
+    }
+  });
+
+  it('keeps its key as the clock moves, though Later today does not keep its instant', () => {
+    const a = snoozeOptions(at('2026-08-19T10:00:00'));
+    const b = snoozeOptions(at('2026-08-19T10:00:07'));
+    expect(b[0].id).not.toBe(a[0].id);
+    expect(b.map((o) => o.key)).toEqual(a.map((o) => o.key));
+  });
+
   it('shows the instant it resolves to, so the name is never the only clue', () => {
     for (const o of snoozeOptions(at('2026-08-19T10:00:00'))) {
       expect(o.detail, `${o.label} has no resolved time`).toBeTruthy();

@@ -99,6 +99,24 @@ pub fn thread_by_id(
     store.thread_by_id(thread_id).map_err(|e| e.to_string())
 }
 
+/// One conversation as a view lists it, found by its id.
+///
+/// For the list's open conversation when a fresh first page does not reach
+/// it: sorted by anything but newest first, a reply can take it past that
+/// page, and the row loaded for it would go stale or be taken for gone.
+#[tauri::command(async)]
+pub fn thread_in_view(
+    view: Option<String>,
+    thread_id: i64,
+    state: State<Arc<AppState>>,
+) -> Result<Option<ThreadListing>, String> {
+    let view = ListView::parse(view.as_deref().unwrap_or("inbox"));
+    let store = state.store_read()?;
+    store
+        .thread_in_view(&view, thread_id)
+        .map_err(|e| e.to_string())
+}
+
 /// The messages of one conversation, for the reading pane.
 ///
 /// Paged like the list: a hundred is the IPC cap, fifty is what the pane

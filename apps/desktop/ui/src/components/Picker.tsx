@@ -19,6 +19,13 @@ export type PickerOption = {
   /** For folders and tags this is a row id; for snooze it is the instant to
    *  come back at, which is the only thing that identifies the choice. */
   id: number;
+  /** The row's identity in the list, where `id` cannot be one. Two snooze
+   *  presets can resolve to the same instant — on a Sunday, Tomorrow and Next
+   *  week are both Monday at 8 — and Later today's instant moves every time
+   *  the list is rebuilt. Keyed by instant, the list lost one of the pair and
+   *  left a stale copy on screen, whose choice acted on what had been open
+   *  when it was drawn. */
+  key?: string;
   /** What the user reads. For a nested folder this is the full path. */
   label: string;
   /** Tag colour, when there is one. */
@@ -202,7 +209,7 @@ export function Picker({ open, mode, options, subject, onClose, onChoose, onCrea
               </div>
             ) : (
             <ComboboxItem
-              key={o.id}
+              key={o.key ?? o.id}
               className="picker-opt"
               // Only while browsing. Ranked and flat, an indent describes
               // nothing — a lone deep match would sit inset under a parent

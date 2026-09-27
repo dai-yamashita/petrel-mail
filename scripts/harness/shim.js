@@ -556,6 +556,15 @@
         return rows.filter(function (r) { return r.filed === view; });
       }
     },
+    // One conversation as the view lists it: the same row list_threads gives
+    // it, from the same model, or null when the view has none.
+    thread_in_view: function (a) {
+      var all = handlers.list_threads({ view: a.view });
+      for (var i = 0; i < all.length; i += 1) {
+        if (all[i].thread_id === a.threadId) return all[i];
+      }
+      return null;
+    },
     search_messages: function (a) {
       // Modelled, not stubbed: results have to carry why they matched, and the
       // ordering has to change when the sort does — a shim that returned the

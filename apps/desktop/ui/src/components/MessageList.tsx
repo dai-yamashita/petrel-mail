@@ -619,13 +619,31 @@ export const MessageList = memo(function MessageList({
   // `virtualizer` is a fresh object each render, so it must not decide whether
   // to run; when it did, the effect fired constantly and snapped the scroll
   // back to the active row, which reads as "the list will not scroll".
-  const lastScrolledFor = useRef<number | null>(null);
+  //
+  // A reply landing in the open conversation gives its row a new id, and the
+  // selection follows it there. That is the list changing under a selection
+  // that has not moved, so it scrolls nowhere: the same conversation, its old
+  // row gone in the same update. The old row still listed is a move to another
+  // message of the thread, which Drafts lists one by one; and with nothing
+  // open in between, whatever opens next is a move, even to the same
+  // conversation come back.
+  const lastScrolledFor = useRef<{ id: number; thread: number } | null>(null);
+  const lastItems = useRef(items);
   useEffect(() => {
-    if (activeId == null || activeIndex < 0) return;
-    if (activeId === lastScrolledFor.current) return;
-    lastScrolledFor.current = activeId;
+    const listChanged = lastItems.current !== items;
+    lastItems.current = items;
+    if (activeId == null) {
+      lastScrolledFor.current = null;
+      return;
+    }
+    if (activeIndex < 0) return;
+    const was = lastScrolledFor.current;
+    if (was?.id === activeId) return;
+    const thread = items[activeIndex].thread_id;
+    lastScrolledFor.current = { id: activeId, thread };
+    if (listChanged && was && was.thread === thread && !idIndex.has(was.id)) return;
     virtualizer.scrollToIndex(activeIndex, { align: 'auto' });
-  }, [activeId, activeIndex, virtualizer]);
+  }, [activeId, activeIndex, virtualizer, items, idIndex]);
 
   const virtualRows = virtualizer.getVirtualItems();
   const lastVisibleIndex =

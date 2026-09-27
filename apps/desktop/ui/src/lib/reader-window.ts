@@ -58,6 +58,29 @@ export function olderCards(args: {
   return args.index.filter((row) => row.id !== args.newestId);
 }
 
+/** Which cards go in the virtual stack and which are drawn below it.
+ *
+ *  Below it, each keyed by message so its frame stays put: the conversation's
+ *  newest, and once a reply lands while the conversation is open, every card
+ *  from `pinFrom` — the one that was newest when it opened — to the end. That
+ *  one moving into the stack rebuilt its frame: the reader jumped to the top of
+ *  the message being read, and its find marks and focus went with it. A
+ *  `pinFrom` not in the index, or not known yet, pins the newest alone. */
+export function pinnedSplit(args: {
+  index: readonly ThreadIndexRow[];
+  newestId: number;
+  pinFrom: number | null;
+}): { older: ThreadIndexRow[]; pinned: ThreadIndexRow[] } {
+  const at = args.pinFrom == null ? -1 : args.index.findIndex((row) => row.id === args.pinFrom);
+  if (at < 0) {
+    return {
+      older: olderCards({ index: args.index, newestId: args.newestId }),
+      pinned: args.index.filter((row) => row.id === args.newestId),
+    };
+  }
+  return { older: args.index.slice(0, at), pinned: args.index.slice(at) };
+}
+
 /** Clamp a requested page size to what thread_detail accepts. */
 export function clampThreadLimit(limit: number): number {
   if (!Number.isFinite(limit)) return THREAD_PAGE;

@@ -62,10 +62,11 @@ export function snoozeOptions(now: Date = new Date()): PickerOption[] {
     return `${d.toLocaleDateString(undefined, near ? { weekday: 'short' } : { weekday: 'short', day: 'numeric', month: 'short' })} ${time}`;
   };
 
+  // Each keeps its own key: two can share an instant (see PickerOption.key).
   return [
-    { id: later.getTime(), label: t('snooze-later'), detail: label(later) },
-    { id: tomorrow.getTime(), label: t('snooze-tomorrow'), detail: label(tomorrow) },
-    { id: weekend.getTime(), label: t('snooze-weekend'), detail: label(weekend) },
-    { id: nextWeek.getTime(), label: t('snooze-next-week'), detail: label(nextWeek) },
+    { id: later.getTime(), key: 'later', label: t('snooze-later'), detail: label(later) },
+    { id: tomorrow.getTime(), key: 'tomorrow', label: t('snooze-tomorrow'), detail: label(tomorrow) },
+    { id: weekend.getTime(), key: 'weekend', label: t('snooze-weekend'), detail: label(weekend) },
+    { id: nextWeek.getTime(), key: 'next-week', label: t('snooze-next-week'), detail: label(nextWeek) },
   ];
 }

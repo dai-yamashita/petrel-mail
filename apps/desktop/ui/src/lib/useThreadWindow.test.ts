@@ -10,6 +10,7 @@ import {
   mergeHead,
   pageMore,
   refreshHead,
+  renumbered,
   replaceLoadHasMore,
   runReplaceLoad,
   stillWanted,
@@ -170,6 +171,138 @@ describe('mergeHead', () => {
     const incoming = page([1, 3]);
     expect(mergeHead(prev, incoming, byDate).map((t) => t.thread_id)).toEqual([1, 3]);
   });
+
+  it('keeps the open conversation after the row it followed, whatever it now sorts by', () => {
+    // Oldest first: it sat 51st, between the rows dated 1098 and 1100.
+    const incoming = Array.from({ length: LIST_PAGE }, (_, i) =>
+      thread({ thread_id: i + 1, date_ms: 1000 + 2 * i }),
+    );
+    const asc = { byDate: true, ascending: true };
+    const held = thread({ thread_id: 500, date_ms: 1099 });
+    const prev = [...incoming.slice(0, 50), held, ...incoming.slice(50)];
+    expect(mergeHead(prev, incoming, asc, 500).indexOf(held)).toBe(50);
+    // A refresh later, with the reply's date written in: that date is past
+    // the page, and the row still stays where it was, not after the page.
+    const replied = { ...held, id: 5001, date_ms: 9_999 };
+    const prevReplied = [...incoming.slice(0, 50), replied, ...incoming.slice(50)];
+    const again = mergeHead(prevReplied, incoming, asc, 500);
+    expect(again.indexOf(replied)).toBe(50);
+    expect(again.length).toBe(LIST_PAGE + 1);
+    // Newest first, the same, inside the page's range.
+    const desc = [...incoming].reverse();
+    const prevDesc = [...desc.slice(0, 50), held, ...desc.slice(50)];
+    expect(mergeHead(prevDesc, desc, byDate, 500).indexOf(held)).toBe(50);
+    // By sender there is no range; it still stays where it was.
+    const bySender = { byDate: false, ascending: true };
+    expect(mergeHead(prevReplied, incoming, bySender, 500).indexOf(replied)).toBe(50);
+    // Told nothing, the range drops it, and a row past the page goes after it.
+    expect(mergeHead(prev, incoming, asc).includes(held)).toBe(false);
+    expect(mergeHead(prevReplied, incoming, asc).indexOf(replied)).toBe(LIST_PAGE);
+  });
+
+  it('follows no row a reply moved, up the page or past it', () => {
+    // Newest first, the open conversation last on the page. A new
+    // conversation pushes it off, and the row above it takes a reply and goes
+    // to the top: it stays at the bottom, after the row above that one.
+    const loaded = page(Array.from({ length: LIST_PAGE }, (_, i) => i + 1));
+    const open = loaded[LIST_PAGE - 1];
+    const above = loaded[LIST_PAGE - 2];
+    const arrived = thread({ thread_id: 900, date_ms: 30_000 });
+    const replied = { ...above, id: 9_999, date_ms: 20_000 };
+    const incoming = [arrived, replied, ...loaded.slice(0, LIST_PAGE - 2)];
+    const merged = mergeHead(loaded, incoming, byDate, open.thread_id);
+    expect(merged.indexOf(open)).toBe(LIST_PAGE);
+    expect(merged[LIST_PAGE - 1].thread_id).toBe(loaded[LIST_PAGE - 3].thread_id);
+    // By sender, the row right above it took a reply that sorts past the
+    // page. With no range, its old row stays in the tail under its old id;
+    // the open one does not follow it there.
+    const bySender = { byDate: false, ascending: true };
+    const prev = [...loaded.slice(0, 50), thread({ thread_id: 500 }), ...loaded.slice(50)];
+    const fresh = [...loaded.slice(0, 49), ...loaded.slice(50), thread({ thread_id: 777 })];
+    const tail = mergeHead(prev, fresh, bySender, 500);
+    expect(tail.findIndex((t) => t.thread_id === 500)).toBe(49);
+    expect(tail[48].thread_id).toBe(loaded[48].thread_id);
+    expect(tail[tail.length - 1]).toBe(loaded[49]);
+  });
+
+  it('keeps to the tail when the rows after it went past the page too', () => {
+    // A short window, the open conversation 55th, and 50 new conversations at
+    // once: it and its neighbours are past the page now, still in order, and
+    // J from it reaches the row that was after it.
+    const old = Array.from({ length: 60 }, (_, i) => thread({ thread_id: i + 1, date_ms: 5_000 - i }));
+    const arrived = Array.from({ length: 50 }, (_, i) =>
+      thread({ thread_id: 1_000 + i, date_ms: 90_000 - i }),
+    );
+    const merged = mergeHead(old, [...arrived, ...old.slice(0, 50)], byDate, old[54].thread_id);
+    const at = merged.indexOf(old[54]);
+    expect(merged[at - 1]).toBe(old[53]);
+    expect(merged[at + 1]).toBe(old[55]);
+  });
+
+  it('takes its place from the tail when the page no longer lists anything above it', () => {
+    // A short window, the open conversation eleventh, and more than a page of
+    // new mail at once: every row it followed is past the page now.
+    const old = Array.from({ length: 20 }, (_, i) => thread({ thread_id: i + 1, date_ms: 5_000 - i }));
+    const incoming = Array.from({ length: LIST_PAGE }, (_, i) =>
+      thread({ thread_id: 1_000 + i, date_ms: 90_000 - i }),
+    );
+    const merged = mergeHead(old, incoming, byDate, old[10].thread_id);
+    const at = merged.indexOf(old[10]);
+    expect(merged[at - 1]).toBe(old[9]);
+    expect(merged[at + 1]).toBe(old[11]);
+  });
+
+  it('goes to the top when nothing it followed is still listed', () => {
+    const incoming = page(Array.from({ length: LIST_PAGE }, (_, i) => i + 1));
+    const held = thread({ thread_id: 500, date_ms: 20_000 });
+    const gone = thread({ thread_id: 900, date_ms: 19_000 });
+    expect(mergeHead([gone, held], incoming, byDate, 500)[0]).toBe(held);
+  });
+
+  it('leaves the open conversation in the tail, in order, further down than the page', () => {
+    // Newest first, page 2: the row above it took a reply and went to the
+    // top. It stays among the rows around it rather than following.
+    const loaded = page(Array.from({ length: LIST_PAGE }, (_, i) => i + 1));
+    const edge = loaded[loaded.length - 1].date_ms;
+    const above = thread({ thread_id: 800, date_ms: edge - 1 });
+    const open = thread({ thread_id: 801, date_ms: edge - 2 });
+    const below = thread({ thread_id: 802, date_ms: edge - 3 });
+    const incoming = [{ ...above, id: 8000, date_ms: 20_000 }, ...loaded.slice(0, LIST_PAGE - 1)];
+    const merged = mergeHead([...loaded, above, open, below], incoming, byDate, 801);
+    expect(merged.slice(LIST_PAGE).map((t) => t.thread_id)).toEqual([LIST_PAGE, 801, 802]);
+    expect(merged[0].thread_id).toBe(800);
+  });
+});
+
+describe('renumbered', () => {
+  it('names the new row of a conversation a reply landed in', () => {
+    const open = thread({ thread_id: 7, id: 70 });
+    const other = thread({ thread_id: 8, id: 80 });
+    const replied = thread({ thread_id: 7, id: 71 });
+    expect([...renumbered([open, other], [replied, other])]).toEqual([[70, 71]]);
+  });
+
+  it('follows a reply the head merge brings in', () => {
+    const byDate = { byDate: true, ascending: false };
+    const prev = [thread({ thread_id: 5, id: 50 }), thread({ thread_id: 6, id: 60 })];
+    const reply = thread({ thread_id: 6, id: 61, date_ms: 9_000_000 });
+    const merged = mergeHead(prev, [reply, prev[0]], byDate);
+    expect([...renumbered(prev, merged)]).toEqual([[60, 61]]);
+  });
+
+  it('leaves a row alone while its id is still listed', () => {
+    const a = thread({ thread_id: 1, id: 10 });
+    const b = thread({ thread_id: 2, id: 20 });
+    expect(renumbered([a, b], [b, a]).size).toBe(0);
+    expect(renumbered([a, b], [{ ...a, unread: true }, b]).size).toBe(0);
+  });
+
+  it('has nothing for a conversation that left the list, or one new to it', () => {
+    const gone = thread({ thread_id: 1, id: 10 });
+    const stays = thread({ thread_id: 2, id: 20 });
+    const fresh = thread({ thread_id: 3, id: 30 });
+    expect(renumbered([gone, stays], [stays, fresh]).size).toBe(0);
+  });
 });
 
 describe('runReplaceLoad', () => {
@@ -272,6 +405,7 @@ function recordingSink(initial: Thread[]) {
       items = typeof next === 'function' ? next(items) : next;
     },
     setHasMore: vi.fn(),
+    setPageEnd: vi.fn(),
     bumpReplace: vi.fn(),
     failed: (e) => failures.push(e),
   };
@@ -328,13 +462,16 @@ describe('refreshHead', () => {
 
   it('folds a fresh page into the head when it arrives', async () => {
     const { sink, rows, failures } = recordingSink(loaded);
+    const only = thread({ thread_id: 3 });
     const fetchers: ThreadFetchers = {
-      threads: async () => [thread({ thread_id: 3 })],
+      threads: async () => [only],
       search: async () => [],
     };
     await refreshHead(fetchers, 'inbox', DEFAULT_SORT, () => true, sink);
     expect(rows().map((r) => r.thread_id)).toEqual([3]);
     expect(failures).toEqual([]);
+    // A short page is the whole view, so it is where the next page starts.
+    expect(sink.setPageEnd).toHaveBeenCalledWith(only);
   });
 
   it('drops an answer, and a failure, for a window since replaced', async () => {
@@ -354,6 +491,130 @@ describe('refreshHead', () => {
   });
 });
 
+describe('refreshHead and the open conversation', () => {
+  // A full page, oldest first: dates 1000, 1002 .. 1198.
+  const page = Array.from({ length: LIST_PAGE }, (_, i) =>
+    thread({ thread_id: i + 1, id: i + 1, date_ms: 1000 + 2 * i }),
+  );
+  const oldestFirst = { key: 'date' as const, ascending: true };
+  const bySender = { key: 'sender' as const, ascending: true };
+  // Between the rows dated 1098 and 1100: the 51st row.
+  const openRow = thread({ thread_id: 500, id: 5000, date_ms: 1099 });
+
+  it('asks after it when a reply carries it past the page, and keeps its place', async () => {
+    const { sink, rows } = recordingSink([...page.slice(0, 50), openRow, ...page.slice(50)]);
+    const reply = thread({ thread_id: 500, id: 5001, date_ms: 9_999, message_count: 2 });
+    const threadInView = vi.fn(async () => reply);
+    await refreshHead(
+      { threads: async () => page, search: async () => [], threadInView },
+      'inbox', oldestFirst, () => true, sink, () => 500,
+    );
+    expect(threadInView).toHaveBeenCalledWith('inbox', 500);
+    expect(rows().findIndex((r) => r.thread_id === 500)).toBe(50);
+    expect(rows()[50].id).toBe(5001);
+    expect(rows().filter((r) => r.thread_id === 500).length).toBe(1);
+    // The next page is still asked for after the page's own last row, not
+    // after the reply's date, which is the newest in the view.
+    expect(sink.setPageEnd).not.toHaveBeenCalled();
+  });
+
+  it('keeps its place on the next refresh too, while it is still open', async () => {
+    const { sink, rows } = recordingSink([...page.slice(0, 50), openRow, ...page.slice(50)]);
+    const reply = thread({ thread_id: 500, id: 5001, date_ms: 9_999, message_count: 2 });
+    const fetchers = { threads: async () => page, search: async () => [], threadInView: async () => reply };
+    await refreshHead(fetchers, 'inbox', oldestFirst, () => true, sink, () => 500);
+    await refreshHead(fetchers, 'inbox', oldestFirst, () => true, sink, () => 500);
+    expect(rows().findIndex((r) => r.thread_id === 500)).toBe(50);
+    // Once another conversation is open, it goes where its date puts it:
+    // past this page, after it.
+    await refreshHead(fetchers, 'inbox', oldestFirst, () => true, sink, () => 1);
+    expect(rows().findIndex((r) => r.thread_id === 500)).toBe(LIST_PAGE);
+  });
+
+  it('never takes the next page from the row it keeps, even when that row is last', async () => {
+    const last = thread({ thread_id: 500, id: 5000, date_ms: 1197 });
+    const { sink, rows } = recordingSink([...page.slice(0, 99), last]);
+    const reply = thread({ thread_id: 500, id: 5001, date_ms: 9_999, message_count: 2 });
+    await refreshHead(
+      { threads: async () => page, search: async () => [], threadInView: async () => reply },
+      'inbox', oldestFirst, () => true, sink, () => 500,
+    );
+    expect(rows()[rows().length - 1].thread_id).toBe(100);
+    expect(rows()[99].id).toBe(5001);
+    expect(sink.setPageEnd).not.toHaveBeenCalled();
+  });
+
+  it('lets it go when the view no longer has it', async () => {
+    const { sink, rows } = recordingSink([...page, openRow]);
+    await refreshHead(
+      { threads: async () => page, search: async () => [], threadInView: async () => null },
+      'inbox', bySender, () => true, sink, () => 500,
+    );
+    expect(rows().some((r) => r.thread_id === 500)).toBe(false);
+  });
+
+  it('asks after it newest first too, where the page does not reach it', async () => {
+    const newest = Array.from({ length: LIST_PAGE }, (_, i) =>
+      thread({ thread_id: i + 1, id: i + 1, date_ms: 2000 - i }),
+    );
+    // Further down than the page: your own reply, filed in Sent, changed the
+    // conversation's newest without moving its row.
+    const below = thread({ thread_id: 500, id: 5000, date_ms: 1800 });
+    const withReply = { ...below, message_count: 2, newest: { ...below.newest, id: 7000 } };
+    const past = recordingSink([...newest, thread({ thread_id: 600, date_ms: 1850 }), below]);
+    const asked = vi.fn(async () => withReply);
+    await refreshHead(
+      { threads: async () => newest, search: async () => [], threadInView: asked },
+      'inbox', DEFAULT_SORT, () => true, past.sink, () => 500,
+    );
+    expect(asked).toHaveBeenCalledWith('inbox', 500);
+    expect(past.rows().findIndex((r) => r.thread_id === 500)).toBe(LIST_PAGE + 1);
+    expect(past.rows()[LIST_PAGE + 1].newest.id).toBe(7000);
+    // Inside the page's range and not on it: gone from the view, and the
+    // answer says so.
+    const gone = thread({ thread_id: 500, id: 5000, date_ms: 1950 });
+    const inside = recordingSink([...newest, gone]);
+    await refreshHead(
+      { threads: async () => newest, search: async () => [], threadInView: async () => null },
+      'inbox', DEFAULT_SORT, () => true, inside.sink, () => 500,
+    );
+    expect(inside.rows().some((r) => r.thread_id === 500)).toBe(false);
+  });
+
+  it('does not ask when the page is the whole view, or already lists it', async () => {
+    const threadInView = vi.fn(async () => null);
+    const short = recordingSink([openRow]);
+    await refreshHead(
+      { threads: async () => [thread({ thread_id: 1 })], search: async () => [], threadInView },
+      'inbox', oldestFirst, () => true, short.sink, () => 500,
+    );
+    const listed = recordingSink(page);
+    await refreshHead(
+      { threads: async () => page, search: async () => [], threadInView },
+      'inbox', oldestFirst, () => true, listed.sink, () => 1,
+    );
+    expect(threadInView).not.toHaveBeenCalled();
+  });
+
+  it('drops the answer for a window since replaced', async () => {
+    const before = [...page, openRow];
+    const { sink, rows } = recordingSink(before);
+    let live = true;
+    await refreshHead(
+      {
+        threads: async () => page,
+        search: async () => [],
+        threadInView: async () => {
+          live = false;
+          return thread({ thread_id: 500, id: 5001, date_ms: 9_999 });
+        },
+      },
+      'inbox', oldestFirst, () => live, sink, () => 500,
+    );
+    expect(rows().find((r) => r.thread_id === 500)?.id).toBe(5000);
+  });
+});
+
 describe('pageMore', () => {
   const loaded = Array.from({ length: LIST_PAGE }, (_, i) => thread({ thread_id: i + 1 }));
 
@@ -370,12 +631,34 @@ describe('pageMore', () => {
 
   it('appends the page and notes the end of the list', async () => {
     const { sink, rows } = recordingSink(loaded);
+    const next = thread({ thread_id: LIST_PAGE + 1 });
     await pageMore(
-      { threads: async () => [thread({ thread_id: LIST_PAGE + 1 })], search: async () => [] },
+      { threads: async () => [next], search: async () => [] },
       'inbox', DEFAULT_SORT, loaded[loaded.length - 1], () => true, sink,
     );
     expect(rows().length).toBe(LIST_PAGE + 1);
     expect(sink.setHasMore).toHaveBeenCalledWith(false);
+    expect(sink.setPageEnd).toHaveBeenCalledWith(next);
+  });
+
+  it('takes the next page from the last row a page delivered, even one already listed', async () => {
+    // The page's last row is a conversation the window already has, so it is
+    // not appended; the page still ended there.
+    const listed = loaded[3];
+    const { sink, rows } = recordingSink(loaded);
+    await pageMore(
+      { threads: async () => [thread({ thread_id: LIST_PAGE + 1 }), listed], search: async () => [] },
+      'inbox', DEFAULT_SORT, loaded[loaded.length - 1], () => true, sink,
+    );
+    expect(rows().length).toBe(LIST_PAGE + 1);
+    expect(sink.setPageEnd).toHaveBeenCalledWith(listed);
+    // An empty page moves nothing.
+    const empty = recordingSink(loaded);
+    await pageMore(
+      { threads: async () => [], search: async () => [] },
+      'inbox', DEFAULT_SORT, loaded[loaded.length - 1], () => true, empty.sink,
+    );
+    expect(empty.sink.setPageEnd).not.toHaveBeenCalled();
   });
 
   it('drops a page for a window since replaced', async () => {

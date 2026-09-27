@@ -47,6 +47,20 @@ function modalOpen(): boolean {
   return document.querySelector('[role="dialog"]:not([hidden]), [role="menu"]:not([hidden])') !== null;
 }
 
+/** A modal dialog is up — Settings, a picker, a confirmation: something that
+ *  holds the pointer and the keys until it closes, so another dialog cannot
+ *  usefully open over it. Ariakit marks its dialogs no differently from its
+ *  popovers, but while a modal one is open it makes the rest of the page
+ *  inert, which a menu or a popover never does, and nothing else here does.
+ *  Two open at once each made the other inert: neither took a click, and
+ *  Escape closed neither. */
+export function dialogOpen(): boolean {
+  return (
+    document.querySelector('[role="dialog"]:not([hidden])') !== null &&
+    document.querySelector('[inert]') !== null
+  );
+}
+
 /** Where a keystroke means text, not a command. */
 function isTyping(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
@@ -129,8 +143,19 @@ export function useKeyboard(actions: KeyActions) {
       if (mod) {
         if (!e.altKey) {
           const k = e.key.toLowerCase();
-          if (k === 'k') return e.preventDefault(), a.openPalette();
-          if (k === ',') return e.preventDefault(), a.openSettings();
+          // Not over another dialog. The palette opened on top of Settings
+          // there, where the dialog underneath held the pointer and Enter did
+          // nothing; and with the palette itself already open, it is open.
+          if (k === 'k') {
+            e.preventDefault();
+            if (!dialogOpen()) a.openPalette();
+            return;
+          }
+          if (k === ',') {
+            e.preventDefault();
+            if (!dialogOpen()) a.openSettings();
+            return;
+          }
           if (/^[1-9]$/.test(e.key)) {
             // Not from inside a composer being typed in. Switching saves and
             // closes the draft, but a recipient still being typed lives in
