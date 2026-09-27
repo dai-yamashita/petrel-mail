@@ -1,7 +1,9 @@
 import { useEffect, useRef } from 'react';
 
 export type KeyActions = {
-  openConversation: () => void;
+  /** `rowPressed`: the Enter was on a row of the list, which Ariakit has
+   *  already pressed as a click — selecting it, and in Drafts resuming it. */
+  openConversation: (rowPressed: boolean) => void;
   backToList: () => void;
   cyclePanes: (backwards: boolean) => void;
   goTo: (view: string) => void;
@@ -67,15 +69,32 @@ function isTyping(target: EventTarget | null): boolean {
  *  guarded controls.
  *
  *  Menu items are included for completeness; Ariakit's own handler takes those
- *  first, because a menu makes `modalOpen()` true. */
+ *  first, because a menu makes `modalOpen()` true. Options too: the composer's
+ *  font and size lists are listboxes, not menus, so Enter on one of their
+ *  options came through as "open the conversation" — which in Drafts reloaded
+ *  the draft under the person typing it. The message list's own rows are
+ *  options as well, and `listRow` answers for them first. */
 function activatable(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   return (
     el?.closest?.(
       'button, a[href], summary, [role="button"], [role="link"], [role="menuitem"],' +
-        ' [role="menuitemradio"], [role="menuitemcheckbox"], [role="checkbox"], [role="tab"]',
+        ' [role="menuitemradio"], [role="menuitemcheckbox"], [role="checkbox"], [role="tab"],' +
+        ' [role="option"]',
     ) != null
   );
+}
+
+/** True when the Enter is on a row of the message list itself.
+ *
+ *  A row is a button to the DOM, so `activatable` counted it as answering
+ *  Enter on its own — and it does, but only as a click: Ariakit presses the
+ *  active row, which selects it. Selecting is not opening. With the reading
+ *  pane off, Enter is the only way to see a message at all, and it did
+ *  nothing. The row itself only; a control inside a row keeps its own Enter. */
+function listRow(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  return el?.matches?.('.row[role="option"]') ?? false;
 }
 
 const GOTO: Record<string, string> = {
@@ -267,11 +286,15 @@ export function useKeyboard(actions: KeyActions) {
           chord.current = { key: 'g', at: Date.now() };
           return;
         case 'Enter':
+          if (listRow(e.target)) {
+            e.preventDefault();
+            return a.openConversation(true);
+          }
           // The list's own Enter, only when the focus is not on something that
           // has an Enter of its own.
           if (activatable(e.target)) return;
           e.preventDefault();
-          return a.openConversation();
+          return a.openConversation(false);
         case 'u':
         case 'U':
           e.preventDefault();

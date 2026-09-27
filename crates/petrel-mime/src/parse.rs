@@ -170,9 +170,9 @@ fn embed_pictures(html: &str, pictures: &[QuotedPicture]) -> String {
     let resolved = crate::sanitize::resolve_cids(html, &parts, |i| {
         data_url(&pictures[i].mime, &pictures[i].bytes)
     });
-    resolved
-        .replace("src=\"cid:", "data-cid=\"")
-        .replace("src='cid:", "data-cid='")
+    // Double-quoted only, for `resolve_cids`' reason: a single-quoted form is
+    // never an attribute of sanitized HTML, only text inside one.
+    resolved.replace("src=\"cid:", "data-cid=\"")
 }
 
 /// The way out of a mailing list, as the message itself declares it.
@@ -1663,5 +1663,46 @@ Content-ID: <{cid}>\r\n\r\n{PNG}\r\n"
         let raw = message(&picture("photo@x", "image/jpg"));
         let out = embed_cid_images(r#"<img src="cid:photo@x">"#, &raw);
         assert!(out.contains("data:image/jpeg;base64,"), "{out}");
+    }
+
+    /// Text inside an attribute that reads like a picture source stays text.
+    /// The single-quoted rewrite wrote a `"` into it that closed the
+    /// attribute early and handed the quote whatever followed — here a remote
+    /// picture, which an unedited reply then carried to everyone on it: the
+    /// person replying made the tracker's delivery.
+    #[test]
+    fn text_inside_an_attribute_cannot_become_a_picture_source() {
+        let raw = message(&picture("pic1", "image/png"));
+        let sanitized = crate::sanitize_html(
+            r#"<img alt="a ='cid:pic1' src=https://remote.example/p.gif z=" src="cid:pic1">"#,
+            false,
+        );
+        assert_eq!(
+            sanitized.report.blocked_remote, 0,
+            "the premise: it is text"
+        );
+        let out = embed_cid_images(&sanitized.html, &raw);
+        assert_eq!(
+            out,
+            sanitized.html.replace(
+                r#"src="cid:pic1""#,
+                &format!(r#"src="data:image/png;base64,{PNG}""#)
+            )
+        );
+        // Read back as the recipient's client would: no remote picture.
+        assert_eq!(crate::sanitize_html(&out, false).report.blocked_remote, 0);
+    }
+
+    /// And a leftover cid named only inside another attribute's text is left
+    /// as that text; only the real `src` is taken out.
+    #[test]
+    fn a_leftover_cid_inside_attribute_text_stays_text() {
+        let raw = message(&picture("logo@x", "image/png"));
+        let html = r#"<img alt="src='cid:gone@x' onerror=x" src="cid:gone@x">"#;
+        let out = embed_cid_images(html, &raw);
+        assert_eq!(
+            out,
+            r#"<img alt="src='cid:gone@x' onerror=x" data-cid="gone@x">"#
+        );
     }
 }

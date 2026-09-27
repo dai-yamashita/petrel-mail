@@ -1525,8 +1525,50 @@ impl Store {
             )
             .ok();
 
+        // A row the composer owns — a draft being written here, or post
+        // waiting in the outbox — is its own authority for what it says. Its
+        // pushed copy comes back through ordinary folder sync and lands here
+        // by Message-ID, and taking that copy's subject and recipients for the
+        // row's own reverted every edit made since the push: a Send Later went
+        // to the recipient who had been removed, under the subject that had
+        // been replaced. From such a copy the row takes what describes the
+        // copy itself — its bytes, where it sits, the conversation its
+        // references name — and nothing the composer writes. A revision saved
+        // by another client arrives as a second copy and is offered as a
+        // conflict instead (`draft_conflict`). `Some` holds the row's own
+        // subject, which threading reads in place of the copy's.
+        let composer_subject: Option<String> = match existing {
+            Some(id) => tx
+                .query_row(
+                    &format!(
+                        "SELECT coalesce(m.subject, '') FROM messages m
+                          WHERE m.id = ?1 AND NOT ({})",
+                        folders::NOT_DRAFT_OR_OUTBOX
+                    ),
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        let composer_owned = composer_subject.is_some();
+
         let date_ms = parsed.date_ms.unwrap_or(0);
         let id = match existing {
+            Some(id) if composer_owned => {
+                tx.execute(
+                    "UPDATE messages SET blob_hash = ?2, blob_kind = 'raw', size = ?3,
+                        has_attachments = ?4, deleted_at_ms = NULL
+                     WHERE id = ?1",
+                    params![id, hash, raw.len() as i64, !parsed.attachments.is_empty()],
+                )?;
+                tx.execute("DELETE FROM attachments WHERE message_id = ?1", params![id])?;
+                tx.execute(
+                    "DELETE FROM message_refs WHERE message_id = ?1",
+                    params![id],
+                )?;
+                id
+            }
             Some(id) => {
                 // `deleted_at_ms` cleared: the server just handed this
                 // message back, so whatever tombstoned it — a folder pruned
@@ -1586,12 +1628,14 @@ impl Store {
         };
 
         {
-            let mut ins_addr = tx.prepare_cached(
-                "INSERT INTO message_addresses(message_id, role, addr_norm, display)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (role, addr, name) in parsed.addresses() {
-                ins_addr.execute(params![id, role, addr, name])?;
+            if !composer_owned {
+                let mut ins_addr = tx.prepare_cached(
+                    "INSERT INTO message_addresses(message_id, role, addr_norm, display)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?;
+                for (role, addr, name) in parsed.addresses() {
+                    ins_addr.execute(params![id, role, addr, name])?;
+                }
             }
 
             let mut ins_att = tx.prepare_cached(
@@ -1631,8 +1675,10 @@ impl Store {
             }
         }
 
-        let subject_norm =
-            crate::threading::normalize_subject(parsed.subject.as_deref().unwrap_or(""));
+        let subject_norm = crate::threading::normalize_subject(match &composer_subject {
+            Some(own) => own.as_str(),
+            None => parsed.subject.as_deref().unwrap_or(""),
+        });
         // The nearest ancestors, and no more of them. References grows by one
         // id per reply and nothing trims it: a long-running list thread
         // arrived carrying 32,771 of them, and the ancestor lookup binds one
@@ -1651,21 +1697,43 @@ impl Store {
             date_ms,
         )?;
 
-        // Same transaction as the message row: the anti-drift invariant.
-        tx.execute(
-            "INSERT INTO fts_content(message_id, subject, body_text, addrs, attachment_names)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(message_id) DO UPDATE SET
-                subject = excluded.subject, body_text = excluded.body_text,
-                addrs = excluded.addrs, attachment_names = excluded.attachment_names",
-            params![
-                id,
-                parsed.subject.clone().unwrap_or_default(),
-                index_text,
-                addrs_text,
-                attachment_names
-            ],
-        )?;
+        // Same transaction as the message row: the anti-drift invariant. A
+        // row the composer owns keeps the entry its last save wrote, which is
+        // what it says; the copy's text is what it said at the push.
+        if !composer_owned {
+            tx.execute(
+                "INSERT INTO fts_content(message_id, subject, body_text, addrs, attachment_names)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(message_id) DO UPDATE SET
+                    subject = excluded.subject, body_text = excluded.body_text,
+                    addrs = excluded.addrs, attachment_names = excluded.attachment_names",
+                params![
+                    id,
+                    parsed.subject.clone().unwrap_or_default(),
+                    index_text,
+                    addrs_text,
+                    attachment_names
+                ],
+            )?;
+        } else {
+            // Unless it has none. Deleting forever takes the entry with the
+            // tombstone, and a copy landing after that — the drain's expunge
+            // racing a watched folder's fetch — makes the row live again, and
+            // live with no entry is drift nothing repairs: the re-extraction
+            // walk leaves these rows alone. Rebuilt from what the row says,
+            // as its saves write it.
+            tx.execute(
+                "INSERT INTO fts_content(message_id, subject, body_text, addrs, attachment_names)
+                 SELECT m.id, coalesce(m.subject, ''), coalesce(m.draft_body, ''),
+                        coalesce((SELECT group_concat(a.addr_norm, ' ')
+                                    FROM message_addresses a
+                                   WHERE a.message_id = m.id AND a.role IN ('to', 'cc')), ''),
+                        ''
+                   FROM messages m WHERE m.id = ?1
+                 ON CONFLICT(message_id) DO NOTHING",
+                params![id],
+            )?;
+        }
         tx.commit()?;
 
         Ok(Ingested {

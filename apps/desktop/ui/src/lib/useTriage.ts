@@ -136,6 +136,11 @@ export function useTriage(opts: {
   // While a batch runs, each row's undo offer is collected here instead of
   // becoming the toast, so the batch can offer them all at once.
   const collecting = useRef<UndoOffer[] | null>(null);
+  // Batches running, each from its first row to its last. `pending` is each
+  // row's, and it drops between one row and the next, where a render can
+  // land: the pane-off reader, seeing nothing open there, closed on a batch
+  // half done. A count, so one batch ending does not speak for another.
+  const [batches, setBatches] = useState(0);
   // Rows a batch put back because the store found nothing to act on. The
   // batch says so once, rather than once per row.
   const notApplied = useRef(0);
@@ -345,10 +350,14 @@ export function useTriage(opts: {
       const offers: UndoOffer[] = [];
       collecting.current = offers;
       notApplied.current = 0;
+      setBatches((n) => n + 1);
       try {
         for (const id of ids) await run(kind, id, targetId);
       } finally {
         collecting.current = null;
+        // In the same turn as the cursor's last move below, so no render sees
+        // the batch over with the cursor still on a row it took.
+        setBatches((n) => n - 1);
       }
       const [first, ...rest] = offers;
       if (!first) {
@@ -416,7 +425,19 @@ export function useTriage(opts: {
     runMany,
     undo,
     pending,
+    /** A batch is running, from its first row to its last. */
+    batching: batches > 0,
     hasUndo: () => lastUndo.current != null,
+    /** Ends the window for undoing the last action: something else was done
+     *  since, and Z or the button undoing the action before it — an archive
+     *  under "Will send tomorrow" — is undoing the wrong thing. */
+    forgetUndo: () => {
+      lastUndo.current = null;
+    },
+    /** What Z would undo right now, as a token. An answer that comes back
+     *  later compares it with the one taken when it was asked for, to tell
+     *  whether anything undoable was done in between. */
+    undoMark: (): unknown => lastUndo.current,
     /** Whether the user asked for this conversation to stay unread. */
     isHeldUnread: (id: number) => heldUnread.current.has(id),
     /** Forgets that request, once the user opens the conversation again.

@@ -98,6 +98,7 @@ function Expanded({
   onReply,
   onForward,
   onToast,
+  later,
   onComposeMailto,
 }: {
   m: ThreadMessage;
@@ -107,6 +108,7 @@ function Expanded({
   onReply?: (messageId: number, all: boolean) => void;
   onForward?: (messageId: number) => void;
   onToast: (text: string) => void;
+  later?: () => (text: string) => void;
   onComposeMailto?: (to: string, subject: string) => void;
 }) {
   return (
@@ -181,6 +183,7 @@ function Expanded({
             messageId={m.id}
             sender={m.from_display || m.from_addr}
             onToast={onToast}
+            later={later}
             onComposeMailto={onComposeMailto}
           />
         )}
@@ -346,6 +349,7 @@ export function Reader({
   onReplyTo,
   onForwardFrom,
   onToast,
+  later,
   onComposeMailto,
   extractionGen = 0,
 }: {
@@ -361,6 +365,11 @@ export function Reader({
   onForwardFrom?: (messageId: number) => void;
   /** Where outcomes are reported — "Saved contract.pdf", or why not. */
   onToast: (text: string) => void;
+  /** Where an answer from a sender's server is reported, taken when it is
+   *  asked for: an unsubscribe can come back after something else was done,
+   *  and must not take that one's Undo away. Absent in the popped-out
+   *  window, which has no Undo to take; `onToast` answers there. */
+  later?: () => (text: string) => void;
   onComposeMailto?: (to: string, subject: string) => void;
   /** Which view is open, so the destructive action can mean the right thing. */
   view: string;
@@ -822,6 +831,7 @@ export function Reader({
                     onReply={onReplyTo}
                     onForward={onForwardFrom}
                     onToast={onToast}
+                    later={later}
                     onComposeMailto={onComposeMailto}
                     onCollapse={() =>
                       setExpanded((prev) => {
@@ -860,6 +870,7 @@ export function Reader({
                 onReply={onReplyTo}
                 onForward={onForwardFrom}
                 onToast={onToast}
+                later={later}
                 onComposeMailto={onComposeMailto}
                 onCollapse={() =>
                   setExpanded((prev) => {

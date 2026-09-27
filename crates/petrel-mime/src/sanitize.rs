@@ -651,11 +651,17 @@ pub fn resolve_cids(
             .replace('>', "&gt;")
             .replace('"', "&quot;");
         let target = href(index);
-        // Both quoted attribute forms, because `src` on an img and
-        // `background` on a table both survive sanitization.
-        for needle in [format!("=\"cid:{escaped}\""), format!("='cid:{escaped}'")] {
-            out = out.replace(&needle, &format!("=\"{target}\""));
-        }
+        // Any attribute that names the cid — `src` on an img and `background`
+        // on a table both survive sanitization — and only in the form the
+        // serializer writes, double-quoted. A single-quoted form cannot be an
+        // attribute of sanitized HTML: the serializer escapes `"` inside a
+        // value and leaves `'` alone, so `='cid:…'` only ever matched text
+        // inside another attribute's value, and the `"` written in its place
+        // closed that value early. The rest of it became attributes the
+        // sanitizer had never seen — an unprefixed id, a style, a remote
+        // `src` that an unedited reply then carried to everyone on it.
+        let needle = format!("=\"cid:{escaped}\"");
+        out = out.replace(&needle, &format!("=\"{target}\""));
     }
     out
 }
@@ -1020,6 +1026,40 @@ mod tests {
         // The sender referenced a part they never attached. A truthful broken
         // image, not an invented URL.
         assert_eq!(out, r#"<img src="cid:missing@x">"#);
+    }
+
+    /// Text inside one attribute that reads like a second, cid-bearing one.
+    /// Rewriting it wrote a `"` that closed the first attribute early, and
+    /// the rest of the text became attributes the sanitizer had refused — an
+    /// unprefixed id and a style here — after the sanitizer had finished.
+    #[test]
+    fn text_inside_an_attribute_cannot_become_attributes() {
+        let attachments = vec![crate::Attachment {
+            filename: None,
+            content_type: Some("image/png".into()),
+            size: 8,
+            content_id: Some("pic1".into()),
+            is_inline: true,
+        }];
+        let sanitized = sanitize_html(
+            r#"<img alt="a ='cid:pic1' id=probe style=position:fixed z=" src="cid:pic1">"#,
+            false,
+        );
+        assert!(
+            sanitized.html.contains("='cid:pic1' id=probe"),
+            "the premise: the sanitizer keeps it, as text: {}",
+            sanitized.html
+        );
+        let out = resolve_cids(&sanitized.html, &attachments, |i| {
+            format!("/attachment/tok/{i}")
+        });
+        // The real reference resolves, and nothing else changes.
+        assert_eq!(
+            out,
+            sanitized
+                .html
+                .replace(r#"src="cid:pic1""#, r#"src="/attachment/tok/0""#)
+        );
     }
 
     #[test]

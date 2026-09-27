@@ -27,7 +27,7 @@ pub fn triage(
     state: State<Arc<AppState>>,
 ) -> Result<ActionReceipt, String> {
     let store = state.store()?;
-    let account = active_account(&store)?;
+    let account = triage_account(&store, thread_id, message_id)?;
     // The provider's placement model, not a per-call guess: on Gmail an
     // archive removes one label, on a classic server it replaces the folder.
     let policy = store.placement_policy(account).map_err(|e| e.to_string())?;
@@ -43,6 +43,32 @@ pub fn triage(
     // this returns, so the drain is never waiting on the caller.
     state.nudge_drain(account);
     Ok(receipt)
+}
+
+/// The account a triage acts for: the one the conversation or message is in,
+/// not whichever the rail shows now.
+///
+/// A pop-out left open across an account switch, and a batch still running
+/// when the account changed, both send ids from the account they were
+/// showing. Acted on under the active account, that mail was filed into this
+/// account's folders and queued for this account's drain, which then moved
+/// or expunged its own mail by the other account's UIDs. The active account
+/// is the fallback only for an id with nothing live behind it, which the
+/// store then answers as it always has.
+fn triage_account(
+    store: &petrel_engine::store::Store,
+    thread_id: i64,
+    message_id: Option<i64>,
+) -> Result<i64, String> {
+    let owner = match message_id {
+        Some(id) => store.account_of_message(id),
+        None => store.thread_account(thread_id),
+    }
+    .map_err(|e| e.to_string())?;
+    match owner {
+        Some(account) => Ok(account),
+        None => active_account(store),
+    }
 }
 
 #[tauri::command(async)]
@@ -486,4 +512,49 @@ pub async fn trash_folder_contents(
     store
         .move_folder_contents(folder_id, to_id)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::triage_account;
+    use petrel_engine::store::{NewMessage, Store};
+
+    fn one_message(store: &mut Store, account: i64) -> i64 {
+        store
+            .insert_messages(&[NewMessage {
+                account_id: account,
+                date_ms: 1_000,
+                from_addr: "a@example.com".into(),
+                from_display: "A".into(),
+                to_addr: "me@example.com".into(),
+                subject: "hello".into(),
+                body_text: "body".into(),
+            }])
+            .unwrap()[0]
+    }
+
+    #[test]
+    fn a_triage_acts_for_the_account_the_mail_is_in_not_the_one_on_screen() {
+        let mut store = Store::open_in_memory().unwrap();
+        let a = store.ensure_test_account().unwrap();
+        let b = store.ensure_test_account().unwrap();
+        let mine = one_message(&mut store, a);
+        let thread = store.thread_of(mine).unwrap().unwrap_or(-mine);
+        // The window has moved on to B, as an account switch does.
+        store.set_active_account(b).unwrap();
+
+        assert_eq!(triage_account(&store, thread, None), Ok(a));
+        assert_eq!(triage_account(&store, thread, Some(mine)), Ok(a));
+    }
+
+    #[test]
+    fn an_id_with_nothing_behind_it_falls_back_to_the_account_on_screen() {
+        let mut store = Store::open_in_memory().unwrap();
+        let a = store.ensure_test_account().unwrap();
+        let b = store.ensure_test_account().unwrap();
+        one_message(&mut store, a);
+        store.set_active_account(b).unwrap();
+        assert_eq!(triage_account(&store, 987_654, None), Ok(b));
+        assert_eq!(triage_account(&store, 987_654, Some(987_654)), Ok(b));
+    }
 }

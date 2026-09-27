@@ -27,6 +27,10 @@ pub(super) fn like_escape(literal: &str) -> String {
 /// confirmed yet. See `folder_awaits_server`.
 const PENDING_CREATE: &str = "pending_create";
 
+/// The `sync_state_json` key on a folder the server flags `\All` where that
+/// is not the archive. See `set_all_mail_folders`.
+const ALL_MAIL: &str = "all_mail";
+
 /// The rows allowed to stand in no folder at all: a draft, pushed or not,
 /// and post waiting in the outbox. Everything else with no placement is a
 /// message the server has stopped holding. Written against the alias `m`.
@@ -1294,6 +1298,51 @@ impl Store {
             params![folder_id],
         )?;
         Ok(())
+    }
+
+    /// Records which of the account's folders the server flags `\All`, on a
+    /// server where that mailbox is not the archive — everywhere but Gmail,
+    /// where All Mail is. Elsewhere it is a virtual view of every message the
+    /// account holds (Dovecot's `virtual/All`, Proton Bridge's All Mail), and
+    /// it still takes the archive role from the survey; synced as the archive,
+    /// it downloaded the whole account a second time and listed every message
+    /// outside the inbox under Archive. The flag is what keeps it out of sync.
+    /// `paths` is the whole set: a folder no longer in it loses the flag.
+    pub fn set_all_mail_folders(&self, account_id: i64, paths: &[String]) -> Result<()> {
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, path FROM folders WHERE account_id = ?1")?;
+            let rows = stmt.query_map(params![account_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (id, path) in rows {
+            let want = paths.contains(&path);
+            if want == self.folder_flag(id, ALL_MAIL)? {
+                continue;
+            }
+            if want {
+                self.conn.execute(
+                    "UPDATE folders SET sync_state_json = json_set(
+                        CASE WHEN json_valid(sync_state_json) THEN sync_state_json ELSE '{}' END,
+                        '$.all_mail', json('true'))
+                      WHERE id = ?1",
+                    params![id],
+                )?;
+            } else {
+                self.conn.execute(
+                    "UPDATE folders SET sync_state_json = json_remove(sync_state_json, '$.all_mail')
+                      WHERE id = ?1 AND json_valid(sync_state_json)",
+                    params![id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the server flags this folder `\All` and it is not the archive.
+    pub fn folder_is_all_mail(&self, folder_id: i64) -> Result<bool> {
+        self.folder_flag(folder_id, ALL_MAIL)
     }
 
     fn folder_flag(&self, folder_id: i64, key: &str) -> Result<bool> {

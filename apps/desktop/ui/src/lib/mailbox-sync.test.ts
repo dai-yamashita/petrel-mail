@@ -8,12 +8,13 @@ describe('syncOnOpen', () => {
     expect(syncOnOpen('spam')).toBe('spam');
     expect(syncOnOpen('trash')).toBe('trash');
     expect(syncOnOpen('starred')).toBe('starred');
+    // A folder of its own on a classic server; the engine answers Gmail's.
+    expect(syncOnOpen('archive')).toBe('archive');
     expect(syncOnOpen('folder:3')).toBe('folder:3');
   });
 
-  it('leaves inbox, archive, and local-only views alone', () => {
+  it('leaves inbox and local-only views alone', () => {
     expect(syncOnOpen('inbox')).toBeNull();
-    expect(syncOnOpen('archive')).toBeNull();
     expect(syncOnOpen('outbox')).toBeNull();
     expect(syncOnOpen('snoozed')).toBeNull();
     expect(syncOnOpen('tag:urgent')).toBeNull();

@@ -2033,3 +2033,145 @@ MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nhalf written\r\n";
         );
     }
 }
+
+/// A conversation is acted on only by the account it belongs to.
+///
+/// A pop-out left open across an account switch, and a batch still running
+/// when the account changed, both hand over thread ids from the account they
+/// were showing. The thread entry point checked only the target, so another
+/// account's conversation was filed into this account's folders and queued
+/// under this account with the other's folder and UID — and on this
+/// account's server, that UID is this account's own mail.
+mod account_wall {
+    use petrel_engine::actions::{ActionKind, PlacementPolicy};
+    use petrel_engine::blob::BlobStore;
+    use petrel_engine::store::Store;
+
+    fn raw(msgid: &str, subject: &str) -> Vec<u8> {
+        format!(
+            "From: someone@example.com\r\nTo: me@example.com\r\nSubject: {subject}\r\n\
+             Date: Mon, 01 Jan 2024 10:00:00 +0000\r\nMessage-ID: <{msgid}>\r\n\
+             MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nhello\r\n"
+        )
+        .into_bytes()
+    }
+
+    struct Two {
+        _dir: tempfile::TempDir,
+        store: Store,
+        a: i64,
+        b: i64,
+        a_msg: i64,
+        a_inbox: i64,
+        a_thread: i64,
+    }
+
+    /// Two accounts, each with one message in its INBOX at UID 5 — the same
+    /// number, as UIDs routinely are across mailboxes — and B on screen.
+    fn two_accounts() -> Two {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("t.db")).unwrap();
+        let blobs = BlobStore::open(&dir.path().join("blobs")).unwrap();
+        let a = store.ensure_test_account().unwrap();
+        let b = store.ensure_test_account().unwrap();
+        let a_inbox = store.ensure_folder(a, "inbox", "INBOX").unwrap();
+        let b_inbox = store.ensure_folder(b, "inbox", "INBOX").unwrap();
+        for account in [a, b] {
+            store.ensure_folder(account, "trash", "Trash").unwrap();
+        }
+        let a_msg = store
+            .ingest_raw(
+                &blobs,
+                a,
+                Some(a_inbox),
+                Some(5),
+                &raw("a@example.com", "A's mail"),
+            )
+            .unwrap()
+            .message_id;
+        store
+            .ingest_raw(
+                &blobs,
+                b,
+                Some(b_inbox),
+                Some(5),
+                &raw("b@example.com", "B's mail"),
+            )
+            .unwrap();
+        store.set_active_account(b).unwrap();
+        let a_thread = store.thread_of(a_msg).unwrap().unwrap_or(-a_msg);
+        Two {
+            _dir: dir,
+            store,
+            a,
+            b,
+            a_msg,
+            a_inbox,
+            a_thread,
+        }
+    }
+
+    #[test]
+    fn a_conversation_names_its_own_account() {
+        let t = two_accounts();
+        assert_eq!(t.store.thread_account(t.a_thread).unwrap(), Some(t.a));
+        assert_eq!(t.store.thread_account(987_654).unwrap(), None);
+    }
+
+    #[test]
+    fn another_accounts_conversation_is_refused_whatever_the_verb() {
+        let t = two_accounts();
+        let b_folder = t.store.ensure_named_folder(t.b, "Receipts").unwrap();
+        let b_tag = t.store.ensure_tag(t.b, "later", None).unwrap();
+        for (kind, target) in [
+            (ActionKind::Archive, None),
+            (ActionKind::Trash, None),
+            (ActionKind::Spam, None),
+            (ActionKind::DeleteForever, None),
+            (ActionKind::Move, Some(b_folder)),
+            (ActionKind::Star, None),
+            (ActionKind::MarkUnread, None),
+            (ActionKind::Tag, Some(b_tag)),
+        ] {
+            let r = t.store.apply_thread_action(
+                t.b,
+                t.a_thread,
+                kind,
+                target,
+                PlacementPolicy::Exclusive,
+            );
+            assert!(r.is_err(), "{kind:?} of A's conversation by B: {r:?}");
+        }
+        assert!(
+            t.store.pending_actions(t.b).unwrap().is_empty(),
+            "nothing may reach B's drain: UID 5 there is B's own message"
+        );
+        assert!(t.store.pending_actions(t.a).unwrap().is_empty());
+        assert_eq!(
+            t.store.folders_of(t.a_msg).unwrap(),
+            vec![t.a_inbox],
+            "A's mail stays where it was"
+        );
+    }
+
+    #[test]
+    fn the_owning_account_still_acts() {
+        let t = two_accounts();
+        t.store
+            .apply_thread_action(
+                t.a,
+                t.a_thread,
+                ActionKind::Trash,
+                None,
+                PlacementPolicy::Exclusive,
+            )
+            .expect("A may bin its own conversation");
+        let a_trash = t.store.folder_for_role(t.a, "trash").unwrap().unwrap();
+        assert_eq!(t.store.folders_of(t.a_msg).unwrap(), vec![a_trash]);
+        let queued = t.store.pending_actions(t.a).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].folder_path, "INBOX");
+        assert_eq!(queued[0].uid, Some(5));
+        assert!(t.store.pending_actions(t.b).unwrap().is_empty());
+    }
+}

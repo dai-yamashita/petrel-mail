@@ -52,6 +52,7 @@ export function AppDialogs({
   setFolders,
   setTags,
   setToast,
+  later,
   items,
   selectedSize,
   clearSelected,
@@ -88,6 +89,10 @@ export function AppDialogs({
   setFolders: (f: Folder[]) => void;
   setTags: (tags: import('../lib/api').Tag[]) => void;
   setToast: (text: string | null) => void;
+  /** For the server's answer to what a dialog asked of it: taken when it is
+   *  asked, it says the answer without taking away the Undo of anything done
+   *  in the meantime. */
+  later: () => (text: string) => void;
   items: Thread[];
   selectedSize: number;
   clearSelected: () => void;
@@ -276,18 +281,19 @@ export function AppDialogs({
               ? binDestination(folders, f)
               : movedFolderPath(folders, f, targetPath);
           if (!next || next === f.path) return;
+          const say = later();
           void api
             .renameFolder(f.id, next)
             .then(() => api.folders().then(setFolders))
             .then(() =>
-              setToast(
+              say(
                 chosen?.role === 'trash'
                   ? t('folder-trashed', { name: leaf })
                   : t('folder-moved', { name: leaf, to: targetPath || t('rail-folders') }),
               ),
             )
             .catch((e) =>
-              setToast(
+              say(
                 nameIsTaken(e)
                   ? t('folder-name-taken', { name: leaf })
                   : t('folder-failed', { error: String(e) }),
@@ -333,14 +339,15 @@ export function AppDialogs({
           // bin already holds that name, because the server refuses a RENAME
           // onto an occupied one and the folder would simply stay put.
           const bin = binFor(folder);
+          const say = later();
           const act = bin
             ? api.renameFolder(folder.id, bin).then(() => t('folder-trashed', { name: leaf }))
             : api.deleteFolder(folder.id).then(() => t('folder-deleted', { name: folder.path }));
           void act
             .then((message) => api.folders().then(setFolders).then(() => message))
-            .then((message) => setToast(message))
+            .then((message) => say(message))
             .catch((e) =>
-              setToast(
+              say(
                 nameIsTaken(e)
                   ? t('folder-name-taken', { name: leaf })
                   : t('folder-failed', { error: String(e) }),
@@ -364,13 +371,14 @@ export function AppDialogs({
           const target = trashingAll;
           setTrashingAll(null);
           if (!target) return;
+          const say = later();
           void api
             .trashFolderContents(target.folder.id)
             .then((n) => {
-              setToast(t('folder-trashed-all', { count: fmtCount(n) }));
+              say(t('folder-trashed-all', { count: fmtCount(n) }));
               onTrashedAll();
             })
-            .catch((e) => setToast(t('folder-failed', { error: String(e) })));
+            .catch((e) => say(t('folder-failed', { error: String(e) })));
         }}
       />
 

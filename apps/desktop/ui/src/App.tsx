@@ -41,6 +41,7 @@ import { Palette } from './components/Palette';
 import { Picker, type PickerOption } from './components/Picker';
 import { NameDialog } from './components/NameDialog';
 import { Compose, addresses, type Draft } from './components/Compose';
+import { plainTextOf } from './components/RichText';
 import { firstUnsendable } from './lib/recipients';
 import { snoozeOptions } from './lib/snooze';
 import { key } from './lib/keys';
@@ -128,6 +129,33 @@ function statusNeedsRender(prev: Status | null, next: Status): boolean {
 const ALERT_TEXT: Record<string, StringId> = {
   'sent-copy-failed': 'alert-sent-copy-failed',
 };
+
+/** Focus back on the list once it is on screen again. Straight after the
+ *  pane-off reader closes the list is still hidden, and focusing a hidden
+ *  element leaves focus on the page body: the arrow keys have no list to walk,
+ *  and a screen reader is left nowhere. */
+function focusListAfterRender() {
+  requestAnimationFrame(() => document.querySelector<HTMLElement>('.scroller')?.focus());
+}
+
+/** The same when the pane-off reader closed by itself, only if focus went
+ *  with it: something else that has focus keeps it. */
+function focusListIfLost() {
+  requestAnimationFrame(() => {
+    const at = document.activeElement;
+    if (!at || at === document.body) document.querySelector<HTMLElement>('.scroller')?.focus();
+  });
+}
+
+/** Whether focus is where the reading keys are — the rail, the list, the
+ *  reader, or nowhere — rather than in something being typed into: a
+ *  composer, a field, a dialog. Only then may the window move it. */
+function focusIsFree(): boolean {
+  const at = document.activeElement as HTMLElement | null;
+  if (!at || at === document.body) return true;
+  if (at.matches('input, textarea, select, [contenteditable="true"]')) return false;
+  return at.closest('.rail, .list-pane, .reader') != null;
+}
 
 export function App() {
   const { settings, locale, set } = useSettings();
@@ -307,6 +335,40 @@ export function App() {
     id: number;
     name: string;
   } | null>(null);
+  const [toast, showToast] = useState<string | null>(null);
+  const [undoOffer, setUndoOffer] = useState<UndoOffer | null>(null);
+  // useTriage's `forgetUndo` and `undoMark`, once they exist further down.
+  const forgetUndo = useRef<() => void>(() => {});
+  const undoMark = useRef<() => unknown>(() => null);
+  // What the person just did, said. It goes up without an Undo — a triage's
+  // own offer is set after its text, by useTriage's onMessage — and it ends
+  // the window for undoing the action before it: Z and the button undo the
+  // last thing done, and this is the last thing done. The toast and its offer
+  // are two pieces of state, and a message raised while an earlier offer was
+  // live wore it: "Will send tomorrow · Undo" undid an archive instead, said
+  // Undone, and the send still went out.
+  const setToast = useCallback((text: string | null) => {
+    setUndoOffer(null);
+    forgetUndo.current();
+    showToast(text);
+  }, []);
+  // What happened by itself: mail arriving, a rule, a notice from sync. It
+  // takes the place of whatever is up, Undo button and all, but leaves Z
+  // undoing what was last done — nothing done came after it.
+  const notify = useCallback((text: string) => {
+    setUndoOffer(null);
+    showToast(text);
+  }, []);
+  // For an answer that comes back later: the server's, to a folder made,
+  // moved or deleted, an unsubscribe or an emptied Trash, or "Sent" at the
+  // end of the countdown. Taken when it is asked for, it says the answer as
+  // what the person did when nothing undoable has been done since, and as a
+  // notice when something has — which it must not end: "Asked Sam to stop",
+  // landing a second after an archive, took the archive's Z with it.
+  const later = useCallback(() => {
+    const mark = undoMark.current();
+    return (text: string) => (undoMark.current() === mark ? setToast(text) : notify(text));
+  }, [setToast, notify]);
   const refreshSearches = useCallback(
     async (): Promise<void> => {
       try {
@@ -340,7 +402,7 @@ export function App() {
       }
     },
     // locale: the failure message comes from t().
-    [query, refreshSearches, locale],
+    [query, refreshSearches, locale, setToast],
   );
   /** Renames one, from wherever it was asked for. */
   const renameSearch = useCallback(
@@ -352,7 +414,7 @@ export function App() {
         .catch((e) => setToast(t('saved-search-failed', { error: String(e) })));
     },
     // locale: the failure message comes from t().
-    [refreshSearches, locale],
+    [refreshSearches, locale, setToast],
   );
   /** The saved search waiting on a yes. Destructive and undoable only by
    *  retyping the query, so it is confirmed like a tag or a folder — the rail's
@@ -420,21 +482,23 @@ export function App() {
             .catch((e) => setToast(t('tag-rename-failed', { error: String(e) })));
     },
     // locale: the failure message comes from t().
-    [tags, view, sortByView, set, refreshSearches, locale],
+    [tags, view, sortByView, set, refreshSearches, locale, setToast],
   );
 
   /** The same for a folder, whose new name is a whole path. */
   const renameFolderTo = useCallback(
-    (folderId: number, newPath: string) =>
-      api
+    (folderId: number, newPath: string) => {
+      const say = later();
+      return api
         .renameFolder(folderId, newPath)
         // Saved queries name a folder by its leaf or its path; the engine has
         // just rewritten them.
         .then(() => refreshSearches())
         .then(() => api.folders().then(setFolders))
-        .catch((e) => setToast(t('folder-failed', { error: String(e) }))),
+        .catch((e) => say(t('folder-failed', { error: String(e) })));
+    },
     // locale: as above.
-    [refreshSearches, setFolders, locale],
+    [refreshSearches, setFolders, locale, later],
   );
 
   const listFetchers = useMemo(
@@ -453,15 +517,21 @@ export function App() {
     // Said, not shown in place of the list: the rows on screen are still
     // the rows, and one poll that could not get a page is not a reason to
     // take forty conversations away.
-    onRefreshFailed: (e) => setToast(t('list-refresh-failed', { error: e })),
+    onRefreshFailed: (e) => notify(t('list-refresh-failed', { error: e })),
   });
   const searchRef = useRef<HTMLInputElement>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   // Null when closed; otherwise the pane to open on.
   const [settingsOpen, setSettingsOpen] = useState<'accounts' | 'appearance' | null>(null);
-  const [toast, setToast] = useState<string | null>(null);
-  const [undoOffer, setUndoOffer] = useState<UndoOffer | null>(null);
+  // Where Settings reports. What it asks for can outlast it — an export of
+  // every message, an import — and the answer can land after something was
+  // done in the list. It is modal, so nothing undoable is done between its
+  // opening and anything asked from it: the mark is taken as it opens.
+  const settingsSay = useMemo(
+    () => (settingsOpen ? later() : setToast),
+    [settingsOpen, later, setToast],
+  );
   const [readerOverlay, setReaderOverlay] = useState(false);
   const [picker, setPicker] = useState<'folder' | 'tag' | 'snooze' | 'send-later' | null>(null);
   // Which conversations the open picker is for. Null means what the keys
@@ -517,8 +587,14 @@ export function App() {
   // has not touched the network — which is the whole reason undo can cancel it
   // rather than chase it.
   // The send waiting out its undo window. The message itself is in the
-  // outbox; this is only what the toast needs to count down and to name it.
-  const [outgoing, setOutgoing] = useState<{ id: number; subject: string; left: number } | null>(null);
+  // outbox; this is only what the toast needs to count down and to name it,
+  // and `say`, taken at the send, to announce it at the end.
+  const [outgoing, setOutgoing] = useState<{
+    id: number;
+    subject: string;
+    left: number;
+    say: (text: string) => void;
+  } | null>(null);
   const outgoingRef = useRef(outgoing);
   outgoingRef.current = outgoing;
 
@@ -640,7 +716,7 @@ export function App() {
     view,
     listKey: `${accountEpoch}:${view}:${query}`,
     onMessage: (text, undo) => {
-      setToast(text);
+      showToast(text);
       setUndoOffer(undo ?? null);
     },
     // The rail's number, moved at the same moment the chip appears on the row.
@@ -676,6 +752,8 @@ export function App() {
       if (openId != null && row.id === openId) setDraft(null);
     },
   });
+  forgetUndo.current = triage.forgetUndo;
+  undoMark.current = triage.undoMark;
 
   // Which conversations a confirmed delete would remove. Captured when the
   // dialog opens rather than read when it closes: the selection can change
@@ -815,12 +893,7 @@ export function App() {
       // else recounts them: the message count does not move.
       .then(() => setTriageEpoch((n) => n + 1))
       .then(() => resumeDraft(o.id))
-      .then(() => {
-        // An undo offer left over from an earlier toast would ride on this
-        // one, and its Undo would reverse that, not this.
-        setUndoOffer(null);
-        setToast(t('compose-cancelled'));
-      })
+      .then(() => setToast(t('compose-cancelled')))
       .catch((e) => setToast(t('compose-resume-failed', { error: String(e) })));
   };
 
@@ -842,20 +915,26 @@ export function App() {
   };
 
   useKeyboard({
-    openConversation: () => {
-      // Drafts have no reading pane. Enter is resume, same as a click.
+    openConversation: (rowPressed) => {
+      // Drafts have no reading pane. Enter is resume, same as a click — and
+      // on a row of the list it arrives as that click, which has resumed the
+      // draft already; a second resume would open it twice.
       if (opensComposer(view) && activeId != null) {
-        void resumeDraft(activeId);
+        if (!rowPressed) void resumeDraft(activeId);
         return;
       }
       // Enter opens what the list has focused; with the reading pane off it is
-      // the only way to see a message at all.
-      if (settings.layout === 'off') setReaderOverlay(true);
-      else document.querySelector<HTMLElement>('.reader')?.focus();
+      // the only way to see a message at all. Only when something is focused:
+      // raised over nothing, the overlay sprang open at the next row picked.
+      // With the pane on, into the message: its body is what takes focus, the
+      // section around it has no tab stop and ignored the call.
+      if (settings.layout === 'off') {
+        if (activeRef.current) setReaderOverlay(true);
+      } else document.querySelector<HTMLElement>('.reader-body')?.focus();
     },
     backToList: () => {
       setReaderOverlay(false);
-      document.querySelector<HTMLElement>('.scroller')?.focus();
+      focusListAfterRender();
     },
     cyclePanes: (backwards) => {
       // F6 is the platform convention for moving between panes, and the only
@@ -894,9 +973,16 @@ export function App() {
     findInMessage: () => {
       // Only where there is something to find in. With no reading pane, or
       // nothing open, ⌘F would put up a bar that could never match anything.
-      if (settings.layout !== 'off' && activeRef.current) setFinding(true);
+      if ((settings.layout !== 'off' && activeRef.current) || overlayOpen) setFinding(true);
     },
     toggleReaderFull: () => {
+      // Opened over the list with no pane, it already has the window: the key
+      // its own menu names goes back to the list.
+      if (overlayOpen) {
+        setReaderOverlay(false);
+        focusListAfterRender();
+        return;
+      }
       if (settings.layout !== 'off' && activeRef.current) setReaderFull((f) => !f);
     },
     // The way back, on a key. Everywhere except the inbox itself and the views
@@ -985,8 +1071,16 @@ export function App() {
       // more recent than a selection made before it, and leaving someone in a
       // list-less window because Escape went to the selection instead is the
       // kind of dead end that sends people back to the mouse.
-      if (readerFull) {
+      // Only with a pane: left set from before the pane was turned off, it
+      // is invisible, and swallowed the Escape meant for the reader below.
+      if (readerFull && settings.layout !== 'off') {
         setReaderFull(false);
+        return;
+      }
+      // The same for the conversation opened over the list with no pane.
+      if (readerOverlay) {
+        setReaderOverlay(false);
+        focusListAfterRender();
         return;
       }
       setSelected(new Set());
@@ -1019,7 +1113,7 @@ export function App() {
     // back, which is the quiet wrong action rather than the loud one.
     find: () => {
       if (!document.hasFocus()) return;
-      if (settings.layout !== 'off' && activeRef.current) setFinding(true);
+      if ((settings.layout !== 'off' && activeRef.current) || overlayOpen) setFinding(true);
     },
     theme: settings.theme,
     density: settings.density,
@@ -1077,6 +1171,39 @@ export function App() {
   }, [query, view, viewName, status?.count, locale]);
 
   const active = useMemo(() => items.find((m) => m.id === activeId) ?? null, [items, activeId]);
+  // With no reading pane, Enter opens the conversation over the list: the
+  // window given to it, as reader-only gives it with the pane on. The overlay
+  // had no layout of its own, and drew the message in the rail's column with
+  // the list squeezed to nothing.
+  const overlayOpen =
+    settings.layout === 'off' && readerOverlay && active != null && !opensComposer(view);
+  // Closed when nothing is left open in it: the last conversation archived
+  // from under it, or one a sync took out of the list. At once, so it is never
+  // left open with nothing in it, to spring back over whatever row is picked
+  // next — and read it. Only a batch waits: it leaves nothing open for a
+  // moment, between its rows going and the cursor landing past them, and
+  // closing there shut the reader on a batch archived from its upper end.
+  // Focus goes back to the list if it went with the reader.
+  useEffect(() => {
+    if (!readerOverlay || active != null || triage.batching) return;
+    setReaderOverlay(false);
+    focusListIfLost();
+  }, [readerOverlay, active, triage.batching]);
+  // And when the list under it is another one: another view, search or
+  // layout. Switching account closes it where it switches. A reload of the
+  // same list is no reason to — a finished re-index asks for one, and it
+  // closed mid-read.
+  useEffect(() => setReaderOverlay(false), [view, query, settings.layout]);
+  // Into the message as it opens there, and as J and K move it along: the list
+  // is gone from the window, and focus left on it had nowhere to be. Never out
+  // of something being typed into — a reply open over it, a field, a dialog.
+  useEffect(() => {
+    if (!overlayOpen) return;
+    const h = requestAnimationFrame(() => {
+      if (focusIsFree()) document.querySelector<HTMLElement>('.reader-body')?.focus();
+    });
+    return () => cancelAnimationFrame(h);
+  }, [overlayOpen, active?.id]);
   const pickerIds = useMemo(
     () => pickerFor ?? targets(selected, activeId),
     [pickerFor, selected, activeId],
@@ -1156,22 +1283,25 @@ export function App() {
       // always where they came from.
       const quoted = await api.quoteMessage(last.id).catch(() => null);
       const { to, cc } = replyTargets(last, identity?.address ?? '', all, quoted?.reply_to ?? []);
+      const html = quoted
+        ? replyBody(
+            startingHtml(identity, true),
+            quoted.from,
+            quoted.date_ms,
+            quoted.html,
+            settings.language === 'system' ? undefined : settings.language,
+          )
+        : startingHtml(identity, true);
       openComposer({
         to: to.join(', '),
         cc: cc.join(', '),
         // Threading rides on the headers, not the subject; the Re: is only
         // what people expect to read.
         subject: row.subject.match(/^re:/i) ? row.subject : `Re: ${row.subject}`,
-        body: startingBody(identity, true),
-        html: quoted
-          ? replyBody(
-              startingHtml(identity, true),
-              quoted.from,
-              quoted.date_ms,
-              quoted.html,
-              settings.language === 'system' ? undefined : settings.language,
-            )
-          : startingHtml(identity, true),
+        // The text half of what the editor will show, quote and all, as a
+        // forward needs; see `plainTextOf`.
+        body: quoted ? plainTextOf(html) : startingBody(identity, true),
+        html,
         ...replyHeaders(last),
       });
     } catch (e) {
@@ -1224,23 +1354,27 @@ export function App() {
           t('compose-too-large', { name: tooBig.join(', '), limit: fileSize(ATTACHMENT_LIMIT) }),
         );
       }
+      const html = quoted
+        ? forwardBody(
+            startingHtml(identity, true),
+            quoted.from,
+            quoted.to,
+            subject,
+            quoted.date_ms,
+            quoted.html,
+            settings.language === 'system' ? undefined : settings.language,
+          )
+        : startingHtml(identity, true);
       openComposer({
         to: '',
         cc: '',
         subject: subject.match(/^fwd:/i) ? subject : `Fwd: ${subject}`,
         attachments,
-        body: startingBody(identity, true),
-        html: quoted
-          ? forwardBody(
-              startingHtml(identity, true),
-              quoted.from,
-              quoted.to,
-              subject,
-              quoted.date_ms,
-              quoted.html,
-              settings.language === 'system' ? undefined : settings.language,
-            )
-          : startingHtml(identity, true),
+        // The text half of the forwarded message too, not the signature
+        // alone: the editor has not reported anything yet, and a forward
+        // sent without an edit never makes it; see `plainTextOf`.
+        body: quoted ? plainTextOf(html) : startingBody(identity, true),
+        html,
       });
     } catch (e) {
       setToast(t('compose-resume-failed', { error: String(e) }));
@@ -1267,7 +1401,7 @@ export function App() {
     } catch (e) {
       setToast(t('compose-resume-failed', { error: String(e) }));
     }
-  }, [locale, openComposer]);
+  }, [locale, openComposer, setToast]);
 
   const onToggleSelect = useCallback(
     (id: number) => {
@@ -1354,6 +1488,8 @@ export function App() {
     const c = draftConflict;
     setDraftConflict(null);
     if (!c) return;
+    // The copy left over is expunged on the server before this returns.
+    const say = later();
     try {
       await api.resolveDraftConflict(c.draftId, c.otherId, takeServer);
       if (takeServer) {
@@ -1363,9 +1499,9 @@ export function App() {
         setDraft(null);
         await resumeDraft(c.draftId);
       }
-      setToast(takeServer ? t('draft-took-server') : t('draft-kept-local'));
+      say(takeServer ? t('draft-took-server') : t('draft-kept-local'));
     } catch (e) {
-      setToast(t('draft-conflict-failed', { error: String(e) }));
+      say(t('draft-conflict-failed', { error: String(e) }));
     }
   };
 
@@ -1378,6 +1514,8 @@ export function App() {
    * dropped — a row id from one account means nothing in another.
    */
   const switchAccount = async (id: number, email: string) => {
+    // Said once the draft below is pushed, which can take a while.
+    const say = later();
     // The composer belongs to the account it opened in. Every save writes
     // to whichever account is active, so a draft left open across the switch
     // would autosave itself into the other account's Drafts. It is written
@@ -1392,7 +1530,7 @@ export function App() {
         api.pushDraft,
       );
       if (!settled.ok) {
-        setToast(t('account-switch-draft-failed', { error: settled.error }));
+        say(t('account-switch-draft-failed', { error: settled.error }));
         return;
       }
       setDraft(null);
@@ -1400,13 +1538,17 @@ export function App() {
     try {
       await api.setActiveAccount(id);
       setActiveId(null);
+      // The pane-off reader too: left open, it filled the window with the
+      // other account's first conversation, and read it.
+      setReaderOverlay(false);
+      focusListIfLost();
       setSelected(new Set());
       setView('inbox');
       setQuery('');
       setAccountEpoch((n) => n + 1);
-      setToast(t('account-switched', { email }));
+      say(t('account-switched', { email }));
     } catch (e) {
-      setToast(t('account-switch-failed', { error: String(e) }));
+      say(t('account-switch-failed', { error: String(e) }));
     }
   };
 
@@ -1527,8 +1669,10 @@ export function App() {
       if (!f) return;
       const delim = folderDelimiter(folders);
       const leaf = folderLeaf(f.path, delim);
+      // The server's answer, whenever it comes.
+      const say = later();
       const failed = (e: unknown) =>
-        setToast(
+        say(
           nameIsTaken(e)
             ? t('folder-name-taken', { name: leaf })
             : t('folder-failed', { error: String(e) }),
@@ -1564,7 +1708,7 @@ export function App() {
         void api
           .renameFolder(folderId, bin)
           .then(() => api.folders().then(setFolders))
-          .then(() => setToast(t('folder-trashed', { name: leaf })))
+          .then(() => say(t('folder-trashed', { name: leaf })))
           .catch(undoMove);
         return;
       }
@@ -1584,7 +1728,7 @@ export function App() {
         // it quietly numbered. The optimistic tree is the right shape, not
         // necessarily the right strings.
         .then(() => api.folders().then(setFolders))
-        .then(() => setToast(t('folder-moved', { name: leaf, to: targetPath || t('rail-folders') })))
+        .then(() => say(t('folder-moved', { name: leaf, to: targetPath || t('rail-folders') })))
         .catch(undoMove);
     },
     // Dropped in the gap between two rows: a reorder, not a move.
@@ -1718,10 +1862,7 @@ export function App() {
     if (!outgoing) return;
     if (outgoing.left <= 0) {
       setOutgoing(null);
-      // Without clearing, the toast carried the Undo of whatever was done
-      // before the send, and pressing it reversed that instead.
-      setUndoOffer(null);
-      setToast(t('compose-sent'));
+      outgoing.say(t('compose-sent'));
       return;
     }
     const h = setTimeout(() => setOutgoing((o) => (o ? { ...o, left: o.left - 1 } : null)), 1000);
@@ -1764,7 +1905,7 @@ export function App() {
 
     const top = worth[0];
     const who = top.from_display || top.from_addr;
-    setToast(
+    notify(
       worth.length === 1
         ? t('notify-one', { who })
         : t('notify-many', { count: fmtCount(worth.length) }),
@@ -1775,7 +1916,7 @@ export function App() {
         worth.length === 1 ? top.subject || t('no-subject') : t('notify-many', { count: fmtCount(worth.length) }),
       );
     }
-  }, [items, view, query, settings, status?.seeding]);
+  }, [items, view, query, settings, status?.seeding, notify]);
 
   // What a rule asked to announce. These never reach the inbox list the
   // effect above watches — the rule filed them — so their word rides the
@@ -1787,7 +1928,7 @@ export function App() {
     if (fresh.length === 0) return;
     if (!shouldNotify(settings, Date.now())) return;
     const [who, subject] = fresh[0];
-    setToast(
+    notify(
       fresh.length === 1
         ? t('notify-one', { who })
         : t('notify-many', { count: fmtCount(fresh.length) }),
@@ -1800,7 +1941,7 @@ export function App() {
           : t('notify-many', { count: fmtCount(fresh.length) }),
       );
     }
-  }, [status, settings]);
+  }, [status, settings, notify]);
 
   // Something that happened to mail of yours, said plainly.
   //
@@ -1818,8 +1959,8 @@ export function App() {
       .map((key) => ALERT_TEXT[key])
       .filter((id): id is StringId => id != null)
       .map((id) => t(id));
-    if (said.length > 0) setToast(said.join(' '));
-  }, [status]);
+    if (said.length > 0) notify(said.join(' '));
+  }, [status, notify]);
 
   // Moving off a conversation marks it read — the rule every mail client with
   // a reading pane uses, and the one Outlook states outright as "mark as read
@@ -1850,7 +1991,23 @@ export function App() {
   // re-runs this, and the conversation then on screen is read as usual.
   const gathering = selected.size > 0;
   useEffect(() => {
-    if (settings.layout === 'off') return;
+    // With no reading pane, walking the list with J and K is not reading it;
+    // a conversation opened over the list is. Closing it is leaving it, which
+    // reads it as moving on to another does, however soon. Forgetting it then
+    // is what keeps the next opening from marking some other row read as the
+    // one "just left".
+    if (settings.layout === 'off' && !readerOverlay) {
+      const leaving = previousId.current;
+      previousId.current = null;
+      if (!gathering && leaving != null) {
+        const row = itemsRef.current.find((m) => m.id === leaving);
+        if (row?.unread && !triageRef.current.isHeldUnread(leaving)) {
+          autoRead.current = leaving;
+          void triageRef.current.run('mark_read', leaving, undefined, true);
+        }
+      }
+      return;
+    }
     const current = activeRef.current;
     const leaving = previousId.current;
     previousId.current = current?.id ?? null;
@@ -1886,7 +2043,7 @@ export function App() {
       void triageRef.current.run('mark_read', id, undefined, true);
     }, 900);
     return () => clearTimeout(h);
-  }, [active?.id, settings.layout, gathering]);
+  }, [active?.id, settings.layout, gathering, readerOverlay]);
 
   // Null while the answer is not known yet, which is not the same as none.
   //
@@ -2055,11 +2212,11 @@ export function App() {
   useEffect(() => {
     const needs = counts['outbox:attention'] ?? 0;
     if (needs > announcedNeeds.current) {
-      setToast(t('outbox-notify', { count: fmtCount(needs) }));
+      notify(t('outbox-notify', { count: fmtCount(needs) }));
       void postDesktopNotification(t('outbox-notify-title'), t('outbox-notify', { count: fmtCount(needs) }));
     }
     announcedNeeds.current = needs;
-  }, [counts]);
+  }, [counts, notify]);
 
   // A `mailto:` in a message opens a message here rather than in whichever
   // other mail program the machine prefers. Web links go to the browser; that
@@ -2198,7 +2355,8 @@ export function App() {
         data-layout={
           // Only while something is open. Filling the window with an empty
           // reading pane would hide the list to show nothing.
-          readerFull && active && settings.layout !== 'off' && !opensComposer(view)
+          (readerFull && active && settings.layout !== 'off' && !opensComposer(view)) ||
+          overlayOpen
             ? 'reader-only'
             : settings.layout === 'off'
               ? 'no-reader'
@@ -2219,8 +2377,9 @@ export function App() {
         view={view}
         current={currentRow}
         folders={folders}
-        onCreateFolder={(name) =>
-          api
+        onCreateFolder={(name) => {
+          const say = later();
+          return api
             .createFolder(name)
             .then(async (id) => {
               setFolders(await api.folders());
@@ -2229,16 +2388,16 @@ export function App() {
               // Not waited on: the rail can show the row while the server is
               // still being asked.
               void api.pushFolder(id).then(
-                () => setToast(t('folder-created', { name })),
-                (e) => setToast(t('folder-server-pending', { name, error: String(e) })),
+                () => say(t('folder-created', { name })),
+                (e) => say(t('folder-server-pending', { name, error: String(e) })),
               );
               return id;
             })
             .catch((e) => {
               setToast(t('folder-failed', { error: String(e) }));
               return undefined;
-            })
-        }
+            });
+        }}
 
         onDeleteFolder={setDeletingFolder}
         onMoveFolder={setMovingFolder}
@@ -2247,10 +2406,12 @@ export function App() {
         // back from the engine, so "nothing to mark" and "4,187 marked" are
         // different sentences rather than one hopeful one.
         onMarkFolderRead={(folder, read) => {
+          // The server flags the whole folder first, and says when it is done.
+          const say = later();
           void api
             .markFolderRead(folder.id, read)
             .then((n) => {
-              setToast(
+              say(
                 n === 0
                   ? t('folder-marked-none')
                   : t(read ? 'folder-marked-read' : 'folder-marked-unread', {
@@ -2259,7 +2420,7 @@ export function App() {
               );
               setAccountEpoch((n) => n + 1);
             })
-            .catch((e) => setToast(t('folder-failed', { error: String(e) })));
+            .catch((e) => say(t('folder-failed', { error: String(e) })));
         }}
         // This one asks, and asks with the number in it: "move everything" is
         // a different decision at four messages and at ten thousand.
@@ -2767,12 +2928,13 @@ export function App() {
         </section>
       )}
 
-      {(settings.layout !== 'off' || readerOverlay) && !opensComposer(view) && (
+      {(settings.layout !== 'off' || overlayOpen) && !opensComposer(view) && (
         <Reader
           thread={active}
           extractionGen={status?.extraction_gen ?? 0}
           view={view}
           onToast={setToast}
+          later={later}
           onComposeMailto={(to, subject) => {
             openComposer({
               to,
@@ -2788,10 +2950,17 @@ export function App() {
           onForwardFrom={(messageId) => {
             if (active) void startForward(active.id, messageId);
           }}
-          full={readerFull}
+          // Opened over the list with no pane, it already has the window, and
+          // shrinking it is going back to the list: the mouse's way out.
+          full={readerFull || overlayOpen}
           finding={finding}
           onCloseFind={() => setFinding(false)}
-          onToggleFull={() => setReaderFull((f) => !f)}
+          onToggleFull={() => {
+            if (overlayOpen) {
+              setReaderOverlay(false);
+              focusListAfterRender();
+            } else setReaderFull((f) => !f);
+          }}
           onPopOut={() => {
             if (!active) return;
             void api
@@ -2921,6 +3090,9 @@ export function App() {
             // ambiguous-outcome rule protects every send, not only the
             // scheduled ones.
             const wait = Number(settings.undoSendSeconds) || 0;
+            // "Sent" comes at the end of the countdown, which is time enough
+            // to have archived something since.
+            const say = later();
             setDraft(null);
             // Through the same chain as every other save, so an autosave
             // still in flight updates this row rather than a twin of it.
@@ -2930,7 +3102,7 @@ export function App() {
                 return api.scheduleSend(id, Date.now() + wait * 1000).then(() => id);
               })
               .then((id) => {
-                setOutgoing({ id, subject: d.subject, left: wait });
+                setOutgoing({ id, subject: d.subject, left: wait, say });
                 // From Drafts to the Outbox. The message count does not move,
                 // so without this neither number did until a sync happened by.
                 setTriageEpoch((n) => n + 1);
@@ -3026,6 +3198,7 @@ export function App() {
           }
         }}
         onCreate={(name) => {
+          const say = later();
           const make = picker === 'folder' ? api.createFolder(name) : api.createTag(name);
           void make
             .then((id) => {
@@ -3033,10 +3206,11 @@ export function App() {
                 setPicker(null);
                 // The server's copy in the background: the move needs only the
                 // id, and the drain makes the folder itself if it gets there
-                // first. Only a failure has anything to say.
+                // first. Only a failure has anything to say — and by then the
+                // move below has its own Undo, which the failure leaves be.
                 void api
                   .pushFolder(id)
-                  .catch((e) => setToast(t('folder-server-pending', { name, error: String(e) })));
+                  .catch((e) => say(t('folder-server-pending', { name, error: String(e) })));
                 // Into the new folder goes what the picker was for, not only
                 // the highlighted row.
                 return triage.runMany('move', pickerIds, id).then(() => api.folders().then(setFolders));
@@ -3078,6 +3252,8 @@ export function App() {
         // is empty and write the mailbox scope over it; the focus last,
         // because the palette takes focus back as it closes.
         onSearch={(q) => {
+          // The results are in the list, under the pane-off reader if it is up.
+          setReaderOverlay(false);
           setQuery(q);
           setSearching(true);
           requestAnimationFrame(() => searchRef.current?.focus());
@@ -3120,6 +3296,7 @@ export function App() {
           if (!wasActive) return;
           setDraft(null);
           setActiveId(null);
+          setReaderOverlay(false);
           setSelected(new Set());
           setView('inbox');
           setQuery('');
@@ -3131,7 +3308,7 @@ export function App() {
           setSettingsOpen(null);
           api.accounts().then(setAccounts).catch(() => {});
         }}
-        onMessage={setToast}
+        onMessage={settingsSay}
       />
       {outgoing && (
         // Its own bar, not the toast: this one is a control with a deadline,
@@ -3153,7 +3330,9 @@ export function App() {
             className="sending-now"
             onClick={() => {
               const o = outgoing;
-              setOutgoing({ ...o, left: 0 });
+              // Sending now is done now: "Sent" answers this, not the Send
+              // that started the countdown.
+              setOutgoing({ ...o, left: 0, say: later() });
               void api.outboxSendNow(o.id).catch((e) => setToast(t('compose-failed', { error: String(e) })));
             }}
           >
@@ -3263,12 +3442,14 @@ export function App() {
         onCancelEmptyTrash={() => setEmptyingTrash(false)}
         onEmptyTrash={() => {
           setEmptyingTrash(false);
+          // One expunge after another on the server: the count can take a while.
+          const say = later();
           void api
             .emptyTrash()
             .then((r) => {
               const [gone, kept] = r.split('/');
               setAccountEpoch((n) => n + 1);
-              setToast(
+              say(
                 Number(gone) === 0 && Number(kept) === 0
                   ? t('trash-already-empty')
                   : Number(kept) > 0
@@ -3276,7 +3457,7 @@ export function App() {
                     : t('trash-emptied', { count: gone }),
               );
             })
-            .catch((e) => setToast(t('trash-empty-failed', { error: String(e) })));
+            .catch((e) => say(t('trash-empty-failed', { error: String(e) })));
         }}
         view={view}
         setView={setView}
@@ -3284,6 +3465,7 @@ export function App() {
         setFolders={setFolders}
         setTags={setTags}
         setToast={setToast}
+        later={later}
         items={items}
         selectedSize={selected.size}
         clearSelected={() => setSelected(new Set())}
@@ -3303,8 +3485,10 @@ export function App() {
               }
             : undefined
         }
+        // Expiry is not something done, so Z still undoes the last action
+        // after the message has gone, as it always has.
         onDone={() => {
-          setToast(null);
+          showToast(null);
           setUndoOffer(null);
         }}
       />

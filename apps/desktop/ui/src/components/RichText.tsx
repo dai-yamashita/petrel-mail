@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import {
   Select, SelectItem, SelectPopover, SelectProvider,
 } from '@ariakit/react';
-import { EditorContent, useEditor, type Editor } from '@tiptap/react';
-import { TextSelection } from '@tiptap/pm/state';
+import { EditorContent, generateJSON, useEditor, type Editor, type Extensions } from '@tiptap/react';
+import { Selection, TextSelection } from '@tiptap/pm/state';
 import StarterKit from '@tiptap/starter-kit';
 import { Blockquote } from '@tiptap/extension-blockquote';
 import { Image } from '@tiptap/extension-image';
@@ -14,7 +14,7 @@ import {
   Bold, ChevronDown, Code, Italic, Link2, List, ListOrdered, Quote,
   Strikethrough, Type, Underline, type LucideIcon,
 } from 'lucide-react';
-import type { DocNode } from '../lib/plain-text';
+import { plainTextFromDoc, type DocNode } from '../lib/plain-text';
 import { EMBED_CAP, asDataUrl, pastedImages } from '../lib/paste-image';
 import { Icon } from './Icon';
 import { t, type StringId } from '../lib/strings';
@@ -76,6 +76,54 @@ const CiteBlockquote = Blockquote.extend({
   },
 });
 
+/** The composer's schema: what the editor edits, and what `plainTextOf` reads
+ *  a body with, so the two cannot come to disagree. */
+export function composerExtensions(): Extensions {
+  return [
+    StarterKit.configure({
+      // Not a document, and not a place to paste a file.
+      heading: false,
+      // Replaced below, to keep the cite attribute quoting depends on.
+      blockquote: false,
+      codeBlock: false,
+      horizontalRule: false,
+      link: {
+        // In an editor a click means "put the caret here", not "leave".
+        openOnClick: false,
+        autolink: true,
+        // A pasted URL becomes a link; a pasted anything-else does not.
+        protocols: ['http', 'https', 'mailto'],
+      },
+    }),
+    // Font family and size ride on a text-style mark, which renders as an
+    // inline style — the only form of styling mail clients agree on. A
+    // stylesheet in the head is stripped by most webmail, and a class name
+    // means nothing at the other end.
+    CiteBlockquote,
+    // Pasted pictures. Base64 stays allowed because a draft *is* a data:
+    // URI until send, when each becomes a MIME part of its own.
+    Image.configure({ allowBase64: true }),
+    TextStyle,
+    FontFamily,
+    FontSize,
+  ];
+}
+
+/**
+ * The plain-text half of a body the editor has not touched yet.
+ *
+ * The editor only reports its document when something changes it, and it does
+ * not count its own starting content as a change. A reply got its text half by
+ * accident — putting the caret in the body appends a line after the quote —
+ * but a forward opens with the caret in To, so one sent without an edit went
+ * out with a text half that was the signature alone: nothing at all to anyone
+ * reading plain text, and all Petrel's own Sent copy was ever indexed by. Read
+ * here from the same document the editor makes of the same HTML.
+ */
+export function plainTextOf(html: string): string {
+  return plainTextFromDoc(generateJSON(html, composerExtensions()) as DocNode);
+}
+
 type Props = {
   /** The body as HTML. Read on mount and when the draft is swapped, not on
    *  every keystroke — the editor owns its own content while it is open. */
@@ -122,34 +170,7 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
   const openHref = useRef<string>('');
 
   const editor = useEditor({
-    extensions: [
-      StarterKit.configure({
-        // Not a document, and not a place to paste a file.
-        heading: false,
-        // Replaced below, to keep the cite attribute quoting depends on.
-        blockquote: false,
-        codeBlock: false,
-        horizontalRule: false,
-        link: {
-          // In an editor a click means "put the caret here", not "leave".
-          openOnClick: false,
-          autolink: true,
-          // A pasted URL becomes a link; a pasted anything-else does not.
-          protocols: ['http', 'https', 'mailto'],
-        },
-      }),
-      // Font family and size ride on a text-style mark, which renders as an
-      // inline style — the only form of styling mail clients agree on. A
-      // stylesheet in the head is stripped by most webmail, and a class name
-      // means nothing at the other end.
-      CiteBlockquote,
-      // Pasted pictures. Base64 stays allowed because a draft *is* a data:
-      // URI until send, when each becomes a MIME part of its own.
-      Image.configure({ allowBase64: true }),
-      TextStyle,
-      FontFamily,
-      FontSize,
-    ],
+    extensions: composerExtensions(),
     content: html || '',
     editorProps: {
       attributes: {
@@ -203,8 +224,26 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
   // At the top, where a reply is written above the quote and a new message
   // above its signature. The end put the caret below the signature, and in a
   // reply at the foot of the quoted original, inside it.
+  //
+  // The caret first, as a transaction of its own, and then focus. As the one
+  // command `focus('start')`, a WebKit that names itself Safari (WebKitGTK on
+  // Linux; not the Mac's own web view) focused the editor from inside it; the
+  // editor settled there — a quote at the end gets a line after it — and the
+  // command's transaction no longer fitted the document: "Applying a
+  // mismatched transaction", thrown from this effect, took the whole window
+  // down on every reply. A frame late too, so nothing thrown in here can do
+  // that again.
   useEffect(() => {
-    if (autoFocus) editor?.commands.focus('start');
+    if (!autoFocus || !editor) return;
+    const h = requestAnimationFrame(() => {
+      if (editor.isDestroyed) return;
+      editor.commands.command(({ tr }) => {
+        tr.setSelection(Selection.atStart(tr.doc));
+        return true;
+      });
+      editor.commands.focus();
+    });
+    return () => cancelAnimationFrame(h);
   }, [autoFocus, editor]);
 
   // Whether the card is up, not the card itself: focus belongs on the first

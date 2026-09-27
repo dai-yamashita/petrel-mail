@@ -62,6 +62,11 @@ pub(crate) struct AppState {
     /// probed last, so with Gmail beside Dovecot half of launches drained one
     /// account's changes with the other's commands.
     pub(crate) caps: Mutex<std::collections::HashMap<i64, ServerCaps>>,
+    /// Accounts whose folders a survey this session has listed and stored:
+    /// which mailbox is the archive, and which of the server's mailboxes are
+    /// views of everything rather than places. The launch survey marks them,
+    /// and so does any later one, once what it found is in the store.
+    pub(crate) surveyed: Mutex<std::collections::HashSet<i64>>,
     /// One pair of outbox wake-ups per account, registered by the account's
     /// sync when it starts. A single shared `Notify` looked simpler and was
     /// wrong with two accounts: `notify_one` wakes whichever worker is first
@@ -266,6 +271,27 @@ impl AppState {
             .get(&account)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Whether a folder survey this session has stored what it found for the
+    /// account: which mailbox is the archive, and which of the server's
+    /// mailboxes are views of everything rather than places.
+    pub(crate) fn surveyed(&self, account: i64) -> bool {
+        self.surveyed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&account)
+    }
+
+    /// Records a survey as stored. After the store has its findings, not
+    /// before: an Archive opened in between would sync on the old marks. Not
+    /// only at launch either: a launch that found no network never surveyed,
+    /// and the next survey that gets through is as good.
+    pub(crate) fn mark_surveyed(&self, account: i64) {
+        self.surveyed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(account);
     }
 
     pub(crate) fn set_caps(&self, account: i64, caps: ServerCaps) {
@@ -584,6 +610,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Arc<AppState> {
         stops: Mutex::new(std::collections::HashMap::new()),
         picked: Mutex::new(std::collections::HashSet::new()),
         caps: Mutex::new(std::collections::HashMap::new()),
+        surveyed: Mutex::new(std::collections::HashSet::new()),
         outbox: Mutex::new(Vec::new()),
         draining: AtomicBool::new(false),
         reindexing: AtomicBool::new(false),
@@ -725,5 +752,27 @@ mod worker_switch_tests {
         );
         assert!(all.get(&1).copied().unwrap_or_default().is_gmail);
         assert!(!all.get(&2).copied().unwrap_or_default().is_gmail);
+    }
+
+    /// Surveyed means a survey's findings are in the store, per account.
+    /// The server's capabilities do not stand in for it: the launch probe
+    /// records those before it has stored anything.
+    #[test]
+    fn an_account_counts_as_surveyed_only_once_its_survey_is_stored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state(dir.path());
+        assert!(!state.surveyed(1));
+        state.set_caps(
+            1,
+            ServerCaps {
+                has_move: true,
+                has_uidplus: true,
+                is_gmail: false,
+            },
+        );
+        assert!(!state.surveyed(1), "capabilities are not a stored survey");
+        state.mark_surveyed(1);
+        assert!(state.surveyed(1));
+        assert!(!state.surveyed(2), "one account's survey is not another's");
     }
 }

@@ -170,12 +170,18 @@ impl Store {
             cursor = i64::MAX;
         }
 
+        // Not a row the composer owns — a draft being written here, or post in
+        // the outbox. What it says is what the composer last saved; its blob
+        // is only the copy last pushed to the server, and re-extracting that
+        // put a Send Later's removed recipient and replaced subject back.
         let rows: Vec<(i64, String)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, blob_hash FROM messages
-                 WHERE blob_hash IS NOT NULL AND deleted_at_ms IS NULL AND id < ?1
-                 ORDER BY id DESC LIMIT ?2",
-            )?;
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT m.id, m.blob_hash FROM messages m
+                 WHERE m.blob_hash IS NOT NULL AND m.deleted_at_ms IS NULL AND m.id < ?1
+                   AND {}
+                 ORDER BY m.id DESC LIMIT ?2",
+                folders::NOT_DRAFT_OR_OUTBOX
+            ))?;
             let it = stmt.query_map(
                 params![cursor, i64::try_from(limit).unwrap_or(i64::MAX)],
                 |r| Ok((r.get(0)?, r.get(1)?)),

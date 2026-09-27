@@ -380,6 +380,7 @@ pub fn run() {
         stops: Mutex::new(std::collections::HashMap::new()),
         picked: Mutex::new(std::collections::HashSet::new()),
         caps: Mutex::new(std::collections::HashMap::new()),
+        surveyed: Mutex::new(std::collections::HashSet::new()),
         outbox: Mutex::new(Vec::new()),
         draining: AtomicBool::new(false),
         reindexing: AtomicBool::new(false),

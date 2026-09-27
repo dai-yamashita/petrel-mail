@@ -270,6 +270,22 @@ impl Store {
 
         self.check_action_target(account_id, kind, target)?;
 
+        // And the conversation has to be this account's. Every selection
+        // below goes by thread id alone, so a thread from another account —
+        // from a pop-out left open across an account switch, or a batch still
+        // running when the account changed — was filed into this account's
+        // folders and queued under it with the other account's folder and
+        // UID, and this account's drain then moved or expunged whatever of
+        // its own mail stood at that number. Refused, as
+        // `apply_message_action` refuses another account's row.
+        if let Some(owner) = self.thread_account(thread_id)?
+            && owner != account_id
+        {
+            return Err(StoreError::Rejected(
+                "that conversation is not this account's".into(),
+            ));
+        }
+
         let flag_filter = match kind {
             ActionKind::MarkRead => format!(" AND flags & {} = 0", flags::SEEN),
             ActionKind::MarkUnread => format!(" AND flags & {} != 0", flags::SEEN),
@@ -966,6 +982,22 @@ impl Store {
             if reached > 0 { "sent" } else { "undeliverable" },
         )?;
         Ok(true)
+    }
+
+    /// The account a conversation belongs to, or `None` when nothing in it
+    /// is live. Any member answers: `assign_thread` only ever links messages
+    /// of one account, so a thread never spans two.
+    pub fn thread_account(&self, thread_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT account_id FROM messages
+                  WHERE coalesce(thread_id, -id) = ?1 AND deleted_at_ms IS NULL
+                  LIMIT 1",
+                params![thread_id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     fn thread_message_ids(&self, thread_id: i64, extra: &str) -> Result<Vec<i64>> {

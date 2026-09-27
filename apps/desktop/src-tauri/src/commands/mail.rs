@@ -46,9 +46,9 @@ pub fn list_threads(
 /// Those folders are not on the IDLE wake path. Waiting for the
 /// five-minute sweep is what made the list look stale next to the
 /// inbox. One folder, not every folder — a wake that swept the tree
-/// put the inbox behind half a minute again. Inbox, archive, tags,
-/// snoozed and outbox are ignored here: inbox has IDLE, archive is
-/// All Mail, the rest have no server folder to SELECT.
+/// put the inbox behind half a minute again. Inbox, tags, snoozed and
+/// outbox are ignored here: inbox has IDLE, the rest have no server
+/// folder to SELECT. So is Archive on Gmail, where it is All Mail.
 #[tauri::command]
 pub async fn sync_mailbox(view: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let account = {

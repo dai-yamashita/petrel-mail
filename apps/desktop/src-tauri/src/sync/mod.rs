@@ -98,6 +98,7 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                 // user's other labels instead of clearing them.
                 looks_like_gmail = cfg.host.contains("gmail")
                     || report.folders.iter().any(|f| f.name.starts_with("[Gmail]"));
+                let all_mail = all_mail_paths(&report.folders, looks_like_gmail);
                 state.set_caps(
                     account,
                     crate::state::ServerCaps {
@@ -106,6 +107,7 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                         is_gmail: looks_like_gmail,
                     },
                 );
+                let mut stored = false;
                 if let Ok(mut store) = state.store.lock() {
                     let tag_names: Vec<String> = store
                         .tags_for_account(account)
@@ -116,9 +118,13 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                         Ok(n) => log_sync(&format!("{n} folder(s) stored")),
                         Err(e) => log_sync(&format!("folder sync failed: {e}")),
                     }
+                    stored = store.set_all_mail_folders(account, &all_mail).is_ok();
                     if looks_like_gmail {
                         let _ = store.set_account_kind(account, "gmail");
                     }
+                }
+                if stored {
+                    state.mark_surveyed(account);
                 }
                 create_waiting_folders(&state, account, &cfg).await;
             }
@@ -519,7 +525,7 @@ async fn refresh_folders(
         .collect();
     // In a block of its own: the guard has to be gone before the await
     // below, and a `drop` does not convince the compiler of that.
-    {
+    let stored = {
         let Ok(mut store) = state.store.lock() else {
             return;
         };
@@ -533,8 +539,30 @@ async fn refresh_folders(
             Ok(_) => {}
             Err(e) => log_sync(&format!("folder sync failed: {e}")),
         }
+        store
+            .set_all_mail_folders(account, &all_mail_paths(&report.folders, looks_like_gmail))
+            .is_ok()
+    };
+    // What the launch survey did, for a launch that had no network to do it.
+    if stored {
+        state.mark_surveyed(account);
     }
     create_waiting_folders(state, account, cfg).await;
+}
+
+/// The mailboxes a survey found flagged `\All` that are not the archive, by
+/// path: none on Gmail, where All Mail is the archive; elsewhere, what
+/// `folders_to_sync_from` must leave alone. See `set_all_mail_folders`.
+fn all_mail_paths(folders: &[petrel_providers::imap::FolderInfo], gmail: bool) -> Vec<String> {
+    if gmail {
+        return Vec::new();
+    }
+    folders
+        .iter()
+        .filter(|f| petrel_providers::imap::selectable(f))
+        .filter(|f| petrel_providers::imap::is_all_mailbox(f))
+        .map(|f| f.name.clone())
+        .collect()
 }
 
 /// Creates on the server the folders made here that it does not have yet.
@@ -626,9 +654,11 @@ struct CycleReport {
 }
 
 /// Folders that may be fetched when the person opens them. Inbox has
-/// IDLE. Archive is All Mail. Snoozed, outbox and tags have no folder
-/// to SELECT.
-const ON_OPEN_ROLES: &[&str] = &["sent", "drafts", "spam", "trash", "starred"];
+/// IDLE. Archive is here for the accounts where it is a folder of its own;
+/// on Gmail it is All Mail, which `folders_to_sync` leaves out, so opening
+/// it there narrows to nothing. Snoozed, outbox and tags have no folder to
+/// SELECT.
+const ON_OPEN_ROLES: &[&str] = &["sent", "drafts", "spam", "trash", "starred", "archive"];
 
 fn open_sync_scope(view: &str) -> Option<Scope> {
     if let Some(role) = ON_OPEN_ROLES.iter().copied().find(|r| *r == view) {
@@ -689,6 +719,17 @@ pub(crate) fn spawn_view_sync(state: Arc<AppState>, account: i64, view: &str) {
     let Some(scope) = open_sync_scope(view) else {
         return;
     };
+    // A mailbox with no folder of its own on this account — Archive on
+    // Gmail — has nothing to fetch. Nor, until a survey this session has
+    // stored what it found, does Archive: the role can sit on a server's view
+    // of every message, which the survey marks and sync then leaves alone,
+    // and the sweep straight after that survey fetches the real one anyway.
+    if scope == Scope::Role("archive") && !state.surveyed(account) {
+        return;
+    }
+    if narrow(folders_to_sync(&state, account), scope).is_empty() {
+        return;
+    }
     let key = view.to_string();
     if !claim_folder_sync(&state, &key) {
         return;
@@ -1287,6 +1328,24 @@ pub(crate) fn folders_to_sync_from(store: &Store, account: i64) -> Vec<(String, 
                 .map(|f| ((*role).to_string(), f.path.clone(), f.id))
         })
         .collect();
+    // The archive, wherever it is a folder like any other. On Gmail the role
+    // is All Mail, which is left out above and walked on its own
+    // (backfill.rs). Everywhere else it is where archived mail lives: left
+    // out, a fresh install never showed an archived message, and one another
+    // client archived lost its only placement at the next inbox pass and was
+    // tombstoned. The folder the drain files into and the view lists, not
+    // merely the first to wear the role — and never a mailbox the server
+    // flags `\All`, a view of the whole account that takes the role too.
+    if matches!(
+        store.placement_policy(account),
+        Ok(petrel_engine::actions::PlacementPolicy::Exclusive)
+    ) && let Ok(Some(id)) = store.folder_for_role(account, "archive")
+        && !store.folder_is_local(id).unwrap_or(false)
+        && !store.folder_is_all_mail(id).unwrap_or(false)
+        && let Some(f) = all.iter().find(|f| f.id == id)
+    {
+        out.push(("archive".to_string(), f.path.clone(), f.id));
+    }
     // Folders the user made sync too — a folder whose mail never arrives is
     // not a folder, it is a name. After the roles, so the inbox still fills
     // first. Local folders are the exception both ways: the server has never
@@ -1885,7 +1944,9 @@ mod folder_survey_tests {
 mod scope_tests {
     use super::{Scope, narrow, open_sync_scope};
 
-    /// The shape `folders_to_sync` returns: (role, path, id), roles first.
+    /// The shape `folders_to_sync` returns: (role, path, id), roles first —
+    /// as a classic account's survey leaves it, where the plain `Archive`
+    /// wears the role and a nested year does not.
     fn targets() -> Vec<(String, String, i64)> {
         [
             ("inbox", "INBOX", 1),
@@ -1894,8 +1955,8 @@ mod scope_tests {
             ("spam", "Spam", 7),
             ("trash", "Trash", 3),
             ("starred", "Starred", 8),
+            ("archive", "Archive", 4),
             ("", "Contracts", 9),
-            ("", "Archive", 4),
             ("", "Archive/2026", 5),
         ]
         .into_iter()
@@ -1937,14 +1998,30 @@ mod scope_tests {
     }
 
     #[test]
-    fn opening_inbox_or_archive_does_not_ask_the_server() {
-        // Inbox has IDLE. Archive is All Mail, excluded from folders_to_sync
-        // so it must not grow a SELECT here either.
+    fn opening_the_inbox_or_a_folderless_view_does_not_ask_the_server() {
+        // Inbox has IDLE; the others have no folder to SELECT.
         assert_eq!(open_sync_scope("inbox"), None);
-        assert_eq!(open_sync_scope("archive"), None);
         assert_eq!(open_sync_scope("outbox"), None);
         assert_eq!(open_sync_scope("snoozed"), None);
         assert_eq!(open_sync_scope("tag:urgent"), None);
+    }
+
+    #[test]
+    fn opening_archive_takes_the_archive_and_not_the_years_under_it() {
+        assert_eq!(open_sync_scope("archive"), Some(Scope::Role("archive")));
+        let out = narrow(targets(), Scope::Role("archive"));
+        let paths: Vec<&str> = out.iter().map(|(_, p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["Archive"]);
+    }
+
+    #[test]
+    fn opening_archive_where_it_is_not_synced_narrows_to_nothing() {
+        // Gmail: All Mail is not in the list, so there is nothing to fetch.
+        let gmail: Vec<(String, String, i64)> = targets()
+            .into_iter()
+            .filter(|(role, _, _)| role != "archive")
+            .collect();
+        assert!(narrow(gmail, Scope::Role("archive")).is_empty());
     }
 
     #[test]
@@ -1989,6 +2066,187 @@ mod scope_tests {
         // folders would put the cost straight back.
         let none: Vec<(String, String, i64)> = vec![(String::new(), "Archive".to_string(), 4)];
         assert!(narrow(none, Scope::Inbox).is_empty());
+    }
+}
+
+/// The list itself, from a survey stored the way a real one is. The fixture
+/// above gave Archive an empty role, a state the survey never leaves it in,
+/// and that is how a classic account's archive went unsynced unnoticed.
+#[cfg(test)]
+mod sync_list_tests {
+    use super::folders_to_sync_from;
+    use petrel_engine::store::Store;
+
+    fn surveyed(survey: &[(&str, Option<&str>)]) -> (Store, i64) {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store.ensure_test_account().unwrap();
+        let folders: Vec<(String, Option<String>)> = survey
+            .iter()
+            .map(|(path, role)| ((*path).to_string(), role.map(String::from)))
+            .collect();
+        store.sync_folders(account, &folders).unwrap();
+        (store, account)
+    }
+
+    fn listed(store: &Store, account: i64) -> Vec<(String, String)> {
+        folders_to_sync_from(store, account)
+            .into_iter()
+            .map(|(role, path, _)| (role, path))
+            .collect()
+    }
+
+    fn pair(role: &str, path: &str) -> (String, String) {
+        (role.to_string(), path.to_string())
+    }
+
+    #[test]
+    fn a_plain_archive_on_a_classic_account_is_synced() {
+        // Namecheap: no \Archive flag; the survey adopts the plain folder.
+        let (store, a) = surveyed(&[("INBOX", Some("inbox")), ("Archive", None)]);
+        assert!(listed(&store, a).contains(&pair("archive", "Archive")));
+    }
+
+    #[test]
+    fn a_special_use_archive_is_synced() {
+        // iCloud, Fastmail, Dovecot: the server flags it \Archive.
+        let (store, a) = surveyed(&[("INBOX", Some("inbox")), ("Archive", Some("archive"))]);
+        assert!(listed(&store, a).contains(&pair("archive", "Archive")));
+    }
+
+    #[test]
+    fn gmails_all_mail_is_not_synced() {
+        let (store, a) = surveyed(&[
+            ("INBOX", Some("inbox")),
+            ("[Gmail]/All Mail", Some("archive")),
+        ]);
+        store.set_account_kind(a, "gmail").unwrap();
+        let list = listed(&store, a);
+        assert!(
+            list.iter().all(|(_, path)| path != "[Gmail]/All Mail"),
+            "All Mail holds every message; syncing it doubles the store: {list:?}"
+        );
+    }
+
+    #[test]
+    fn the_archive_follows_the_roles_and_precedes_the_persons_folders() {
+        let (store, a) = surveyed(&[
+            ("INBOX", Some("inbox")),
+            ("Sent", Some("sent")),
+            ("Drafts", Some("drafts")),
+            ("Junk", None),
+            ("Trash", None),
+            ("Archive", None),
+            ("Archive/2026", None),
+            ("Contracts", None),
+        ]);
+        assert_eq!(
+            listed(&store, a),
+            vec![
+                pair("inbox", "INBOX"),
+                pair("sent", "Sent"),
+                pair("drafts", "Drafts"),
+                pair("spam", "Junk"),
+                pair("trash", "Trash"),
+                pair("archive", "Archive"),
+                // A year under it is a place, not the mailbox, and syncs as
+                // one of the person's folders — once.
+                pair("", "Archive/2026"),
+                pair("", "Contracts"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_local_archive_is_not_asked_about() {
+        let (mut store, a) = surveyed(&[("INBOX", Some("inbox")), ("Archive", Some("archive"))]);
+        let id = store.folder_for_role(a, "archive").unwrap().unwrap();
+        store.mark_folder_local(id).unwrap();
+        assert!(
+            listed(&store, a).iter().all(|(role, _)| role != "archive"),
+            "the server has never heard of a local folder"
+        );
+    }
+
+    #[test]
+    fn a_mailbox_flagged_all_is_never_synced_as_the_archive() {
+        // Dovecot's stock set plus its documented `virtual/All`, and a plain
+        // Archive. The survey hands the role to `virtual/All`; syncing that
+        // would download the whole account again and list it all as Archive.
+        let (store, a) = surveyed(&[
+            ("INBOX", Some("inbox")),
+            ("Sent", Some("sent")),
+            ("virtual/All", Some("archive")),
+            ("Archive", None),
+        ]);
+        store
+            .set_all_mail_folders(a, &["virtual/All".to_string()])
+            .unwrap();
+        let list = listed(&store, a);
+        assert!(
+            list.iter().all(|(_, path)| path != "virtual/All"),
+            "{list:?}"
+        );
+        // Everything else as it was: the plain Archive syncs as a folder.
+        assert!(list.contains(&pair("", "Archive")), "{list:?}");
+    }
+
+    #[test]
+    fn the_all_mark_follows_the_survey_and_leaves_other_marks_alone() {
+        let (mut store, a) = surveyed(&[("INBOX", Some("inbox")), ("All", Some("archive"))]);
+        let id = store.folder_for_role(a, "archive").unwrap().unwrap();
+        store.mark_folder_local(id).unwrap();
+        store.set_all_mail_folders(a, &["All".to_string()]).unwrap();
+        assert!(store.folder_is_all_mail(id).unwrap());
+        assert!(
+            store.folder_is_local(id).unwrap(),
+            "the local mark survives"
+        );
+        // A survey that no longer flags it takes the mark away.
+        store.set_all_mail_folders(a, &[]).unwrap();
+        assert!(!store.folder_is_all_mail(id).unwrap());
+        assert!(store.folder_is_local(id).unwrap());
+    }
+
+    #[test]
+    fn the_survey_names_the_all_mailboxes_everywhere_but_gmail() {
+        use super::all_mail_paths;
+        use petrel_providers::imap::FolderInfo;
+        let folder = |name: &str, attrs: &[&str]| FolderInfo {
+            name: name.into(),
+            delimiter: Some("/".into()),
+            attributes: attrs.iter().map(|s| s.to_string()).collect(),
+        };
+        let found = [
+            folder("INBOX", &[]),
+            folder("Archive", &["\\Archive"]),
+            folder("virtual/All", &["\\All"]),
+            folder("virtual", &["\\Noselect"]),
+        ];
+        assert_eq!(
+            all_mail_paths(&found, false),
+            vec!["virtual/All".to_string()]
+        );
+        // Gmail's All Mail is the archive, and is walked as one.
+        let gmail = [folder("[Gmail]/All Mail", &["\\All"])];
+        assert!(all_mail_paths(&gmail, true).is_empty());
+    }
+
+    #[test]
+    fn the_archive_synced_is_the_one_the_drain_files_into() {
+        // Two folders wearing the role, as a server flagging both \Archive
+        // and \All would leave them. One is synced: the one mail goes to.
+        let (store, a) = surveyed(&[
+            ("INBOX", Some("inbox")),
+            ("Archive", Some("archive")),
+            ("All", Some("archive")),
+        ]);
+        let target = store.folder_for_role(a, "archive").unwrap().unwrap();
+        let archives: Vec<i64> = folders_to_sync_from(&store, a)
+            .into_iter()
+            .filter(|(role, _, _)| role == "archive")
+            .map(|(_, _, id)| id)
+            .collect();
+        assert_eq!(archives, vec![target]);
     }
 }
 

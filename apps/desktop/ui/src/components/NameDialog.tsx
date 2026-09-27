@@ -99,6 +99,11 @@ export function NameDialog({
               return;
             }
             if (e.key !== 'Enter') return;
+            // Kept from the page, or it outlives the dialog: committing
+            // closes it, focus goes back to whatever opened it within the
+            // same keystroke, and the Enter then pressed that button — the +
+            // or the menu item — and opened it all over again.
+            e.preventDefault();
             commit();
           }}
         />

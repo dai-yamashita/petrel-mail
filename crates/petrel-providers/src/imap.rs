@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_imap::extensions::idle::IdleResponse;
-use async_imap::imap_proto::{AttributeValue, MessageSection, Response, SectionPath, Status};
+use async_imap::imap_proto::{
+    AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
+};
 use async_imap::types::Flag;
 use async_imap::{Client, Session};
 use futures::StreamExt;
@@ -1437,6 +1439,72 @@ where
             }
             // EXISTS, EXPUNGE, an unsolicited FLAGS: not this command's
             // business, and not a reason to stop reading.
+            _ => {}
+        }
+    }
+}
+
+/// Runs a SEARCH or UID SEARCH and returns what it found, sorted — or an
+/// error when the server did not answer it `OK`.
+///
+/// The typed `search` and `uid_search` stop at the tagged reply without
+/// reading its status, the flaw `fetch_command` exists for. A SEARCH answered
+/// `NO [SERVERBUG]` arrived as an empty answer, and an empty answer to "which
+/// of these UIDs are still here" reads as "none of them": the removal check
+/// dropped every placement in the folder, and on a classic account every
+/// message in it went with them. `command` is the whole line after the tag.
+async fn search_command<S>(session: &mut Session<S>, command: String) -> Result<Vec<u32>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    let tag = session.run_command(&command).await?;
+    let name = if command.starts_with("UID ") {
+        "UID SEARCH"
+    } else {
+        "SEARCH"
+    };
+    let mut found: Vec<u32> = Vec::new();
+    loop {
+        let Some(response) = session.read_response().await? else {
+            return Err(ImapError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("{name}: the connection closed before the server answered"),
+            )));
+        };
+        match response.parsed() {
+            Response::MailboxData(MailboxDatum::Search(ids)) => found.extend(ids.iter().copied()),
+            Response::Done {
+                tag: answered,
+                status,
+                information,
+                ..
+            } if answered == &tag => {
+                return match status {
+                    Status::Ok => {
+                        found.sort_unstable();
+                        found.dedup();
+                        Ok(found)
+                    }
+                    _ => Err(ImapError::Protocol(format!(
+                        "{name}: {status:?} {}",
+                        information.as_deref().unwrap_or_default()
+                    ))),
+                };
+            }
+            Response::Data {
+                status: Status::Bye,
+                information,
+                ..
+            } => {
+                return Err(ImapError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!(
+                        "{name}: the server closed the connection ({})",
+                        information.as_deref().unwrap_or_default()
+                    ),
+                )));
+            }
+            // EXISTS, EXPUNGE, an unsolicited FLAGS: as for a FETCH.
             _ => {}
         }
     }
@@ -3001,8 +3069,18 @@ where
     let already_there = match message_id {
         Some(id) => {
             session.select(wire_name(to)).await?;
-            let query = format!("HEADER Message-ID {}", quote_imap(id));
-            !session.uid_search(query).await?.is_empty()
+            let query = format!("UID SEARCH HEADER Message-ID {}", quote_imap(id));
+            match search_command(&mut session, query).await {
+                Ok(hits) => !hits.is_empty(),
+                // A refusal (a tagged NO or BAD) cannot say whether the copy
+                // landed. Copying again risks a duplicate in the destination;
+                // not copying risks a move that never happens. The duplicate
+                // is the smaller harm, and it is what happened here before a
+                // refusal was visible. Anything else fails the move, as it
+                // always did, and the drain asks again.
+                Err(ImapError::Protocol(_)) => false,
+                Err(e) => return Err(e),
+            }
         }
         None => false,
     };
@@ -3062,9 +3140,7 @@ where
 {
     let mut session = sign_in(client, cfg).await?;
     session.select(wire_name(folder)).await?;
-    let hits = session.uid_search(query).await?;
-    let mut found: Vec<u32> = hits.into_iter().collect();
-    found.sort_unstable();
+    let found = search_command(&mut session, format!("UID SEARCH {query}")).await?;
     sign_out(&mut session).await?;
     Ok(found)
 }
@@ -3109,12 +3185,14 @@ where
     match uid_next {
         // Without a UIDNEXT there is no last number to walk towards, so the
         // one broad question is the only one that can be asked.
-        None => found.extend(session.uid_search("ALL").await?),
+        None => found.extend(search_command(session, "UID SEARCH ALL".to_string()).await?),
         Some(uid_next) => {
             let mut first = 1u32;
             while first < uid_next {
                 let last = first.saturating_add(SEARCH_RANGE - 1).min(uid_next - 1);
-                found.extend(session.uid_search(format!("UID {first}:{last}")).await?);
+                found.extend(
+                    search_command(session, format!("UID SEARCH UID {first}:{last}")).await?,
+                );
                 if last == uid_next - 1 {
                     break;
                 }
@@ -3147,9 +3225,7 @@ where
 {
     let mut session = sign_in(client, cfg).await?;
     session.select(wire_name(folder)).await?;
-    let hits = session.search(query).await?;
-    let mut found: Vec<u32> = hits.into_iter().collect();
-    found.sort_unstable();
+    let found = search_command(&mut session, format!("SEARCH {query}")).await?;
     sign_out(&mut session).await?;
     Ok(found)
 }
@@ -3280,6 +3356,23 @@ mod tests {
 /// here fails silently and leaves every folder unmapped, which reads as "this
 /// server has no Sent folder" rather than as a parsing bug.
 ///
+/// Whether a mailbox is flagged `\All` (RFC 6154) and not `\Archive`: a view
+/// of every message the account holds.
+///
+/// On Gmail that is All Mail, the archive. Anywhere else — Dovecot's
+/// `virtual/All`, Proton Bridge's All Mail — it is not somewhere mail is
+/// filed, though [`special_use_role`] still gives it the archive role, and
+/// syncing it as the archive downloads the whole account a second time. The
+/// caller records these so sync leaves them alone.
+pub fn is_all_mailbox(folder: &FolderInfo) -> bool {
+    let tokens: Vec<String> = folder
+        .attributes
+        .iter()
+        .map(|a| normalise_attr(a))
+        .collect();
+    tokens.iter().any(|t| t == "all") && !tokens.iter().any(|t| t == "archive")
+}
+
 /// Gmail is the reason `\All` maps to archive. It has no `\Archive` at all —
 /// archiving there means removing the Inbox label, and everything lives in All
 /// Mail. Treating All Mail as the archive destination is what makes
@@ -3386,6 +3479,20 @@ mod special_use_tests {
                 "failed on {rendering}"
             );
         }
+    }
+
+    #[test]
+    fn an_all_mailbox_is_recognised_however_it_is_rendered() {
+        assert!(is_all_mailbox(&f(
+            "virtual/All",
+            &["\\All", "\\HasNoChildren"]
+        )));
+        assert!(is_all_mailbox(&f("All Mail", &["Extension(\"\\\\All\")"])));
+        assert!(!is_all_mailbox(&f("Archive", &["\\Archive"])));
+        // Flagged both ways, it is an archive that happens to hold everything.
+        assert!(!is_all_mailbox(&f("Archive", &["\\Archive", "\\All"])));
+        assert!(!is_all_mailbox(&f("INBOX", &[])));
+        assert!(!is_all_mailbox(&f("Allotments", &["\\HasNoChildren"])));
     }
 
     #[test]

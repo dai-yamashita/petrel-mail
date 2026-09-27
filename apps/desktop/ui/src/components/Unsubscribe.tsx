@@ -19,11 +19,14 @@ export function Unsubscribe({
   messageId,
   sender,
   onToast,
+  later,
   onComposeMailto,
 }: {
   messageId: number;
   sender: string;
   onToast: (text: string) => void;
+  /** Where the one-click answer is said, taken when it is asked for. */
+  later?: () => (text: string) => void;
   /** Absent where no composer can open (the popped-out reader). */
   onComposeMailto?: (to: string, subject: string) => void;
 }) {
@@ -55,10 +58,13 @@ export function Unsubscribe({
   const run = () => {
     setAsking(false);
     if (info.one_click) {
+      // The sender's server answers, in its own time — often after the
+      // newsletter has been archived.
+      const say = later ? later() : onToast;
       void api
         .unsubscribeOneClick(messageId)
-        .then(() => onToast(t('unsub-done', { sender })))
-        .catch((e) => onToast(t('unsub-failed', { error: String(e) })));
+        .then(() => say(t('unsub-done', { sender })))
+        .catch((e) => say(t('unsub-failed', { error: String(e) })));
       return;
     }
     if (info.url) {

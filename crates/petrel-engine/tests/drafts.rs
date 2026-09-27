@@ -892,3 +892,295 @@ mod account_home {
         );
     }
 }
+
+/// A draft being written here, and post in the outbox, say what the composer
+/// last saved — not what the copy last pushed to the server said.
+///
+/// The pushed copy comes back through ordinary folder sync and lands on the
+/// row by Message-ID. Taking that copy's subject and recipients for the row's
+/// own reverted every edit made after the push, and since a row with a send
+/// time is no longer pushed again, a Send Later went out to the recipient who
+/// had been removed, under the subject that had been replaced. A re-extraction
+/// after an upgrade did the same from the stored copy.
+mod composer_owns_its_words {
+    use petrel_engine::blob::BlobStore;
+    use petrel_engine::store::{DraftEnvelope, ListView, Sort, Store};
+
+    const MSGID: &str = "draft-abc@petrel.test";
+    const NOW: i64 = 1_790_000_000_000;
+
+    fn setup() -> (tempfile::TempDir, Store, BlobStore, i64, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        let blobs = BlobStore::open(&dir.path().join("blobs")).unwrap();
+        let account = store.ensure_test_account().unwrap();
+        let drafts = store.ensure_folder(account, "drafts", "Drafts").unwrap();
+        (dir, store, blobs, account, drafts)
+    }
+
+    /// The copy `push_draft_to_server` renders, as folder sync fetches it.
+    fn pushed_copy(to: &str, subject: &str, body: &str) -> Vec<u8> {
+        format!(
+            "From: Me <me@example.com>\r\nTo: {to}\r\nSubject: {subject}\r\n\
+             Date: Tue, 18 Aug 2026 14:02:00 +0000\r\nMessage-ID: <{MSGID}>\r\n\
+             MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn save(
+        store: &Store,
+        account: i64,
+        id: Option<i64>,
+        to: &str,
+        subject: &str,
+        body: &str,
+    ) -> i64 {
+        store
+            .save_draft_full(
+                account,
+                id,
+                to,
+                "",
+                subject,
+                body,
+                &format!("<p>{body}</p>"),
+                &DraftEnvelope::default(),
+            )
+            .unwrap()
+    }
+
+    /// Written, pushed as uid 41 mid-composition, then finished: a
+    /// recipient swapped (dana must not get this one), the subject settled.
+    fn pushed_then_edited(store: &mut Store, account: i64) -> i64 {
+        let id = save(
+            store,
+            account,
+            None,
+            "dana@example.com",
+            "Quarterly draft",
+            "first words",
+        );
+        store.set_draft_msgid(id, MSGID).unwrap();
+        store.set_draft_server_uid(id, Some(41)).unwrap();
+        save(
+            store,
+            account,
+            Some(id),
+            "sam@example.com",
+            "Quarterly final numbers",
+            "final words",
+        );
+        id
+    }
+
+    fn fetch_back_the_push(
+        store: &mut Store,
+        blobs: &BlobStore,
+        account: i64,
+        drafts: i64,
+        id: i64,
+    ) {
+        let raw = pushed_copy("dana@example.com", "Quarterly draft", "first words");
+        let ingested = store
+            .ingest_raw(blobs, account, Some(drafts), Some(41), &raw)
+            .unwrap();
+        assert_eq!(ingested.message_id, id, "the copy still lands on the row");
+        assert!(!ingested.was_new);
+    }
+
+    fn assert_as_saved(store: &Store, id: i64) {
+        let rec = store.load_draft(id).unwrap();
+        assert_eq!(rec.to, "sam@example.com", "a removed recipient came back");
+        assert_eq!(
+            rec.subject, "Quarterly final numbers",
+            "a replaced subject came back"
+        );
+        assert_eq!(rec.body, "final words");
+        let hits = |q: &str| store.search(q, 10).unwrap().len();
+        assert_eq!(hits("final"), 1, "search reads what was saved");
+        assert_eq!(hits("first"), 0, "and not the words the push carried");
+    }
+
+    #[test]
+    fn a_send_later_goes_as_it_was_saved_after_its_push_is_fetched_back() {
+        let (_d, mut store, blobs, account, drafts) = setup();
+        let id = pushed_then_edited(&mut store, account);
+        store.schedule_send(id, Some(NOW + 6 * 3_600_000)).unwrap();
+
+        fetch_back_the_push(&mut store, &blobs, account, drafts, id);
+
+        let due = store.due_sends(account, NOW + 6 * 3_600_000 + 1).unwrap();
+        assert_eq!(due.len(), 1, "still queued");
+        assert_eq!(due[0].to, "sam@example.com");
+        assert_eq!(due[0].subject, "Quarterly final numbers");
+        assert_as_saved(&store, id);
+    }
+
+    #[test]
+    fn a_draft_keeps_its_later_edits_when_its_push_is_fetched_back() {
+        let (_d, mut store, blobs, account, drafts) = setup();
+        let id = pushed_then_edited(&mut store, account);
+        fetch_back_the_push(&mut store, &blobs, account, drafts, id);
+        assert_as_saved(&store, id);
+        let row = store
+            .list_threads(&ListView::Folder("drafts".into()), 0, 10, Sort::default())
+            .unwrap();
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].subject, "Quarterly final numbers");
+    }
+
+    #[test]
+    fn a_fetched_back_copy_still_records_where_it_sits() {
+        let (_d, mut store, blobs, account, drafts) = setup();
+        let id = pushed_then_edited(&mut store, account);
+        fetch_back_the_push(&mut store, &blobs, account, drafts, id);
+        assert_eq!(store.folders_of(id).unwrap(), vec![drafts]);
+        assert_eq!(store.placement_uids(drafts).unwrap(), vec![41]);
+    }
+
+    #[test]
+    fn re_extraction_leaves_a_queued_send_as_it_was_saved() {
+        let (_d, mut store, blobs, account, drafts) = setup();
+        let id = save(
+            &store,
+            account,
+            None,
+            "dana@example.com",
+            "Quarterly draft",
+            "first words",
+        );
+        store.set_draft_msgid(id, MSGID).unwrap();
+        store.set_draft_server_uid(id, Some(41)).unwrap();
+        // Fetched back while it still said what it said, so the row holds
+        // that copy's bytes; then finished and scheduled.
+        fetch_back_the_push(&mut store, &blobs, account, drafts, id);
+        save(
+            &store,
+            account,
+            Some(id),
+            "sam@example.com",
+            "Quarterly final numbers",
+            "final words",
+        );
+        store.schedule_send(id, Some(NOW + 86_400_000)).unwrap();
+
+        // An update ships a new extractor overnight.
+        store.set_setting("extraction_version", "9").unwrap();
+        store.reindex_bodies(&blobs).unwrap();
+
+        let due = store.due_sends(account, NOW + 86_400_001).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].to, "sam@example.com");
+        assert_eq!(due[0].subject, "Quarterly final numbers");
+        assert_as_saved(&store, id);
+    }
+
+    #[test]
+    fn re_extraction_leaves_a_draft_as_it_was_saved() {
+        let (_d, mut store, blobs, account, drafts) = setup();
+        let id = save(
+            &store,
+            account,
+            None,
+            "dana@example.com",
+            "Quarterly draft",
+            "first words",
+        );
+        store.set_draft_msgid(id, MSGID).unwrap();
+        fetch_back_the_push(&mut store, &blobs, account, drafts, id);
+        save(
+            &store,
+            account,
+            Some(id),
+            "sam@example.com",
+            "Quarterly final numbers",
+            "final words",
+        );
+        store.set_setting("extraction_version", "9").unwrap();
+        store.reindex_bodies(&blobs).unwrap();
+        assert_as_saved(&store, id);
+    }
+
+    #[test]
+    fn a_draft_its_copy_brings_back_is_searchable_again() {
+        use petrel_engine::actions::{ActionKind, PlacementPolicy};
+        // Saved and pushed; binned; deleted forever, which takes it out of
+        // search with the tombstone. Then its copy lands in Trash before the
+        // server has expunged it — the drain's delete racing a watched fetch —
+        // and the row is live again. Live, it has to be findable.
+        let (_d, mut store, blobs, account, drafts) = setup();
+        let id = save(
+            &store,
+            account,
+            None,
+            "sam@example.com",
+            "Quarterly final numbers",
+            "final words",
+        );
+        store.set_draft_msgid(id, MSGID).unwrap();
+        let copy = pushed_copy("sam@example.com", "Quarterly final numbers", "final words");
+        store
+            .ingest_raw(&blobs, account, Some(drafts), Some(41), &copy)
+            .unwrap();
+        let trash = store.ensure_folder(account, "trash", "Trash").unwrap();
+        let thread = store.thread_of(id).unwrap().unwrap_or(-id);
+        for kind in [ActionKind::Trash, ActionKind::DeleteForever] {
+            store
+                .apply_thread_action(account, thread, kind, None, PlacementPolicy::Exclusive)
+                .unwrap();
+        }
+        assert_eq!(store.search("final", 10).unwrap().len(), 0, "deleted");
+
+        let back = store
+            .ingest_raw(&blobs, account, Some(trash), Some(55), &copy)
+            .unwrap();
+        assert_eq!(back.message_id, id);
+        assert_eq!(store.search("final", 10).unwrap().len(), 1, "by its words");
+        assert_eq!(
+            store.search("sam", 10).unwrap().len(),
+            1,
+            "by its recipient"
+        );
+    }
+
+    #[test]
+    fn a_draft_written_elsewhere_still_follows_its_server_copy() {
+        // Nothing of it was written here: the server copy is all there is,
+        // and a newer one is the draft.
+        let (_d, mut store, blobs, account, drafts) = setup();
+        let first = store
+            .ingest_raw(
+                &blobs,
+                account,
+                Some(drafts),
+                Some(7),
+                &pushed_copy("dana@example.com", "From the phone", "phone words"),
+            )
+            .unwrap();
+        let again = store
+            .ingest_raw(
+                &blobs,
+                account,
+                Some(drafts),
+                Some(8),
+                &pushed_copy("sam@example.com", "From the phone, edited", "edited words"),
+            )
+            .unwrap();
+        assert_eq!(again.message_id, first.message_id);
+        let rec = store.load_draft(first.message_id).unwrap();
+        assert_eq!(rec.subject, "From the phone, edited");
+        assert_eq!(rec.to, "sam@example.com");
+        assert_eq!(store.search("edited", 10).unwrap().len(), 1);
+        assert_eq!(
+            store.search("phone", 10).unwrap().len(),
+            1,
+            "the subject says phone"
+        );
+        assert_eq!(
+            store.search("dana", 10).unwrap().len(),
+            0,
+            "the old recipient is gone from the index"
+        );
+    }
+}

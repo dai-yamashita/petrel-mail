@@ -7,9 +7,25 @@
   grid-template-columns: 1fr;
 }
 
-.shell[data-layout='reader-only'] .rail,
-.shell[data-layout='reader-only'] .list-pane {
+.shell[data-layout='reader-only'] .rail {
   display: none;
+}
+
+/* The list shares the reader's cell rather than leaving the grid: unseen, so
+   it takes no click, no focus and no screen reader's attention, and still laid
+   out at its own height, so it can measure and scroll. With `display: none` it
+   could do neither — J and K in the full-window reader stopped at the end of
+   the first page, and the list came back scrolled away from the row they had
+   reached. */
+.shell[data-layout='reader-only'] .list-pane {
+  grid-row: 1;
+  grid-column: 1;
+  visibility: hidden;
+}
+
+.shell[data-layout='reader-only'] .reader {
+  grid-row: 1;
+  grid-column: 1;
 }
 
 /* A conversation popped out on its own. The reader fills it, because there is
