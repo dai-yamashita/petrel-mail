@@ -578,9 +578,14 @@ impl Store {
         // left the server copy in place for good. The row waits until the
         // drain has delivered or given up on it, which is at most a few
         // cycles once there is a network again.
+        //
+        // Nor while it has a time to go. Deleting a message forever does not
+        // stop its send (see `Store::outbox`), and a Send Later further off
+        // than the grace period was purged before it went.
         let purged = tx.execute(
             "DELETE FROM messages
              WHERE deleted_at_ms IS NOT NULL AND deleted_at_ms <= ?1
+               AND send_after_ms IS NULL
                AND NOT EXISTS (SELECT 1 FROM action_messages am
                                JOIN actions a ON a.id = am.action_id
                                WHERE am.message_id = messages.id

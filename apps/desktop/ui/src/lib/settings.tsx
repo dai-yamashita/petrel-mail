@@ -181,21 +181,40 @@ type Ctx = {
   locale: string;
   set: <K extends Key>(key: K, value: Settings[K]) => void;
   reset: (key: Key) => void;
+  /** The saved settings have been read, or could not be. Until then every
+   *  setting is its default, and anything that must not act on a default
+   *  (the first list, which the saved sort orders) waits for this. */
+  loaded: boolean;
 };
 
 const SettingsContext = createContext<Ctx | null>(null);
 
 export function SettingsProvider({ children }: { children: React.ReactNode }) {
   const [stored, setStored] = useState<Record<string, string>>({});
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     let live = true;
+    // Not waited on forever. The read takes the store's writer, and one held
+    // at launch would have left the list saying "Loading your mail…" for as
+    // long as it was held. After this long the defaults stand, and the saved
+    // settings apply when they come, as they did before anything waited.
+    const giveUp = window.setTimeout(() => live && setLoaded(true), 1500);
     api
       .getSettings()
-      .then((s) => live && setStored(s))
-      .catch((err) => api.log(`get_settings failed: ${err}`));
+      .then((s) => {
+        if (!live) return;
+        setStored(s);
+        setLoaded(true);
+      })
+      .catch((err) => {
+        api.log(`get_settings failed: ${err}`);
+        if (live) setLoaded(true);
+      })
+      .finally(() => window.clearTimeout(giveUp));
     return () => {
       live = false;
+      window.clearTimeout(giveUp);
     };
   }, []);
 
@@ -292,7 +311,7 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
   setLocale(resolved);
 
   return (
-    <SettingsContext.Provider value={{ settings, locale: resolved, set, reset }}>
+    <SettingsContext.Provider value={{ settings, locale: resolved, set, reset, loaded }}>
       {/* Not keyed on the language any more.
           It used to be: `<Fragment key={resolved}>`, so changing the language
           remounted the whole tree and every component re-ran t(). It also

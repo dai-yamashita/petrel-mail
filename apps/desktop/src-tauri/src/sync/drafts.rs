@@ -212,14 +212,6 @@ pub(crate) fn drop_server_draft_using(state: &AppState, store: &Store, draft_id:
     });
 }
 
-/// The lock-acquiring face of `drop_server_draft_using`.
-pub(crate) fn spawn_drop_server_draft(state: &Arc<AppState>, draft_id: i64) {
-    let Ok(store) = state.store.lock() else {
-        return;
-    };
-    drop_server_draft_using(state, &store, draft_id);
-}
-
 /// Splits a recipient field the way the composer's chip field does —
 /// commas and semicolons — for rendering a draft whose addresses are still
 /// one string. A draft may legitimately have none at all.

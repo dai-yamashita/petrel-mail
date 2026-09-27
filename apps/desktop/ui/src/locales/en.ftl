@@ -219,6 +219,10 @@ compose-scheduled = Will send { $when }
 compose-already-popped = This message already has its own window.
 compose-popout-failed = Could not open a window for that: { $error }
 compose-resume-failed = Could not open that draft: { $error }
+# Undo or Discard on a message too late to stop: going now, or gone.
+outbox-too-late-sending = Too late: that message is being sent now.
+outbox-too-late-sent = Too late: that message has already been sent.
+outbox-already-back = That message is already back in Drafts.
 compose-save-failed = Could not save the draft: { $error }
 compose-cancelled = Held. Nothing was sent.
 compose-failed = Not sent: { $error }

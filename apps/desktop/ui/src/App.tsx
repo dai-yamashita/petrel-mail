@@ -15,6 +15,7 @@ import { readSections, sectionOf, visibleSections } from './lib/rail-sections';
 import { arrangementFor, countFor, countModes, visibleMailboxes } from './lib/mailboxes';
 import { count as fmtCount, fileSize } from './lib/format';
 import { t, type StringId } from './lib/strings';
+import { outboxRefusal } from './lib/outbox-refusal';
 import { Bookmark, Search, SquarePen, TriangleAlert } from 'lucide-react';
 import { SortMenu } from './components/SortMenu';
 import {
@@ -165,7 +166,7 @@ function focusIsFree(): boolean {
 }
 
 export function App() {
-  const { settings, locale, set } = useSettings();
+  const { settings, locale, set, loaded: settingsLoaded } = useSettings();
   const [status, setStatus] = useState<Status | null>(null);
   // Bumped when the active account changes, and by anything else that
   // rewrites a lot of the store at once — marking a folder read, emptying one
@@ -528,6 +529,8 @@ export function App() {
     // Read when a refresh lands, so the open conversation is looked after
     // wherever the sort puts it. Not in Drafts, where rows are messages.
     openThread: () => (listsPerMessage(view) ? null : (activeRef.current?.thread_id ?? null)),
+    // The saved sort, not the default: see `ready`.
+    ready: settingsLoaded,
   });
   const searchRef = useRef<HTMLInputElement>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -939,11 +942,22 @@ export function App() {
     void api
       .outboxEdit(o.id)
       // Out of the Outbox and back in Drafts, so both numbers change. Nothing
-      // else recounts them: the message count does not move.
-      .then(() => setTriageEpoch((n) => n + 1))
-      .then(() => resumeDraft(o.id))
+      // else recounts them: the message count does not move. The draft to
+      // open is a new one when the message was deleted while it waited.
+      .then((open) => {
+        setTriageEpoch((n) => n + 1);
+        return resumeDraft(open ?? o.id);
+      })
       .then(() => setToast(t('compose-cancelled')))
-      .catch((e) => setToast(t('compose-resume-failed', { error: String(e) })));
+      .catch((e) => {
+        const refused = outboxRefusal(e);
+        // Not a refusal: the pull-back itself failed and changed nothing, so
+        // the message is still queued and goes at its time. The bar comes
+        // back to say so, with its Undo to try again, unless a newer send
+        // has taken its place.
+        if (!refused) setOutgoing((cur) => cur ?? o);
+        setToast(refused ?? t('compose-resume-failed', { error: String(e) }));
+      });
   };
 
   /** A triage verb the way the keys mean it: on the selection when there is
@@ -2968,7 +2982,13 @@ export function App() {
           // in plain words and offer only the actions that state allows.
           <Outbox
             onDiscard={(row) => setDiscarding(row)}
-            onEdit={(id) => void resumeDraft(id)}
+            onEdit={(id, open) => {
+              // Pulled back from the Outbox: the bar counting down for the same
+              // message went on to say "Sent" at zero.
+              if (outgoingRef.current?.id === id) setOutgoing(null);
+              void resumeDraft(open);
+            }}
+            onRefused={(text) => setToast(text)}
           />
         ) : loading || (status?.seeding && items.length === 0) ? (
           // A sync in flight with nothing ingested yet is not an empty mailbox,
@@ -3466,9 +3486,20 @@ export function App() {
             onClick={() => {
               const o = outgoing;
               // Sending now is done now: "Sent" answers this, not the Send
-              // that started the countdown.
-              setOutgoing({ ...o, left: 0, say: later() });
-              void api.outboxSendNow(o.id).catch((e) => setToast(t('compose-failed', { error: String(e) })));
+              // that started the countdown, and only once the outbox says the
+              // message is going. Pulled back a moment before, by Z or the
+              // Outbox's Undo, it is not, and the bar said "Sent" anyway.
+              // The press is the last thing done, so Z no longer undoes what
+              // came before it, even while the answer is on its way.
+              forgetUndo.current();
+              const say = later();
+              setOutgoing(null);
+              void api
+                .outboxSendNow(o.id)
+                .then((going) => {
+                  if (going !== false) say(t('compose-sent'));
+                })
+                .catch((e) => setToast(t('compose-failed', { error: String(e) })));
             }}
           >
             {t('compose-send-now')}
@@ -3554,6 +3585,10 @@ export function App() {
       <AppDialogs
         discarding={discarding}
         setDiscarding={setDiscarding}
+        onDiscarded={(id) => {
+          // Nor may the bar go on counting a message that was discarded.
+          if (outgoingRef.current?.id === id) setOutgoing(null);
+        }}
         deletingSearch={deletingSearch}
         setQuery={setQuery}
         setDeletingSearch={setDeletingSearch}

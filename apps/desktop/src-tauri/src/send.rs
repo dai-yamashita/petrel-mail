@@ -479,19 +479,49 @@ pub(crate) async fn send_due(state: Arc<AppState>, account: i64) {
         return;
     };
 
-    for d in due {
-        let id = d.id;
+    for queued in due {
+        let id = queued.id;
         // Claim first. If the store stays busy we leave the row queued rather
         // than transmit without a durable Transmitting mark, or mark it and
         // then fail to start SMTP. The guard must die before the next await:
         // MutexGuard is not Send.
-        {
+        //
+        // Only if it is still due. The list was read when the pass began, and
+        // a message sent before this one can take a while: one undone,
+        // discarded or given a new time in the meantime was claimed anyway and
+        // sent. And what goes is what the row holds now, not what the pass
+        // read: undone, edited and sent again, it is the new text.
+        let d = {
             let Some(store) = wait_store(&state).await else {
                 log_sync("outbox: store stayed busy, leaving the row queued");
                 continue;
             };
-            let _ = store.set_send_state(id, SendState::Transmitting, None, None, None);
-        }
+            match store.claim_send(id, now_ms()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    log_sync("outbox: a message pulled back since the pass began, left alone");
+                    continue;
+                }
+                Err(e) => {
+                    log_sync(&format!(
+                        "outbox: could not claim a message, leaving it queued: {e}"
+                    ));
+                    continue;
+                }
+            }
+            match store.load_draft(id) {
+                Ok(d) => d,
+                Err(e) => {
+                    // Claimed and then unreadable: back in the queue for the
+                    // next pass, rather than held as if it were on the wire.
+                    log_sync(&format!(
+                        "outbox: could not read a claimed message, requeued: {e}"
+                    ));
+                    let _ = store.resend_now(id, now_ms() + 60_000);
+                    continue;
+                }
+            }
+        };
         let to: Vec<String> =
             d.to.split([',', ';'])
                 .map(|a| a.trim().to_string())

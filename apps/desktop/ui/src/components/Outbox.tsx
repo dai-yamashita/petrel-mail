@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Clock, Paperclip, WifiOff } from 'lucide-react';
 import { api, type OutboxRow } from '../lib/api';
 import { Icon } from './Icon';
 import { t } from '../lib/strings';
+import { outboxRefusal } from '../lib/outbox-refusal';
 
 /**
  * Every message Petrel is holding, and why.
@@ -47,21 +48,38 @@ function Row({
   onChange,
   onDiscard,
   onEdit,
+  onRefused,
 }: {
   row: OutboxRow;
   now: number;
   onChange: () => void;
   onDiscard: (row: OutboxRow) => void;
-  onEdit?: (id: number) => void;
+  /** `open` is the draft to resume: a new one when the message was deleted
+   *  forever while it waited. */
+  onEdit?: (id: number, open: number) => void;
+  onRefused?: (text: string) => void;
 }) {
-  const edit = () =>
+  // One pull-back per row. The row stays up until the next redraw, and a
+  // second press opened the message a second time.
+  const pulling = useRef(false);
+  const edit = () => {
+    if (pulling.current) return;
+    pulling.current = true;
     void api
       .outboxEdit(row.id)
-      .then(() => {
-        onEdit?.(row.id);
+      .then((open) => {
+        onEdit?.(row.id, open ?? row.id);
         onChange();
       })
-      .catch(onChange);
+      .catch((e) => {
+        pulling.current = false;
+        // Too late to pull back: said, as Z and the bar say it, rather than
+        // the row simply redrawing as "Sending…".
+        const text = outboxRefusal(e);
+        if (text) onRefused?.(text);
+        onChange();
+      });
+  };
   const [checking, setChecking] = useState<string | null>(null);
   const act = (p: Promise<unknown>) => void p.then(onChange).catch(onChange);
 
@@ -188,12 +206,16 @@ export function Outbox({
   onDiscard,
   onCountChange,
   onEdit,
+  onRefused,
 }: {
   onDiscard: (row: OutboxRow) => void;
   /** Told how many need a person, so the rail can turn amber. */
   onCountChange?: (total: number, needsAttention: number) => void;
-  /** After the send is pulled back: open the composer on that draft. */
-  onEdit?: (id: number) => void;
+  /** After the send is pulled back: open the composer on `open`, the draft
+   *  the pull-back handed over. */
+  onEdit?: (id: number, open: number) => void;
+  /** Undo or Edit came too late: the words to say so. */
+  onRefused?: (text: string) => void;
 }) {
   const [rows, setRows] = useState<OutboxRow[]>([]);
   const [now, setNow] = useState(() => Date.now());
@@ -237,6 +259,7 @@ export function Outbox({
           onChange={() => setTick((n) => n + 1)}
           onDiscard={onDiscard}
           onEdit={onEdit}
+          onRefused={onRefused}
         />
       ))}
     </section>

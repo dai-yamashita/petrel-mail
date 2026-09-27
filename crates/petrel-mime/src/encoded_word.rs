@@ -66,8 +66,14 @@ enum Iso2022State {
 }
 
 fn iso2022_end_state(data: &[u8]) -> Iso2022State {
-    let mut i = 0;
-    let mut state = Iso2022State::Ascii;
+    iso2022_scan(data, 0, Iso2022State::Ascii)
+}
+
+/// The shift state at the end of `data`, reading from `from` in state
+/// `start`: how a group's state is carried as words join it.
+fn iso2022_scan(data: &[u8], from: usize, start: Iso2022State) -> Iso2022State {
+    let mut i = from;
+    let mut state = start;
     while i < data.len() {
         if data[i] != 0x1B {
             i += 1;
@@ -108,8 +114,35 @@ fn iso2022_end_state(data: &[u8]) -> Iso2022State {
     state
 }
 
-fn iso2022_should_cut(prev: &[u8], next: &[u8]) -> bool {
-    iso2022_end_state(prev) != Iso2022State::Jis && next.first() == Some(&0x1B)
+fn iso2022_should_cut(prev_end: Iso2022State, next: &[u8]) -> bool {
+    prev_end != Iso2022State::Jis && next.first() == Some(&0x1B)
+}
+
+/// The payloads of a run, joined where a word split a character and kept
+/// apart where each carries its own shifts (see the module notes).
+///
+/// Each group keeps the state its bytes end in as words join it. Asked of
+/// the whole group for every word, the state cost a rescan each time, so a
+/// long run cost time in the square of its length: a crafted header of
+/// ISO-2022-JP words froze the window for seconds. A word that joins is read
+/// from three bytes before the join, the most of an escape sequence the
+/// group can end in, so a sequence split across it reads as it did whole.
+fn iso2022_groups(payloads: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut groups: Vec<(Vec<u8>, Iso2022State)> = Vec::new();
+    for payload in payloads {
+        match groups.last_mut() {
+            Some((prev, end)) if !iso2022_should_cut(*end, &payload) => {
+                let from = prev.len().saturating_sub(3);
+                prev.extend(payload);
+                *end = iso2022_scan(prev, from, *end);
+            }
+            _ => {
+                let end = iso2022_end_state(&payload);
+                groups.push((payload, end));
+            }
+        }
+    }
+    groups.into_iter().map(|(group, _)| group).collect()
 }
 
 struct ParsedWord<'a> {
@@ -120,7 +153,16 @@ struct ParsedWord<'a> {
     payload: &'a [u8],
 }
 
-fn try_parse_encoded_word(data: &[u8], at: usize) -> Option<ParsedWord<'_>> {
+/// The encoded word that starts at `at`, if one does.
+///
+/// `last` is where the block's last `?=` starts, found once for the whole
+/// block. A payload ends at the first `?=` after it, so one that starts past
+/// `last` has no end, and is refused here instead of by a scan to the end of
+/// the block. That scan, from every `=?x?Q?` in turn, was quadratic: a header
+/// made of such fragments with no `?=` among them froze the window for 3.8 s
+/// at 320 KB, every time the message was opened. A payload that has an end
+/// finds the same `?=` it always did, so nothing decodes differently.
+fn try_parse_encoded_word(data: &[u8], at: usize, last: Option<usize>) -> Option<ParsedWord<'_>> {
     if at + 2 > data.len() || &data[at..at + 2] != b"=?" {
         return None;
     }
@@ -150,7 +192,8 @@ fn try_parse_encoded_word(data: &[u8], at: usize) -> Option<ParsedWord<'_>> {
     }
     i += 1;
     let payload_start = i;
-    while i + 1 < data.len() {
+    let last = last.filter(|&l| l >= payload_start)?;
+    while i <= last {
         if data[i] == b'?' && data[i + 1] == b'=' {
             return Some(ParsedWord {
                 start: at,
@@ -224,16 +267,12 @@ fn utf8_encoded_word(text: &str) -> Vec<u8> {
 }
 
 fn merge_iso2022_jp_run(words: &[ParsedWord]) -> Option<Vec<u8>> {
-    let mut groups: Vec<Vec<u8>> = Vec::new();
-    for w in words {
-        let payload = decode_word_payload(w.encoding, w.payload)?;
-        match groups.last_mut() {
-            Some(prev) if !iso2022_should_cut(prev, &payload) => prev.extend(payload),
-            _ => groups.push(payload),
-        }
-    }
+    let payloads = words
+        .iter()
+        .map(|w| decode_word_payload(w.encoding, w.payload))
+        .collect::<Option<Vec<_>>>()?;
     let mut text = String::new();
-    for group in &groups {
+    for group in &iso2022_groups(payloads) {
         let (cow, _, _) = encoding_rs::ISO_2022_JP.decode(group);
         text.push_str(&cow);
     }
@@ -307,14 +346,16 @@ fn rewrite_header_block(headers: &[u8]) -> Cow<'_, [u8]> {
     // every row.
     let mut out: Option<Vec<u8>> = None;
     let mut pos = 0;
+    // Where the block's last `?=` is; see `try_parse_encoded_word`.
+    let last = headers.windows(2).rposition(|w| w == b"?=");
 
     while pos < headers.len() {
-        if let Some(first) = try_parse_encoded_word(headers, pos) {
+        if let Some(first) = try_parse_encoded_word(headers, pos, last) {
             let mut run = vec![first];
             let mut scan = run[0].end;
             loop {
                 scan = skip_fws(headers, scan);
-                match try_parse_encoded_word(headers, scan) {
+                match try_parse_encoded_word(headers, scan, last) {
                     Some(next) if charset_eq(next.charset, run[0].charset) => {
                         scan = next.end;
                         run.push(next);
@@ -420,6 +461,121 @@ body\r\n";
         assert!(
             !text.contains("=?utf-8?B?6KiI55S7?="),
             "second subject word must be gone: {text}"
+        );
+    }
+
+    /// The quadratic header: every `=?x?Q?` fragment scanned the rest of the
+    /// block for a `?=` that is not there. 320 KB took 3.8 s in a release
+    /// build, and about 640 KB froze the window for 15 s on every open.
+    #[test]
+    fn a_header_of_unterminated_words_is_read_in_one_pass() {
+        let fragments = "=?x?Q?a".repeat(320 * 1024 / 7);
+        let raw = format!("Subject: {fragments}\r\n\r\nbody\r\n");
+        let started = std::time::Instant::now();
+        let out = merge_adjacent_encoded_words(raw.as_bytes());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "nothing to merge, nothing copied"
+        );
+    }
+
+    /// A run of ISO-2022-JP words in one folded header: each word used to
+    /// rescan everything joined before it. Both shapes: plain words, and words
+    /// that open in JIS, which never cut and so make one long group.
+    #[test]
+    fn a_long_run_of_iso_2022_jp_words_is_read_in_one_pass() {
+        for word in [
+            "=?ISO-2022-JP?Q?aaaaaaaaaaaaaaaaaa?=",
+            "=?ISO-2022-JP?Q?=1B$B$\"?=",
+        ] {
+            let words = vec![word; 640 * 1024 / (word.len() + 3)].join("\r\n ");
+            let raw = format!("Subject: {words}\r\n\r\nbody\r\n");
+            let started = std::time::Instant::now();
+            let out = merge_adjacent_encoded_words(raw.as_bytes());
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{word}: took {:?}",
+                started.elapsed()
+            );
+            assert!(String::from_utf8_lossy(&out).contains("=?UTF-8?B?"));
+        }
+    }
+
+    /// The groups kept as they grow are the groups a rescan of each would
+    /// give, byte for byte: over many runs cut into words at random, from
+    /// pieces that put escape sequences across the joins.
+    #[test]
+    fn carrying_the_shift_state_groups_as_rescanning_did() {
+        fn by_rescan(payloads: &[Vec<u8>]) -> Vec<Vec<u8>> {
+            let mut groups: Vec<Vec<u8>> = Vec::new();
+            for payload in payloads {
+                match groups.last_mut() {
+                    Some(prev) if !iso2022_should_cut(iso2022_end_state(prev), payload) => {
+                        prev.extend(payload)
+                    }
+                    _ => groups.push(payload.clone()),
+                }
+            }
+            groups
+        }
+        let pieces: [&[u8]; 14] = [
+            b"\x1b",
+            b"$",
+            b"(",
+            b"B",
+            b"@",
+            b"A",
+            b"D",
+            b"J",
+            b"I",
+            b"a",
+            b"$B",
+            b"(B",
+            b"$(D",
+            b"\x1b$B$\"",
+        ];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let words: Vec<Vec<u8>> = (0..1 + next(6))
+                .map(|_| {
+                    (0..next(5))
+                        .flat_map(|_| pieces[next(pieces.len())].to_vec())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                iso2022_groups(words.clone()),
+                by_rescan(&words),
+                "{words:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_ending_at_the_last_terminator_still_parses() {
+        // The last `?=` closes the second word; the fragment after it has no
+        // end and is left as text, as it always was.
+        let block = b"=?utf-8?B?5p2x5Lqs?= =?utf-8?B?6KiI55S7?= =?utf-8?B?tail";
+        let last = block.windows(2).rposition(|w| w == b"?=");
+        let second = try_parse_encoded_word(block, 21, last).expect("the second word");
+        assert_eq!(second.payload, b"6KiI55S7");
+        assert!(try_parse_encoded_word(block, 42, last).is_none());
+        let empty = b"=?utf-8?B??=";
+        let last = empty.windows(2).rposition(|w| w == b"?=");
+        assert_eq!(
+            try_parse_encoded_word(empty, 0, last).map(|w| w.payload.len()),
+            Some(0)
         );
     }
 

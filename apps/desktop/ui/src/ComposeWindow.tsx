@@ -22,11 +22,10 @@ import { useDropGuard } from './lib/useFileDrop';
  * list and sync loop would cost real memory and a second poll against the mail
  * server, to show nothing. This window knows about one draft.
  *
- * It has no undo-send window either. That countdown exists so a message can be
- * caught in the seconds after ⌘↵, and it is watched in the window you are
- * looking at — here, pressing send closes this window, so there would be
- * nowhere for the countdown to live. Send from a popped-out composer is
- * immediate, and says so.
+ * Send puts the message in the outbox with the same undo window the main
+ * composer gives, and closes this window. The countdown has nowhere to show
+ * here, so the message waits out its window in the main window's Outbox,
+ * where Undo still pulls it back.
  */
 export function ComposeWindow({ draftId }: { draftId: number }) {
   const [draft, setDraft] = useState<Draft | null>(null);

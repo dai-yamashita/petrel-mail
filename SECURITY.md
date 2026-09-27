@@ -42,4 +42,3 @@ macOS builds are also signed with an Apple Developer ID and notarized.
 - Missing hardening that has no demonstrated impact. Tell us anyway if you
   think it matters, but say what it lets an attacker do.
 - Reports from an automated scanner with no working reproduction.
-

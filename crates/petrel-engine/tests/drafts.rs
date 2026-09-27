@@ -444,6 +444,49 @@ mod the_whole_message {
         assert_eq!(back.to, "a@x");
     }
 
+    /// The staged-file sweep asks this before it deletes anything: a draft
+    /// weeks old still sends what it lists, and so does one in the outbox.
+    #[test]
+    fn every_file_a_draft_still_lists_is_known() {
+        let store = Store::open_in_memory().unwrap();
+        let account = store.ensure_test_account().unwrap();
+        let listing = |files: &[&str]| DraftEnvelope {
+            attachments: files.iter().map(|f| f.to_string()).collect(),
+            ..DraftEnvelope::default()
+        };
+        let save = |subject: &str, envelope: &DraftEnvelope| {
+            store
+                .save_draft_full(account, None, "a@x", "", subject, "b", "", envelope)
+                .unwrap()
+        };
+        save("draft", &listing(&["/data/staged/1-0/board-pack.pdf"]));
+        let queued = save(
+            "queued",
+            &listing(&["/data/staged/2-0/minutes.pdf", "/Users/sam/notes.txt"]),
+        );
+        store.schedule_send(queued, Some(1_000)).unwrap();
+        store
+            .save_draft(account, None, "c@x", "none", "b", "")
+            .unwrap();
+
+        let mut paths = store.draft_attachment_paths().unwrap();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "/Users/sam/notes.txt",
+                "/data/staged/1-0/board-pack.pdf",
+                "/data/staged/2-0/minutes.pdf"
+            ]
+        );
+        // Sent or discarded, it lists nothing any more.
+        store.delete_draft(queued).unwrap();
+        assert_eq!(
+            store.draft_attachment_paths().unwrap(),
+            ["/data/staged/1-0/board-pack.pdf"]
+        );
+    }
+
     #[test]
     fn an_old_draft_with_no_envelope_still_loads() {
         // Rows written before the column existed hold NULL there.

@@ -34,6 +34,10 @@ fi
 
 APP="$ROOT/target/release/Petrel.app"
 DMG="$ROOT/target/release/Petrel-$VERSION.dmg"
+# The release's tag, spelled once. The update manifest's download URL names
+# it, so a release published under any other tag answers every update with a
+# 404: the instructions at the end used to leave it unsaid.
+TAG="v$VERSION"
 ENTITLEMENTS="$ROOT/apps/desktop/src-tauri/Entitlements.plist"
 NOTARY_PROFILE="${PETREL_NOTARY_PROFILE:-petrel-notary}"
 
@@ -120,7 +124,10 @@ if [ -n "$(git status --porcelain)" ]; then
     die "working tree is dirty. Commit or stash first (PETREL_ALLOW_DIRTY=1 overrides)."
   fi
 fi
-echo "commit: $(git rev-parse --short HEAD)"
+# The commit this is built from, which the release's tag must name: left to
+# itself, gh tags whatever the default branch holds when it runs.
+COMMIT="$(git rev-parse HEAD)"
+echo "commit: ${COMMIT:0:7}"
 
 # One binary for both kinds of Mac. Each half is built for its own target and
 # the two are joined with lipo; the manifest below points both platform keys
@@ -242,6 +249,10 @@ say "update artifact"
 # points), and losing it means no existing install can ever be updated
 # again — back it up somewhere you would keep an SSH key.
 TARBALL="$ROOT/target/release/Petrel-$VERSION.app.tar.gz"
+# Set only once this run has written the manifest. A latest.json left by an
+# earlier run is not this release's, and the publish step below must not
+# offer to attach it.
+MANIFEST=""
 if [ "${PETREL_NO_UPDATE_ARTIFACT:-}" != "1" ]; then
   # COPYFILE_DISABLE=1 is load-bearing. Without it macOS tar stores each
   # file's extended attributes as a second, parallel "._name" member —
@@ -260,7 +271,7 @@ if [ "${PETREL_NO_UPDATE_ARTIFACT:-}" != "1" ]; then
   # what the installed app says about itself cannot disagree.
   NOTES="${PETREL_RELEASE_NOTES:-}"
   PUBDATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  URL="https://github.com/donth77/petrel-mail/releases/download/v$VERSION/Petrel-$VERSION.app.tar.gz"
+  URL="https://github.com/donth77/petrel-mail/releases/download/$TAG/Petrel-$VERSION.app.tar.gz"
   # Written by a JSON writer rather than a heredoc. Release notes are prose,
   # and the moment one contains a quote or a line break, string interpolation
   # emits a broken manifest. A manifest that will not parse means every
@@ -279,6 +290,7 @@ json.dump({
         "darwin-x86_64":  {"signature": sig, "url": url},
     },
 }, open(os.environ["RELEASE_OUT"], "w"), indent=2)' || die "could not write latest.json"
+  MANIFEST="$ROOT/target/release/latest.json"
   echo "signed tarball: $TARBALL"
   echo "manifest:       $ROOT/target/release/latest.json"
 else
@@ -286,13 +298,17 @@ else
 fi
 
 printf '\n%s\n' "release ready: $DMG"
-if [ -f "$ROOT/target/release/latest.json" ]; then
-  cat <<'NEXT'
+if [ -n "$MANIFEST" ]; then
+  cat <<NEXT
 
-To publish: create the GitHub release for this version and attach both the
-.dmg (what a person downloads) and the .app.tar.gz plus latest.json (what
-existing installs read). The endpoint in tauri.conf.json points at
+To publish, push this commit, then create the release under the tag the
+manifest's download URL names, $TAG, at the commit it was built from, with
+the .dmg (what a person downloads) and the .app.tar.gz and latest.json (what
+existing installs read) attached. The endpoint in tauri.conf.json points at
 releases/latest/download/latest.json, so the manifest must be an asset of
-the release marked latest — not a file in the repository.
+the release marked latest, not a file in the repository:
+
+  gh release create "$TAG" --target "$COMMIT" --latest --title "Petrel $VERSION" \\
+    "$DMG" "$TARBALL" "$MANIFEST"
 NEXT
 fi

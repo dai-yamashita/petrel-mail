@@ -803,8 +803,8 @@ const mock = {
         attempts: 1, next_ms: null, attachments: 0 },
     ];
   },
-  outboxSendNow: async () => {},
-  outboxEdit: async () => {},
+  outboxSendNow: async () => true,
+  outboxEdit: async (id: number) => id,
   outboxCheck: async () => 'NeedsAttention',
   openExternal: async (url: string) => {
     // The browser stand-in cannot hand a URL to the system, and opening one in
@@ -921,8 +921,11 @@ const real = {
   attachmentUrl: (messageId: number, part: number) =>
     invoke<string>('attachment_url', { messageId, part }),
   outbox: () => invoke<OutboxRow[]>('list_outbox'),
-  outboxSendNow: (id: number) => invoke<void>('outbox_send_now', { id }),
-  outboxEdit: (id: number) => invoke<void>('outbox_edit', { id }),
+  /** Whether the message is going: not when it was pulled back a moment before. */
+  outboxSendNow: (id: number) => invoke<boolean>('outbox_send_now', { id }),
+  /** The draft to open: the message itself, or a new draft with its words
+   *  when it was deleted forever while it waited. */
+  outboxEdit: (id: number) => invoke<number>('outbox_edit', { id }),
   outboxCheck: (id: number) => invoke<string>('outbox_check', { id }),
   stageAttachment: (name: string, bytes: Uint8Array) =>
     invoke<{ path: string; name: string; size: number }>('stage_attachment', { name, bytes }),

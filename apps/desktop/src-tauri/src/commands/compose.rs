@@ -3,7 +3,7 @@
 use crate::commands::clean_header;
 use crate::diag::{create_private_dir, data_dir};
 use crate::state::{AppState, active_account, now_ms};
-use crate::sync::drafts::{push_draft_to_server, schedule_draft_push, spawn_drop_server_draft};
+use crate::sync::drafts::{drop_server_draft_using, push_draft_to_server, schedule_draft_push};
 use petrel_engine::store::{DraftRecord, Identity};
 use std::sync::Arc;
 use tauri::State;
@@ -264,11 +264,21 @@ pub fn load_draft(id: i64, state: State<Arc<AppState>>) -> Result<DraftRecord, S
     })
 }
 
+/// Discards a draft, or a message waiting in the outbox.
+///
+/// Not one on the wire. Deleted under the worker, it went anyway, and the
+/// person who had just discarded it was told nothing: the outcome had no row
+/// to land on. One guard for the look and the delete, so the worker cannot
+/// claim it in between.
 #[tauri::command(async)]
 pub fn delete_draft(id: i64, state: State<Arc<AppState>>) -> Result<(), String> {
-    // The server's copy goes with it. Read before the local row disappears.
-    spawn_drop_server_draft(state.inner(), id);
     let store = state.store()?;
+    crate::commands::outbox::refuse_while_transmitting(&store, id)?;
+    // And not a row that is no longer this message: its id reused by mail
+    // that arrived since, which Discard would have deleted.
+    crate::commands::outbox::refuse_when_gone(&store, id)?;
+    // The server's copy goes with it. Read before the local row disappears.
+    drop_server_draft_using(state.inner(), &store, id);
     store.delete_draft(id).map_err(|e| e.to_string())
 }
 

@@ -191,52 +191,15 @@ fn origin_of(url: &tauri::Url) -> String {
 
 /// Clears out what previous runs left in the data directory.
 ///
-/// Two kinds of leftovers. A "Remove all local data" renames the old
-/// directory aside and quits — the store is still open at that moment, and
-/// on Windows an open SQLite file cannot be deleted — so the deletion
-/// happens here, on the next launch, when nothing holds it. And the staging
-/// directory holds copies of attachments that were dropped into a composer:
-/// they are somebody's mail, they are only needed until the message goes,
-/// and nothing ever removed them.
+/// A "Remove all local data" renames the old directory aside and quits — the
+/// store is still open at that moment, and on Windows an open SQLite file
+/// cannot be deleted — so the deletion happens here, on the next launch,
+/// when nothing holds it. Staged attachments are swept later, once the store
+/// is open: see `sweep_staged`.
 fn sweep_leftovers(dir: &std::path::Path) {
     let removed = commands::storage::purge_removed(dir);
     if removed > 0 {
         log_sync("mail from an earlier removal request deleted");
-    }
-    // Staged attachments: copies of somebody's mail, written when a file is
-    // dragged into a composer or a message is forwarded, and nothing ever
-    // removed them. Old ones only — a draft written last night and sent this
-    // morning must still find what was attached to it, and a fortnight is far
-    // longer than a message spends being written. Each now sits in a
-    // directory of its own; files staged loose, before that, go the same way.
-    let staged = dir.join("staged");
-    let _ = crate::diag::create_private_dir(&staged);
-    const KEEP: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
-    if let Ok(entries) = std::fs::read_dir(&staged) {
-        let mut swept = 0usize;
-        for entry in entries.flatten() {
-            let old_enough = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .and_then(|t| t.elapsed().map_err(std::io::Error::other))
-                .map(|age| age > KEEP)
-                .unwrap_or(false);
-            if !old_enough {
-                continue;
-            }
-            let path = entry.path();
-            let removed = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-            if removed.is_ok() {
-                swept += 1;
-            }
-        }
-        if swept > 0 {
-            log_sync(&format!("{swept} staged attachment(s) cleared"));
-        }
     }
     // And the per-launch directories attachments are opened from, which live
     // in the system temp directory — world-readable on Linux. Only this
@@ -251,6 +214,87 @@ fn sweep_leftovers(dir: &std::path::Path) {
             }
         }
     }
+}
+
+/// Staged attachments: copies of somebody's mail, written when a file is
+/// dragged into a composer or a message is forwarded, and nothing else ever
+/// removes them. Old ones only, a fortnight being far longer than a message
+/// spends being written, and never one a draft still lists.
+///
+/// That second rule is why this waits for the store. Swept by age alone, the
+/// file behind a draft saved three weeks ago, or behind a message waiting in
+/// the outbox, went with the rest, and the send failed with "Could not read
+/// attachment" when its time came. The drafts are asked only when something
+/// is old enough to go, and if they cannot be read, nothing goes.
+fn sweep_staged(dir: &std::path::Path, store: &Store) {
+    const KEEP: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+    let staged = dir.join("staged");
+    let _ = crate::diag::create_private_dir(&staged);
+    let Ok(entries) = std::fs::read_dir(&staged) else {
+        return;
+    };
+    let old: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+                .map(|age| age > KEEP)
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .collect();
+    if old.is_empty() {
+        return;
+    }
+    let listed = match store.draft_attachment_paths() {
+        Ok(listed) => listed,
+        Err(_) => {
+            log_sync("staged attachments kept: the drafts that might list them could not be read");
+            return;
+        }
+    };
+    let mut swept = 0usize;
+    for path in staged_to_sweep(old, &listed) {
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if removed.is_ok() {
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        log_sync(&format!("{swept} staged attachment(s) cleared"));
+    }
+}
+
+/// Which of the old entries in `staged` can go: those no draft lists a file
+/// in.
+///
+/// By the entry's own name, the part of a listed path just below a `staged`
+/// directory: each staged file sits in a directory of its own, named for the
+/// moment it was written, or, staged before that, loose in it. Not by the
+/// whole path: the same data directory reached another way on a later launch
+/// (a symlink, /tmp for /private/tmp) matched nothing, and the file a draft
+/// listed went anyway.
+fn staged_to_sweep(old: Vec<std::path::PathBuf>, listed: &[String]) -> Vec<std::path::PathBuf> {
+    let kept: std::collections::HashSet<&std::ffi::OsStr> = listed
+        .iter()
+        .filter_map(|p| {
+            let parts: Vec<std::path::Component> = std::path::Path::new(p).components().collect();
+            parts
+                .windows(2)
+                .rev()
+                .find(|w| w[0].as_os_str() == "staged")
+                .map(|w| w[1].as_os_str())
+        })
+        .collect();
+    old.into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| !kept.contains(name)))
+        .collect()
 }
 
 pub fn run() {
@@ -275,6 +319,9 @@ pub fn run() {
         Ok(s) => s,
         Err(e) => cannot_start("Its mailbox could not be opened.", &db, &e.to_string()),
     };
+    if let Some(step) = store.deferred_step() {
+        log_sync(&format!("store upgrade left for the next launch: {step}"));
+    }
     // Before the readers attach. TRUNCATE needs the other connections idle;
     // a leftover multi-gigabyte WAL made every listing take tens of seconds.
     // The frames are usually already in the main file, so this is a truncate
@@ -286,6 +333,7 @@ pub fn run() {
         )),
         Err(e) => log_sync(&format!("wal checkpoint on open: {e}")),
     }
+    sweep_staged(&dir, &store);
     // One account row for now; the account model arrives with setup UI.
     let first = match store.first_account() {
         Ok(a) => a,
@@ -986,6 +1034,57 @@ mod theme_init_tests {
                 "a backslash survived into the script: {js}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod staged_sweep_tests {
+    use super::staged_to_sweep;
+    use std::path::PathBuf;
+
+    /// A draft three weeks old still sends what it lists, and so does a
+    /// message in the outbox; what nothing lists goes.
+    #[test]
+    fn an_old_staged_file_a_draft_lists_is_kept() {
+        let staged = PathBuf::from("/data/Petrel/staged");
+        let old = vec![
+            staged.join("1-0"),
+            staged.join("2-0"),
+            staged.join("3-0"),
+            staged.join("4-loose.pdf"),
+            staged.join("5-loose.txt"),
+        ];
+        let listed = vec![
+            "/data/Petrel/staged/1-0/board-pack.pdf".to_string(),
+            "/data/Petrel/staged/4-loose.pdf".to_string(),
+            "/Users/sam/Documents/notes.txt".to_string(),
+            "/data/Petrel/staged/../petrel.db".to_string(),
+        ];
+        assert_eq!(
+            staged_to_sweep(old, &listed),
+            [
+                staged.join("2-0"),
+                staged.join("3-0"),
+                staged.join("5-loose.txt")
+            ]
+        );
+    }
+
+    /// The same data directory reached by another path: the draft was
+    /// written under /tmp, the sweep reads /private/tmp.
+    #[test]
+    fn a_listed_file_is_kept_however_its_directory_was_spelled() {
+        let staged = PathBuf::from("/private/tmp/Petrel/staged");
+        let old = vec![staged.join("1-0"), staged.join("2-0")];
+        let listed = vec!["/tmp/Petrel/staged/1-0/board-pack.pdf".to_string()];
+        assert_eq!(staged_to_sweep(old, &listed), [staged.join("2-0")]);
+    }
+
+    #[test]
+    fn with_nothing_listed_every_old_entry_goes() {
+        let staged = PathBuf::from("/data/Petrel/staged");
+        let old = vec![staged.join("1-0"), staged.join("2-x.pdf")];
+        assert_eq!(staged_to_sweep(old.clone(), &[]), old);
     }
 }
 

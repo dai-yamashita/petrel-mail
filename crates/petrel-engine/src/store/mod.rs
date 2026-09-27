@@ -23,7 +23,7 @@ mod search;
 pub use maintenance::{ReindexProgress, WalCheckpoint};
 pub use saved_search::SavedSearch;
 
-pub const SCHEMA_VERSION: i64 = 27;
+pub const SCHEMA_VERSION: i64 = 28;
 /// How many of a message's References are kept. Threading only ever looks
 /// for the nearest ancestors, and an unbounded header is both a query
 /// SQLite refuses to run and a row count nobody reads.
@@ -34,38 +34,106 @@ pub const EXTRACTOR_VERSION: i64 = 1;
 /// Every schema step in order: the baseline, then each migration by the
 /// version it brings the store to. Applied from whatever version the file
 /// is at, one transaction each.
-const MIGRATIONS: &[(i64, &str)] = &[
-    (1, include_str!("schema.sql")),
-    (2, include_str!("migrations/0002-tags.sql")),
-    (3, include_str!("migrations/0003-settings.sql")),
-    (4, include_str!("migrations/0004-action-messages.sql")),
-    (5, include_str!("migrations/0005-snooze.sql")),
-    (6, include_str!("migrations/0006-identity.sql")),
-    (7, include_str!("migrations/0007-draft-body.sql")),
-    (8, include_str!("migrations/0008-send-later.sql")),
-    (9, include_str!("migrations/0009-remote-senders.sql")),
-    (10, include_str!("migrations/0010-draft-html.sql")),
-    (11, include_str!("migrations/0011-outbox-state.sql")),
-    (12, include_str!("migrations/0012-draft-envelope.sql")),
-    (13, include_str!("migrations/0013-draft-sync.sql")),
-    (14, include_str!("migrations/0014-rules.sql")),
-    (15, include_str!("migrations/0015-thread-key-index.sql")),
-    (16, include_str!("migrations/0016-blob-hash-index.sql")),
-    (17, include_str!("migrations/0017-gmail-thread-ids.sql")),
-    (18, include_str!("migrations/0018-invite-response.sql")),
-    (19, include_str!("migrations/0019-trashed-at.sql")),
-    (20, include_str!("migrations/0020-sidebar-order.sql")),
-    (21, include_str!("migrations/0021-count-view-index.sql")),
-    (22, include_str!("migrations/0022-tag-origin.sql")),
-    (23, include_str!("migrations/0023-folder-role-index.sql")),
+const MIGRATIONS: &[(i64, Step)] = &[
+    (1, Step::Sql(include_str!("schema.sql"))),
+    (2, Step::Sql(include_str!("migrations/0002-tags.sql"))),
+    (3, Step::Sql(include_str!("migrations/0003-settings.sql"))),
+    (
+        4,
+        Step::Sql(include_str!("migrations/0004-action-messages.sql")),
+    ),
+    (5, Step::Sql(include_str!("migrations/0005-snooze.sql"))),
+    (6, Step::Sql(include_str!("migrations/0006-identity.sql"))),
+    (7, Step::Sql(include_str!("migrations/0007-draft-body.sql"))),
+    (8, Step::Sql(include_str!("migrations/0008-send-later.sql"))),
+    (
+        9,
+        Step::Sql(include_str!("migrations/0009-remote-senders.sql")),
+    ),
+    (
+        10,
+        Step::Sql(include_str!("migrations/0010-draft-html.sql")),
+    ),
+    (
+        11,
+        Step::Sql(include_str!("migrations/0011-outbox-state.sql")),
+    ),
+    (
+        12,
+        Step::Sql(include_str!("migrations/0012-draft-envelope.sql")),
+    ),
+    (
+        13,
+        Step::Sql(include_str!("migrations/0013-draft-sync.sql")),
+    ),
+    (14, Step::Sql(include_str!("migrations/0014-rules.sql"))),
+    (
+        15,
+        Step::Sql(include_str!("migrations/0015-thread-key-index.sql")),
+    ),
+    (
+        16,
+        Step::Sql(include_str!("migrations/0016-blob-hash-index.sql")),
+    ),
+    (
+        17,
+        Step::Sql(include_str!("migrations/0017-gmail-thread-ids.sql")),
+    ),
+    (
+        18,
+        Step::Sql(include_str!("migrations/0018-invite-response.sql")),
+    ),
+    (
+        19,
+        Step::Sql(include_str!("migrations/0019-trashed-at.sql")),
+    ),
+    (
+        20,
+        Step::Sql(include_str!("migrations/0020-sidebar-order.sql")),
+    ),
+    (
+        21,
+        Step::Sql(include_str!("migrations/0021-count-view-index.sql")),
+    ),
+    (
+        22,
+        Step::Sql(include_str!("migrations/0022-tag-origin.sql")),
+    ),
+    (
+        23,
+        Step::Sql(include_str!("migrations/0023-folder-role-index.sql")),
+    ),
     (
         24,
-        include_str!("migrations/0024-action-message-outcome.sql"),
+        Step::Sql(include_str!("migrations/0024-action-message-outcome.sql")),
     ),
-    (25, include_str!("migrations/0025-ghost-repair.sql")),
-    (26, include_str!("migrations/0026-submission-ports.sql")),
-    (27, include_str!("migrations/0027-saved-searches.sql")),
+    (
+        25,
+        Step::Sql(include_str!("migrations/0025-ghost-repair.sql")),
+    ),
+    (
+        26,
+        Step::Sql(include_str!("migrations/0026-submission-ports.sql")),
+    ),
+    (
+        27,
+        Step::Sql(include_str!("migrations/0027-saved-searches.sql")),
+    ),
+    // A rebuild that cannot finish waits for the next open, and every step
+    // after it waits too (see `init`). Before adding a step the code relies
+    // on, take this one out of the sequence: it checks for AUTOINCREMENT
+    // first, so it can run on its own at every open, or be made to fail the
+    // open again.
+    (28, Step::Rebuild(rebuild_messages_with_autoincrement)),
 ];
+
+/// One schema step: SQL, or a rebuild that needs more than SQL can say.
+enum Step {
+    Sql(&'static str),
+    /// Run with foreign keys off (see the runner), inside the step's
+    /// transaction.
+    Rebuild(fn(&Connection) -> Result<()>),
+}
 
 const _: () = assert!(
     MIGRATIONS[MIGRATIONS.len() - 1].0 == SCHEMA_VERSION,
@@ -89,6 +157,10 @@ pub enum StoreError {
     /// folder is theirs to fix.
     #[error("could not write the export: {0}")]
     Export(#[from] std::io::Error),
+    /// A schema step that checked its own work and found it wrong, and so
+    /// rolled back rather than leave the store changed.
+    #[error("schema step failed: {0}")]
+    Migration(String),
 }
 
 /// What a garbage-collection pass destroyed.
@@ -114,6 +186,9 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 pub struct Store {
     conn: Connection,
+    /// A schema step that could not finish at open, and waits for the next
+    /// one; see `deferred_step`.
+    deferred: Option<String>,
 }
 
 /// Minimal insertable message for the M0 store spike; the MIME pipeline will
@@ -1229,6 +1304,82 @@ fn apply_runtime_pragmas(conn: &Connection) -> Result<String> {
     Ok(mode)
 }
 
+/// Step 28: message ids that are never given out twice.
+///
+/// `messages.id` was a plain INTEGER PRIMARY KEY, so once the row holding the
+/// highest id was deleted the next row took that id. A draft sent and removed
+/// passed its id to the mail that arrived next, often its own copy in Sent,
+/// and anything still holding the id (an Undo, a Discard, a row on screen)
+/// acted on the newcomer. AUTOINCREMENT can only be declared when a table is
+/// created, so the table is rebuilt: its definition as it stands now, taken
+/// from the schema so no column is left behind, with the key made
+/// AUTOINCREMENT; every row copied under its own id; its indexes and trigger
+/// put back as they were. Nothing that points at a message changes, and the
+/// step checks that: the same rows, and no reference broken that was not
+/// broken before. Otherwise it fails, and its transaction takes it back.
+fn rebuild_messages_with_autoincrement(conn: &Connection) -> Result<()> {
+    let table: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+        [],
+        |r| r.get(0),
+    )?;
+    if table.contains("AUTOINCREMENT") {
+        return Ok(());
+    }
+    let key = "INTEGER PRIMARY KEY";
+    let at = table
+        .find(key)
+        .ok_or_else(|| StoreError::Migration("messages has no integer key".into()))?;
+    let rebuilt = format!(
+        "{}{key} AUTOINCREMENT{}",
+        &table[..at],
+        &table[at + key.len()..]
+    )
+    .replacen("CREATE TABLE messages", "CREATE TABLE messages_rebuilt", 1);
+
+    // Everything hung on the table by name goes with it, so it is kept first.
+    let dependents: Vec<String> = conn
+        .prepare(
+            "SELECT sql FROM sqlite_master
+              WHERE tbl_name = 'messages' AND type IN ('index', 'trigger') AND sql IS NOT NULL
+              ORDER BY type, name",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let count = |conn: &Connection| -> Result<(i64, i64)> {
+        Ok((
+            conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?,
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?,
+        ))
+    };
+    let before = count(conn)?;
+
+    conn.execute_batch(&rebuilt)?;
+    conn.execute_batch("INSERT INTO messages_rebuilt SELECT * FROM messages")?;
+    // The rename checks the whole schema unless told not to, and until it
+    // lands every reference to `messages` names a table that is not there.
+    conn.pragma_update(None, "legacy_alter_table", "ON")?;
+    let renamed =
+        conn.execute_batch("DROP TABLE messages; ALTER TABLE messages_rebuilt RENAME TO messages;");
+    // Off again whether that worked or not. A failure here is rolled back
+    // and tried at the next launch, and the switch must not outlive it.
+    conn.pragma_update(None, "legacy_alter_table", "OFF")?;
+    renamed?;
+    for sql in &dependents {
+        conn.execute_batch(sql)?;
+    }
+
+    let after = count(conn)?;
+    if after != before {
+        return Err(StoreError::Migration(format!(
+            "rebuilding messages changed (rows, broken references) from {before:?} to {after:?}"
+        )));
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         Self::init(Connection::open(path)?)
@@ -1258,7 +1409,10 @@ impl Store {
             )));
         }
         conn.pragma_update(None, "query_only", "ON")?;
-        Ok(Store { conn })
+        Ok(Store {
+            conn,
+            deferred: None,
+        })
     }
 
     /// Holds an uncommitted IMMEDIATE transaction while `f` runs, then
@@ -1282,17 +1436,48 @@ impl Store {
         // one runs only what it is missing. Re-running schema.sql over a
         // populated store would fail on "table already exists".
         let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        for (n, sql) in MIGRATIONS {
+        let mut deferred = None;
+        for (n, step) in MIGRATIONS {
             if ver < *n {
                 // One transaction per step, with the version written inside
                 // it. A crash halfway through a multi-statement migration
                 // used to leave some of its columns added and the version
                 // unchanged, and the next open failed on "duplicate column
                 // name" for good.
-                let tx = conn.unchecked_transaction()?;
-                tx.execute_batch(sql)?;
-                tx.pragma_update(None, "user_version", *n)?;
-                tx.commit()?;
+                match step {
+                    Step::Sql(sql) => {
+                        let tx = conn.unchecked_transaction()?;
+                        tx.execute_batch(sql)?;
+                        tx.pragma_update(None, "user_version", *n)?;
+                        tx.commit()?;
+                    }
+                    // A table rebuilt under foreign keys that are on is a
+                    // table emptied first: dropping the old one deletes every
+                    // row that points at it, down the cascades. They go off
+                    // for the step, outside its transaction, where alone the
+                    // pragma takes effect, and come back on whatever happened.
+                    Step::Rebuild(rebuild) => {
+                        conn.pragma_update(None, "foreign_keys", "OFF")?;
+                        let done = (|| -> Result<()> {
+                            let tx = conn.unchecked_transaction()?;
+                            rebuild(&tx)?;
+                            tx.pragma_update(None, "user_version", *n)?;
+                            tx.commit()?;
+                            Ok(())
+                        })();
+                        conn.pragma_update(None, "foreign_keys", "ON")?;
+                        // A rebuild improves the store; it is not needed to
+                        // open it. One that cannot finish (a disk too full
+                        // for the copy) has been rolled back, and is tried
+                        // again at the next open rather than keeping the app
+                        // from starting. The steps after it wait with it:
+                        // they come in order.
+                        if let Err(e) = done {
+                            deferred = Some(format!("step {n}: {e}"));
+                            break;
+                        }
+                    }
+                }
             }
         }
         if ver < SCHEMA_VERSION {
@@ -1301,7 +1486,14 @@ impl Store {
                 params![EXTRACTOR_VERSION.to_string()],
             )?;
         }
-        Ok(Store { conn })
+        Ok(Store { conn, deferred })
+    }
+
+    /// The schema step that could not finish at open, if one could not, and
+    /// why. The store works without it and tries again at the next open;
+    /// this is for saying so in the log.
+    pub fn deferred_step(&self) -> Option<&str> {
+        self.deferred.as_deref()
     }
 
     /// The account the window is showing.
@@ -2202,6 +2394,281 @@ impl Store {
                 r.get::<_, String>(0)
             })
             .optional()?)
+    }
+}
+
+#[cfg(test)]
+mod message_id_tests {
+    use super::*;
+
+    /// A store as step 27 left it, the last before ids stopped being reused,
+    /// with a row in every table that points at a message, and the top id
+    /// freed the way a sent draft frees it.
+    fn store_at_27(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        register_functions(&conn).unwrap();
+        apply_runtime_pragmas(&conn).unwrap();
+        for (n, step) in MIGRATIONS.iter().filter(|(n, _)| *n <= 27) {
+            let Step::Sql(sql) = step else {
+                panic!("step {n} is not SQL")
+            };
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", *n).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO accounts (id, kind, email) VALUES (1, 'imap', 'me@example.com');
+             INSERT INTO folders (id, account_id, role, name, path)
+                  VALUES (10, 1, 'inbox', 'Inbox', 'INBOX'), (11, 1, 'drafts', 'Drafts', 'Drafts');
+             INSERT INTO messages (id, account_id, thread_id, date_ms, from_addr, subject, flags, message_id_hdr)
+                  VALUES (1, 1, 1, 1000, 'sam@example.com', 'First', 0, '<a@x>'),
+                         (2, 1, 1, 2000, 'dana@example.com', 'Re: First', 1, '<b@x>'),
+                         (3, 1, 3, 3000, 'me@example.com', 'A draft', 0, NULL),
+                         (4, 1, 4, 4000, 'alex@example.com', 'Newest', 0, '<d@x>');
+             UPDATE messages SET draft_body = 'hello', draft_envelope = '{}', send_after_ms = 5000
+              WHERE id = 3;
+             INSERT INTO placements (message_id, folder_id, uid, uidvalidity)
+                  VALUES (1, 10, 1, 7), (2, 10, 2, 7), (3, 11, NULL, NULL), (4, 10, 4, 7);
+             INSERT INTO message_addresses (message_id, role, addr_norm, display)
+                  VALUES (1, 'from', 'sam@example.com', 'Sam'), (2, 'to', 'me@example.com', NULL);
+             INSERT INTO message_refs (message_id, ref_msgid) VALUES (2, 'a@x');
+             INSERT INTO attachments (message_id, part_id, filename, mime, size)
+                  VALUES (1, 2, 'board-pack.pdf', 'application/pdf', 1024);
+             INSERT INTO tags (id, account_id, name) VALUES (1, 1, 'Work');
+             INSERT INTO message_tags (message_id, tag_id) VALUES (2, 1);
+             INSERT INTO actions (id, account_id, kind, payload_json, created_ms)
+                  VALUES (1, 1, 'archive', '{}', 1);
+             INSERT INTO action_messages (action_id, message_id) VALUES (1, 1);
+             INSERT INTO fts_content (message_id, subject, body_text)
+                  VALUES (1, 'First', 'minutes attached'), (2, 'Re: First', 'thanks');
+             INSERT INTO messages (id, account_id, date_ms, subject) VALUES (5, 1, 6000, 'Sent');
+             DELETE FROM messages WHERE id = 5;",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Every row of every table that holds or points at a message.
+    fn rows(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        for table in [
+            "messages",
+            "placements",
+            "message_addresses",
+            "message_refs",
+            "attachments",
+            "message_tags",
+            "action_messages",
+            "fts_content",
+        ] {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let columns = stmt.column_count();
+            let found = stmt
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|i| {
+                            r.get::<_, rusqlite::types::Value>(i)
+                                .map(|v| format!("{v:?}"))
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                })
+                .unwrap();
+            for row in found {
+                out.push(format!("{table}: {}", row.unwrap().join(" | ")));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The indexes and triggers hung on `messages`, with their definitions.
+    fn hung_on_messages(conn: &Connection) -> Vec<(String, String, String)> {
+        conn.prepare(
+            "SELECT type, name, sql FROM sqlite_master
+              WHERE tbl_name = 'messages' AND type IN ('index', 'trigger') AND sql IS NOT NULL
+              ORDER BY 1, 2",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    fn one(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn rebuilding_for_autoincrement_keeps_every_row_and_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("petrel.db");
+        let (before, hung) = {
+            let conn = store_at_27(&path);
+            (rows(&conn), hung_on_messages(&conn))
+        };
+        assert!(
+            before.len() > 12,
+            "the fixture has rows to keep: {before:?}"
+        );
+
+        let store = Store::open(&path).unwrap();
+        let conn = &store.conn;
+        assert_eq!(one(conn, "PRAGMA user_version"), SCHEMA_VERSION);
+        let table: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'messages'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            table.contains("INTEGER PRIMARY KEY AUTOINCREMENT"),
+            "{table}"
+        );
+        assert_eq!(rows(conn), before, "every row, as it was");
+        assert_eq!(
+            hung_on_messages(conn),
+            hung,
+            "every index and the trigger, back"
+        );
+        assert_eq!(one(conn, "PRAGMA foreign_keys"), 1, "foreign keys on again");
+        assert_eq!(one(conn, "PRAGMA legacy_alter_table"), 0);
+        assert_eq!(
+            one(conn, "SELECT count(*) FROM pragma_foreign_key_check"),
+            0
+        );
+
+        // A top id freed from here on is not given out again.
+        conn.execute(
+            "INSERT INTO messages (account_id, date_ms, subject) VALUES (1, 7000, 'Next')",
+            [],
+        )
+        .unwrap();
+        let next = conn.last_insert_rowid();
+        conn.execute("DELETE FROM messages WHERE id = ?1", [next])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (account_id, date_ms, subject) VALUES (1, 8000, 'After')",
+            [],
+        )
+        .unwrap();
+        assert!(conn.last_insert_rowid() > next, "id {next} given out twice");
+
+        // The cascades and the trigger still hold on the new table.
+        conn.execute("DELETE FROM messages WHERE id = 1", [])
+            .unwrap();
+        for table in [
+            "placements",
+            "message_addresses",
+            "attachments",
+            "action_messages",
+            "fts_content",
+        ] {
+            let left = one(
+                conn,
+                &format!("SELECT count(*) FROM {table} WHERE message_id = 1"),
+            );
+            assert_eq!(left, 0, "{table} kept a row for a deleted message");
+        }
+    }
+
+    /// What the one-time rebuild costs at launch, on a store the size of a
+    /// long-used mailbox. Run by hand, in release:
+    /// `cargo test --release -p petrel-engine --lib rebuilding_a_large -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn rebuilding_a_large_store_is_quick() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("petrel.db");
+        let n: i64 = std::env::var("PETREL_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        {
+            let conn = store_at_27(&path);
+            conn.execute_batch("BEGIN").unwrap();
+            for i in 100..100 + n {
+                conn.execute(
+                    "INSERT INTO messages (id, account_id, thread_id, date_ms, from_addr, subject,
+                                           subject_norm, snippet, message_id_hdr, doc_json)
+                     VALUES (?1, 1, ?1 / 3, ?1 * 1000, 'sender@example.com', 'Subject ' || ?1,
+                             'subject ' || ?1, 'A snippet of the message body, as the list shows it',
+                             '<' || ?1 || '@example.com>', '{\"blocks\":[]}')",
+                    [i],
+                )
+                .unwrap();
+                conn.execute("INSERT INTO placements (message_id, folder_id, uid, uidvalidity) VALUES (?1, 10, ?1, 7)", [i]).unwrap();
+                conn.execute("INSERT INTO message_addresses (message_id, role, addr_norm) VALUES (?1, 'from', 'sender@example.com'), (?1, 'to', 'me@example.com')", [i]).unwrap();
+                conn.execute("INSERT INTO fts_content (message_id, subject, body_text) VALUES (?1, 'Subject ' || ?1, 'body text of the message')", [i]).unwrap();
+            }
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        let started = std::time::Instant::now();
+        let store = Store::open(&path).unwrap();
+        let took = started.elapsed();
+        eprintln!("rebuilt {} messages in {took:?}", n + 4);
+        assert_eq!(one(&store.conn, "SELECT count(*) FROM messages"), n + 4);
+    }
+
+    /// A rebuild that cannot finish leaves the store as it was, and opens:
+    /// here a table in the way of the copy stands in for a full disk.
+    #[test]
+    fn a_rebuild_that_cannot_finish_waits_for_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("petrel.db");
+        let before = {
+            let conn = store_at_27(&path);
+            conn.execute_batch("CREATE TABLE messages_rebuilt (id INTEGER)")
+                .unwrap();
+            rows(&conn)
+        };
+        let store = Store::open(&path).unwrap();
+        let conn = &store.conn;
+        assert!(
+            store
+                .deferred_step()
+                .is_some_and(|e| e.starts_with("step 28"))
+        );
+        assert_eq!(
+            one(conn, "PRAGMA user_version"),
+            27,
+            "the step is still to do"
+        );
+        assert_eq!(rows(conn), before, "nothing changed");
+        assert_eq!(one(conn, "PRAGMA foreign_keys"), 1, "foreign keys on again");
+        let table: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'messages'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!table.contains("AUTOINCREMENT"));
+        drop(store);
+
+        // Out of the way, the next open finishes it.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE messages_rebuilt")
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        assert!(store.deferred_step().is_none());
+        assert_eq!(one(&store.conn, "PRAGMA user_version"), SCHEMA_VERSION);
+        assert_eq!(rows(&store.conn), before);
+    }
+
+    #[test]
+    fn a_new_store_never_gives_an_id_out_twice() {
+        let store = Store::open_in_memory().unwrap();
+        let account = store.ensure_test_account().unwrap();
+        let first = store
+            .save_draft(account, None, "a@example.com", "One", "b", "")
+            .unwrap();
+        store.delete_draft(first).unwrap();
+        let second = store
+            .save_draft(account, None, "a@example.com", "Two", "b", "")
+            .unwrap();
+        assert!(second > first, "id {first} given out twice");
     }
 }
 

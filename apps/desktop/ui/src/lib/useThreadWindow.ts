@@ -288,6 +288,11 @@ export function useThreadWindow(args: {
   /** The conversation open in the reader, read when a refresh lands; see
    *  `refreshHead`. */
   openThread?: () => number | null;
+  /** False until the saved settings are in. The first window waits for them:
+   *  loaded in the default order, its first row, the newest conversation,
+   *  became the open one, and was kept when the saved order replaced the
+   *  window a moment later, scrolled to wherever that order put it. */
+  ready?: boolean;
 }): {
   items: Thread[];
   setItems: React.Dispatch<React.SetStateAction<Thread[]>>;
@@ -303,8 +308,18 @@ export function useThreadWindow(args: {
    *  the array is new. */
   replaceEpoch: number;
 } {
-  const { query, view, sort, accountEpoch, messageCount, mailGen, fetchers, onRefreshFailed, openThread } =
-    args;
+  const {
+    query,
+    view,
+    sort,
+    accountEpoch,
+    messageCount,
+    mailGen,
+    fetchers,
+    onRefreshFailed,
+    openThread,
+    ready = true,
+  } = args;
 
   const [items, setItems] = useState<Thread[]>([]);
   const [loading, setLoading] = useState(true);
@@ -335,6 +350,9 @@ export function useThreadWindow(args: {
   const openThreadRef = useRef(openThread);
   openThreadRef.current = openThread;
 
+  const readyRef = useRef(ready);
+  readyRef.current = ready;
+
   // The row the last page ended on; see `WindowSink.setPageEnd`.
   const pageEnd = useRef<Thread | null>(null);
 
@@ -364,6 +382,7 @@ export function useThreadWindow(args: {
 
   // Replace the window when the mailbox, query, sort, or account changes.
   useEffect(() => {
+    if (!ready) return;
     let live = true;
     gen.current += 1;
     const myGen = gen.current;
@@ -408,7 +427,7 @@ export function useThreadWindow(args: {
       live = false;
       window.clearTimeout(handle);
     };
-  }, [query, view, sort, accountEpoch]);
+  }, [query, view, sort, accountEpoch, ready]);
 
   // On a reset, remember the count without treating it as new mail.
   useEffect(() => {
@@ -430,6 +449,8 @@ export function useThreadWindow(args: {
     messageCountRef.current = messageCount;
     mailGenRef.current = mailGen;
     if (!mailboxMoved(prev, { count: messageCount, gen: mailGen })) return;
+    // Before the first window: it will read the mailbox as it is now.
+    if (!readyRef.current) return;
 
     let live = true;
     // The answer belongs to the window asked for. A page for the inbox that

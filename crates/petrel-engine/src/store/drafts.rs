@@ -5,15 +5,6 @@
 use super::*;
 
 impl Store {
-    /// Saves a draft, or updates one already saved.
-    ///
-    /// Stored as an ordinary message row carrying the \Draft flag and placed in
-    /// the drafts folder, rather than in a table of its own. That is what makes
-    /// the Drafts view, search, and every triage action work on drafts without
-    /// any of them learning a second kind of thing — and it is how a draft
-    /// reaches the server the day sync learns to APPEND one.
-    /// The Message-ID header a stored message carries, for a reply that
-    /// must thread into its conversation at the other end.
     /// A server revision of this draft that is not the copy this store
     /// pushed: a second-copy row sharing the draft's Message-ID, standing in
     /// the drafts folder. The reconcile sweep creates exactly this shape when
@@ -72,6 +63,8 @@ impl Store {
         Ok(())
     }
 
+    /// The Message-ID header a stored message carries, for a reply that
+    /// must thread into its conversation at the other end.
     pub fn msgid_header_of(&self, message_id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -93,6 +86,13 @@ impl Store {
         Ok(())
     }
 
+    /// Saves a draft, or updates one already saved.
+    ///
+    /// Stored as an ordinary message row carrying the \Draft flag and placed in
+    /// the drafts folder, rather than in a table of its own. That is what makes
+    /// the Drafts view, search, and every triage action work on drafts without
+    /// any of them learning a second kind of thing — and it is how a draft
+    /// reaches the server the day sync learns to APPEND one.
     pub fn save_draft(
         &self,
         account_id: i64,
@@ -114,8 +114,30 @@ impl Store {
         )
     }
 
-    /// The draft's server identity: its stable Message-ID and the UID of the
-    /// copy currently in the server's Drafts folder.
+    /// Whether `id` is still a message this app is sending or wrote: one in
+    /// the outbox, or a draft saved here.
+    ///
+    /// Undo, Edit and Discard act on an id they were handed earlier. Before
+    /// schema step 28, SQLite gave the next row the highest id once the row
+    /// that held it was deleted, so a message sent and removed could have its
+    /// id taken a moment later by mail arriving, or by the Sent copy of
+    /// itself, and an Undo or a Discard held from before acted on the
+    /// newcomer. Ids are no longer given out twice, and this stays as the
+    /// second guard: only a draft saved here has an envelope, and received
+    /// mail never does.
+    pub fn is_own_outgoing(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT draft_envelope IS NOT NULL OR send_after_ms IS NOT NULL
+                   FROM messages WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
     /// The account a message belongs to, tombstoned or not. The callers that
     /// push or drop a draft's server copy used to ask for the *active*
     /// account instead, and with two accounts that is whichever one the rail
@@ -132,6 +154,8 @@ impl Store {
             .optional()?)
     }
 
+    /// The draft's server identity: its stable Message-ID and the UID of the
+    /// copy currently in the server's Drafts folder.
     pub fn draft_sync_state(&self, draft_id: i64) -> Result<(Option<String>, Option<u32>)> {
         Ok(self
             .conn
@@ -293,11 +317,6 @@ impl Store {
         Ok(id)
     }
 
-    /// Marks a draft to go at a given time, or clears the schedule.
-    ///
-    /// Clearing matters as much as setting: an outbox you cannot pull something
-    /// back out of is a worse promise than sending straight away, because the
-    /// window where you can change your mind is exactly why it exists.
     /// Whether this row has a send time: post in the outbox, not a draft.
     pub fn has_send_time(&self, draft_id: i64) -> Result<bool> {
         Ok(self
@@ -311,6 +330,11 @@ impl Store {
             .unwrap_or(false))
     }
 
+    /// Marks a draft to go at a given time, or clears the schedule.
+    ///
+    /// Clearing matters as much as setting: an outbox you cannot pull something
+    /// back out of is a worse promise than sending straight away, because the
+    /// window where you can change your mind is exactly why it exists.
     pub fn schedule_send(&self, draft_id: i64, at_ms: Option<i64>) -> Result<()> {
         self.conn.execute(
             "UPDATE messages SET send_after_ms = ?2 WHERE id = ?1",
@@ -336,14 +360,12 @@ impl Store {
     /// `send_next_ms` is the retry ladder's next rung; a freshly scheduled
     /// message has none and goes on `send_after_ms` alone.
     pub fn due_sends(&self, account_id: i64, now_ms: i64) -> Result<Vec<DraftRecord>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id FROM messages
-             WHERE account_id = ?1
-               AND send_after_ms IS NOT NULL AND send_after_ms <= ?2
-               AND coalesce(send_next_ms, 0) <= ?2
-               AND coalesce(send_state, 'RetryQueued') IN ('UndoWindow', 'RetryQueued')
+             WHERE account_id = ?1 AND {}
              ORDER BY send_after_ms",
-        )?;
+            sendable("?2")
+        ))?;
         let ids: Vec<i64> = stmt
             .query_map(params![account_id, now_ms], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -369,6 +391,28 @@ impl Store {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Takes a message for sending, if it is still due, and says whether it did.
+    ///
+    /// `due_sends` is read once per pass and the worker sends one message at
+    /// a time, so a message pulled back to Drafts, discarded or given a new
+    /// time while an earlier one was on the wire was still on the list. It
+    /// was claimed anyway, by id alone, and sent: a message the person had
+    /// undone went out, and the draft they had just got back was deleted
+    /// behind it. This claims only what `due_sends` would still return, in
+    /// the same statement.
+    pub fn claim_send(&self, id: i64, now_ms: i64) -> Result<bool> {
+        let claimed = self.conn.execute(
+            &format!(
+                "UPDATE messages
+                    SET send_state = 'Transmitting', send_error = NULL, send_next_ms = NULL
+                  WHERE id = ?1 AND {}",
+                sendable("?2")
+            ),
+            params![id, now_ms],
+        )?;
+        Ok(claimed == 1)
     }
 
     /// Records where a send attempt left a message.
@@ -448,15 +492,20 @@ impl Store {
     /// in. This is "Send now", "Try now" and "Send anyway": the person has
     /// looked and decided, which is the only thing that may move a message out
     /// of `NeedsAttention`.
-    pub fn resend_now(&self, id: i64, now_ms: i64) -> Result<()> {
-        self.conn.execute(
+    ///
+    /// Only a message still in the outbox, and says whether there was one.
+    /// The Outbox redraws once a second, and Send now on a row pulled back a
+    /// moment before, by Z or by Edit, queued the draft again while it lay
+    /// open in the composer, and it went.
+    pub fn resend_now(&self, id: i64, now_ms: i64) -> Result<bool> {
+        let n = self.conn.execute(
             "UPDATE messages
                 SET send_state = 'RetryQueued', send_error = NULL,
                     send_next_ms = NULL, send_after_ms = ?2
-              WHERE id = ?1",
+              WHERE id = ?1 AND send_after_ms IS NOT NULL",
             params![id, now_ms],
         )?;
-        Ok(())
+        Ok(n == 1)
     }
 
     /// Takes a message out of the outbox and back into Drafts, keeping its
@@ -473,7 +522,104 @@ impl Store {
         Ok(())
     }
 
+    /// The draft to open for a message just pulled back out of the outbox:
+    /// the message itself, or a new draft with its words if it was deleted
+    /// forever while it waited.
+    ///
+    /// A reply is deleted with its conversation from the Trash and still
+    /// goes (see `outbox`). Pulled back, the deleted row was handed over as
+    /// the draft. It is in no list, so the draft vanished when the composer
+    /// closed, and the grace-period sweep reaped it. Bringing the row back in
+    /// place is no better: the actions still queued for its server copy find
+    /// a message by its placements and its Message-ID, so they would take
+    /// the new draft's copy with them. The deleted row is left to them, and
+    /// its words start again as a draft nothing in the queue names.
+    pub fn draft_to_reopen(&self, id: i64) -> Result<i64> {
+        let deleted: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT account_id FROM messages WHERE id = ?1 AND deleted_at_ms IS NOT NULL",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(account) = deleted else {
+            return Ok(id);
+        };
+        let d = self.load_draft(id)?;
+        self.save_draft_full(
+            account,
+            None,
+            &d.to,
+            &d.cc,
+            &d.subject,
+            &d.body,
+            &d.html,
+            &d.envelope,
+        )
+    }
+
+    /// Takes a message out of the outbox to be edited, and returns the draft
+    /// to open (`draft_to_reopen`). One transaction: the message never leaves
+    /// the queue without a draft to show for it.
+    ///
+    /// One already pulled back is the same success it always was, with one
+    /// exception. When it had been deleted forever, its words are in the
+    /// draft the first pull-back made. Opening the deleted row again put the
+    /// person's edits where no list shows them and the sweep reaps them, so
+    /// that is refused. Z and the Outbox row's Undo can both land within the
+    /// row's one-second redraw.
+    pub fn pull_back(&self, id: i64) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let queued = self.queued_state(id)?.is_some();
+        let deleted: bool = self
+            .conn
+            .query_row(
+                "SELECT deleted_at_ms IS NOT NULL FROM messages WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if deleted && !queued {
+            return Err(StoreError::Rejected(
+                "that message is already back in Drafts".into(),
+            ));
+        }
+        self.unschedule_send(id)?;
+        let open = if queued {
+            self.draft_to_reopen(id)?
+        } else {
+            id
+        };
+        tx.commit()?;
+        Ok(open)
+    }
+
+    /// The send state of a message with a time set, as the outbox would show
+    /// it. `None` when it has no time.
+    ///
+    /// What Edit and Discard ask before they act: one row by id, where
+    /// listing the account's whole outbox to find it was the long way round.
+    pub fn queued_state(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT coalesce(send_state, 'RetryQueued') FROM messages
+                  WHERE id = ?1 AND send_after_ms IS NOT NULL",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// The outbox, with each row's state spelled out for the UI.
+    ///
+    /// Every message with a time, wherever it sits. Filing one in the Trash
+    /// or Spam, or deleting it forever, does not stop it: a reply went into
+    /// the bin with its conversation, and a rule that held binned mail back
+    /// held the reply too. Undo, Edit and Discard here are what stop a send,
+    /// so everything that will go is listed where they are.
     pub fn outbox(&self, account_id: i64) -> Result<Vec<OutboxRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.id, coalesce(m.subject,''), m.send_after_ms,
@@ -551,4 +697,39 @@ impl Store {
             .execute("DELETE FROM messages WHERE id = ?1", params![id])?;
         Ok(())
     }
+
+    /// Every file a draft still lists, in any account: saved drafts, and
+    /// messages waiting in the outbox, which are drafts with a time.
+    ///
+    /// For the sweep of staged attachments at launch. A staged file is only
+    /// clutter once nothing will send it; one a draft still lists is the
+    /// attachment, and sweeping it by age alone failed the send weeks later
+    /// with "Could not read attachment". An envelope that does not parse lists
+    /// nothing, as it does when the draft is opened.
+    pub fn draft_attachment_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT draft_envelope FROM messages WHERE draft_envelope IS NOT NULL")?;
+        let envelopes = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(envelopes
+            .iter()
+            .filter_map(|json| serde_json::from_str::<DraftEnvelope>(json).ok())
+            .flat_map(|envelope| envelope.attachments)
+            .collect())
+    }
+}
+
+/// What the worker may send on its own at `now` (a bound parameter): due,
+/// and in a state it sends from. `due_sends` and `claim_send` share it, so a
+/// claim can never take what the list would not have offered.
+///
+/// Where the message sits is not asked, on purpose (see `outbox`).
+fn sendable(now: &str) -> String {
+    format!(
+        "send_after_ms IS NOT NULL AND send_after_ms <= {now}
+         AND coalesce(send_next_ms, 0) <= {now}
+         AND coalesce(send_state, 'RetryQueued') IN ('UndoWindow', 'RetryQueued')"
+    )
 }

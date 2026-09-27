@@ -2,6 +2,7 @@ import type { Dispatch, SetStateAction } from 'react';
 import { api, type ActionKind, type Folder, type OutboxRow, type Thread } from '../lib/api';
 import { count as fmtCount } from '../lib/format';
 import { t } from '../lib/strings';
+import { outboxRefusal } from '../lib/outbox-refusal';
 import {
   binDestination,
   binTakesFolders,
@@ -31,6 +32,7 @@ import { Picker, type PickerOption } from './Picker';
 export function AppDialogs({
   discarding,
   setDiscarding,
+  onDiscarded,
   deletingTag,
   deletingSearch,
   setDeletingSearch,
@@ -68,6 +70,8 @@ export function AppDialogs({
 }: {
   discarding: OutboxRow | null;
   setDiscarding: Dispatch<SetStateAction<OutboxRow | null>>;
+  /** A message discarded from the Outbox, once the store has let it go. */
+  onDiscarded?: (id: number) => void;
   deletingTag: { id: number; name: string } | null;
   deletingSearch: { id: number; name: string } | null;
   setDeletingSearch: (search: { id: number; name: string } | null) => void;
@@ -147,7 +151,8 @@ export function AppDialogs({
           if (!row) return;
           void api
             .deleteDraft(row.id)
-            .catch((e) => setToast(t('triage-failed', { error: String(e) })));
+            .then(() => onDiscarded?.(row.id))
+            .catch((e) => setToast(outboxRefusal(e) ?? t('triage-failed', { error: String(e) })));
         }}
       />
 
