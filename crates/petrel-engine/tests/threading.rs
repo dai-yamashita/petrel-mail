@@ -911,6 +911,309 @@ fn a_list_page_follows_a_cursor_that_gained_a_reply() {
     );
 }
 
+/// `mail`, from someone of one's own, for the sorts that read the sender.
+fn mail_from(from: &str, msgid: &str, subject: &str, refs: &[&str], date_ms: i64) -> Vec<u8> {
+    let raw = String::from_utf8(mail(msgid, subject, refs, date_ms, "hi")).unwrap();
+    raw.replacen(
+        "From: Someone <someone@example.com>",
+        &format!("From: {from}"),
+        1,
+    )
+    .into_bytes()
+}
+
+/// What a row was listed under, as the list sends it back with a cursor: the
+/// walk's own value, carried on the row.
+fn shown_for(
+    _key: petrel_engine::store::SortKey,
+    row: &petrel_engine::store::ThreadListing,
+) -> String {
+    row.sort_value
+        .clone()
+        .expect("a sender or subject row says what it sorts under")
+}
+
+/// Sorted by sender or subject, the conversation a page ended on can move
+/// before the next page is asked for: a reply from someone else, or a "Re:"
+/// subject, sorts it elsewhere. Looked up afresh, the next page started from
+/// its new place, and the rows between were never listed or were listed
+/// twice. Told what the row showed, the page follows from where it was.
+#[test]
+fn a_sender_or_subject_page_follows_where_the_cursor_was_listed() {
+    use petrel_engine::store::{Sort, SortKey};
+    for (key, ascending) in [
+        (SortKey::Sender, true),
+        (SortKey::Sender, false),
+        (SortKey::Subject, true),
+        (SortKey::Subject, false),
+    ] {
+        let case = format!("{key:?} ascending={ascending}");
+        let (_d, mut store, blobs, account) = setup();
+        let inbox = inboxed(&store, account);
+        for i in 0..8 {
+            let raw = mail_from(
+                &format!("Sender {i} <s{i}@example.com>"),
+                &format!("root-{i}"),
+                &format!("Topic {i}"),
+                &[],
+                T0 + i * DAY,
+            );
+            store
+                .ingest_raw(&blobs, account, Some(inbox), None, &raw)
+                .unwrap();
+        }
+        let sort = Sort { key, ascending };
+        let all = store.list_threads(&ListView::Inbox, 0, 50, sort).unwrap();
+        let first = store.list_threads(&ListView::Inbox, 0, 3, sort).unwrap();
+        let cursor = first[2].clone();
+        let followers: Vec<i64> = all[3..6].iter().map(|r| r.thread_id).collect();
+        let shown = shown_for(key, &cursor);
+
+        // A reply that sorts the cursor conversation elsewhere: from someone
+        // who sorts last, or under a "Re:" subject.
+        let root = format!(
+            "root-{}",
+            cursor.subject.trim_start_matches("Topic ").trim()
+        );
+        let from = if ascending {
+            "Zed Last <z@example.com>"
+        } else {
+            "Aaa First <a@example.com>"
+        };
+        let reply = mail_from(
+            from,
+            "reply-1",
+            &format!("Re: {}", cursor.subject),
+            &[root.as_str()],
+            T0 + 20 * DAY,
+        );
+        store
+            .ingest_raw(&blobs, account, Some(inbox), None, &reply)
+            .unwrap();
+        let moved = store.list_threads(&ListView::Inbox, 0, 50, sort).unwrap();
+        assert_ne!(
+            moved.iter().position(|r| r.thread_id == cursor.thread_id),
+            Some(2),
+            "{case}: the reply moved it"
+        );
+
+        let next = store
+            .list_threads_after_shown(
+                &ListView::Inbox,
+                3,
+                sort,
+                cursor.date_ms,
+                cursor.thread_id,
+                Some(&shown),
+            )
+            .unwrap();
+        assert_eq!(
+            next.iter().map(|r| r.thread_id).collect::<Vec<_>>(),
+            followers,
+            "{case}: the next page is the three that followed it"
+        );
+    }
+}
+
+/// Told what it showed, a cursor whose conversation has left the view (read
+/// and archived on another device) still says where the page starts.
+#[test]
+fn a_sender_page_follows_a_cursor_that_left_the_view() {
+    use petrel_engine::actions::{ActionKind, PlacementPolicy};
+    use petrel_engine::store::{Sort, SortKey};
+    let (_d, mut store, blobs, account) = setup();
+    let inbox = inboxed(&store, account);
+    store.ensure_folder(account, "archive", "Archive").unwrap();
+    for i in 0..6 {
+        let raw = mail_from(
+            &format!("Sender {i} <s{i}@example.com>"),
+            &format!("root-{i}"),
+            &format!("Topic {i}"),
+            &[],
+            T0 + i * DAY,
+        );
+        store
+            .ingest_raw(&blobs, account, Some(inbox), None, &raw)
+            .unwrap();
+    }
+    let sort = Sort {
+        key: SortKey::Sender,
+        ascending: true,
+    };
+    let all = store.list_threads(&ListView::Inbox, 0, 50, sort).unwrap();
+    let cursor = all[2].clone();
+    store
+        .apply_thread_action(
+            account,
+            cursor.thread_id,
+            ActionKind::Archive,
+            None,
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+    let next = store
+        .list_threads_after_shown(
+            &ListView::Inbox,
+            3,
+            sort,
+            cursor.date_ms,
+            cursor.thread_id,
+            Some(&shown_for(SortKey::Sender, &cursor)),
+        )
+        .unwrap();
+    assert_eq!(
+        next.iter().map(|r| r.thread_id).collect::<Vec<_>>(),
+        all[3..6].iter().map(|r| r.thread_id).collect::<Vec<_>>()
+    );
+}
+
+/// Two conversations from one sender at one instant sort by key, so a page
+/// can end between them and the next begins with the other, rather than
+/// skipping it as level with the cursor.
+#[test]
+fn a_sender_page_ending_between_two_level_conversations_lists_both() {
+    use petrel_engine::store::{Sort, SortKey};
+    let (_d, mut store, blobs, account) = setup();
+    let inbox = inboxed(&store, account);
+    for i in 0..4 {
+        let raw = mail_from(
+            "Same Sender <same@example.com>",
+            &format!("root-{i}"),
+            &format!("Topic {i}"),
+            &[],
+            T0,
+        );
+        store
+            .ingest_raw(&blobs, account, Some(inbox), None, &raw)
+            .unwrap();
+    }
+    for ascending in [true, false] {
+        let sort = Sort {
+            key: SortKey::Sender,
+            ascending,
+        };
+        let all = store.list_threads(&ListView::Inbox, 0, 50, sort).unwrap();
+        assert_eq!(all.len(), 4);
+        // One row a page, from the first to the last.
+        let mut walked = vec![all[0].thread_id];
+        let mut last = all[0].clone();
+        loop {
+            let next = store
+                .list_threads_after_shown(
+                    &ListView::Inbox,
+                    1,
+                    sort,
+                    last.date_ms,
+                    last.thread_id,
+                    Some(&shown_for(SortKey::Sender, &last)),
+                )
+                .unwrap();
+            let Some(row) = next.into_iter().next() else {
+                break;
+            };
+            walked.push(row.thread_id);
+            last = row;
+        }
+        assert_eq!(
+            walked,
+            all.iter().map(|r| r.thread_id).collect::<Vec<_>>(),
+            "ascending={ascending}: each once, in order"
+        );
+    }
+}
+
+/// Two messages of one conversation sent in the same second, by different
+/// people: which of them the row names and which the walk sorts by were each
+/// SQLite's choice, and could differ. The walk's own value, carried on the
+/// row, is what the next page starts from, so a page that ends on that
+/// conversation is followed by the rows after it, whatever the row shows.
+#[test]
+fn a_sender_page_follows_a_conversation_whose_newest_messages_tie() {
+    use petrel_engine::store::{Sort, SortKey};
+    let (_d, mut store, blobs, account) = setup();
+    let inbox = inboxed(&store, account);
+    let tied = T0 + 10 * DAY;
+    store
+        .ingest_raw(
+            &blobs,
+            account,
+            Some(inbox),
+            None,
+            &mail_from("Bob <bob@example.com>", "tie-1", "Tie", &[], tied),
+        )
+        .unwrap();
+    store
+        .ingest_raw(
+            &blobs,
+            account,
+            Some(inbox),
+            None,
+            &mail_from(
+                "Carol <carol@example.com>",
+                "tie-2",
+                "Re: Tie",
+                &["tie-1"],
+                tied,
+            ),
+        )
+        .unwrap();
+    for (i, from) in ["Adam", "Bea", "Bob Two", "Cara", "Dan"].iter().enumerate() {
+        store
+            .ingest_raw(
+                &blobs,
+                account,
+                Some(inbox),
+                None,
+                &mail_from(
+                    &format!("{from} <p{i}@example.com>"),
+                    &format!("other-{i}"),
+                    &format!("Other {i}"),
+                    &[],
+                    T0 + i as i64 * DAY,
+                ),
+            )
+            .unwrap();
+    }
+    let sort = Sort {
+        key: SortKey::Sender,
+        ascending: true,
+    };
+    let all = store.list_threads(&ListView::Inbox, 0, 50, sort).unwrap();
+    assert_eq!(all.len(), 6);
+    assert!(
+        all.iter().all(|r| r.sort_value.is_some()),
+        "every row says what it sorts under"
+    );
+    // Page by page, one row each, from the first row to the last.
+    let mut walked = vec![all[0].thread_id];
+    let mut last = all[0].clone();
+    while let Some(row) = store
+        .list_threads_after_shown(
+            &ListView::Inbox,
+            1,
+            sort,
+            last.date_ms,
+            last.thread_id,
+            Some(&shown_for(SortKey::Sender, &last)),
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+    {
+        walked.push(row.thread_id);
+        last = row;
+    }
+    assert_eq!(walked, all.iter().map(|r| r.thread_id).collect::<Vec<_>>());
+    // By date there is nothing to carry.
+    assert!(
+        store
+            .list_threads(&ListView::Inbox, 0, 50, Sort::default())
+            .unwrap()
+            .iter()
+            .all(|r| r.sort_value.is_none())
+    );
+}
+
 #[test]
 fn thread_detail_page_returns_the_newest_slice_then_older() {
     let (_d, mut store, blobs, account) = setup();

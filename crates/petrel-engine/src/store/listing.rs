@@ -26,6 +26,24 @@ fn sorts_after(value: &str, date_ms: i64, cursor: &str, cursor_ms: i64, ascendin
     date_ms < cursor_ms
 }
 
+/// `sorts_after` with the conversation's key as the last word, as the walk's
+/// ORDER BY ends: two conversations with the same sender and date sort by key,
+/// the higher first. A position, so a page can start after one exactly.
+fn sorts_after_at(
+    value: &str,
+    date_ms: i64,
+    key: i64,
+    cursor: &str,
+    cursor_ms: i64,
+    cursor_key: i64,
+    ascending: bool,
+) -> bool {
+    if value == cursor && date_ms == cursor_ms {
+        return key < cursor_key;
+    }
+    sorts_after(value, date_ms, cursor, cursor_ms, ascending)
+}
+
 /// The tags a row wears, as one JSON array per conversation.
 ///
 /// Shared by the two queries that build a row — the list's and the one search
@@ -168,6 +186,7 @@ impl Store {
                 aliased: walk.as_ref().map(|w| w.aliased).unwrap_or(false),
                 sort,
                 before: None,
+                shown: None,
             },
         )
     }
@@ -187,6 +206,27 @@ impl Store {
         before_date_ms: i64,
         before_thread_id: i64,
     ) -> Result<Vec<ThreadListing>> {
+        self.list_threads_after_shown(view, limit, sort, before_date_ms, before_thread_id, None)
+    }
+
+    /// `list_threads_after`, told what the row it names showed for the sort:
+    /// its sender (the name, or the address where there is none) or its
+    /// subject, as it was listed.
+    ///
+    /// Sorted by sender or subject, the next page started from where that
+    /// conversation sorts *now*. One that took a reply from someone else, or
+    /// a "Re:" subject, had moved, and the page started from its new place:
+    /// the rows in between were skipped, or the list ended. With what it
+    /// showed, the page starts from where it was, as a date cursor does.
+    pub fn list_threads_after_shown(
+        &self,
+        view: &ListView,
+        limit: u32,
+        sort: Sort,
+        before_date_ms: i64,
+        before_thread_id: i64,
+        shown: Option<&str>,
+    ) -> Result<Vec<ThreadListing>> {
         let account = self.active_account()?.unwrap_or(-1);
         let walk = page_walk(view, account);
         self.listing_rows(
@@ -203,6 +243,7 @@ impl Store {
                 aliased: walk.as_ref().map(|w| w.aliased).unwrap_or(false),
                 sort,
                 before: Some((before_date_ms, before_thread_id)),
+                shown: shown.map(str::to_string),
             },
         )
     }
@@ -233,6 +274,7 @@ impl Store {
                 aliased: false,
                 sort: Sort::default(),
                 before: None,
+                shown: None,
             },
         )?;
         Ok(rows.into_iter().next())
@@ -266,6 +308,14 @@ impl Store {
     }
 }
 
+/// One page's conversations, in order, and what each sorts under when the
+/// sort is by sender or subject.
+#[derive(Default)]
+struct PageKeys {
+    keys: Vec<i64>,
+    values: std::collections::HashMap<i64, String>,
+}
+
 /// One listing's shape: the predicates, the page, and how rows group.
 struct ListingQuery<'a> {
     inner: &'a str,
@@ -290,10 +340,12 @@ struct ListingQuery<'a> {
     /// `messages`.
     aliased: bool,
     sort: Sort,
-    /// Date-sort cursor: the last row's `(date_ms, thread_id)`. Sender and
-    /// subject sorts ignore it and keep walking from offset, because those
-    /// orders have no index to resume on.
+    /// Cursor: the last row's `(date_ms, thread_id)`, which the next page
+    /// starts after (see `page_keys`).
     before: Option<(i64, i64)>,
+    /// What that row showed for a sender or subject sort, as it was listed
+    /// (`list_threads_after_shown`). None looks up what it sorts under now.
+    shown: Option<String>,
 }
 
 /// Message ids that sit in a role folder. Shared by the count and the
@@ -423,11 +475,20 @@ impl Store {
             per_message,
             ..
         } = &q;
-        let keys = self.page_keys(account, &q)?;
+        let PageKeys { keys, values } = self.page_keys(account, &q)?;
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        self.rows_for_keys(account, inner, outer, *per_message, &keys, bound.clone())
+        let mut rows =
+            self.rows_for_keys(account, inner, outer, *per_message, &keys, bound.clone())?;
+        if !values.is_empty() {
+            for row in &mut rows {
+                // The walk's key: the conversation, or in Drafts the message.
+                let k = if *per_message { -row.id } else { row.thread_id };
+                row.sort_value = values.get(&k).cloned();
+            }
+        }
+        Ok(rows)
     }
 
     /// The conversations one page of the list shows, newest first.
@@ -445,7 +506,7 @@ impl Store {
     /// the date index: recent mail is dense there, so a page fills
     /// after a short walk. Archive and "all" stay there too: archive
     /// is most of a Gmail store, and "all" *is* the store.
-    fn page_keys(&self, account: i64, q: &ListingQuery<'_>) -> Result<Vec<i64>> {
+    fn page_keys(&self, account: i64, q: &ListingQuery<'_>) -> Result<PageKeys> {
         let ListingQuery {
             inner,
             limit,
@@ -457,6 +518,7 @@ impl Store {
             aliased,
             sort,
             before,
+            shown,
             ..
         } = q;
         let (limit, offset, per_message, aliased, sort, before) =
@@ -547,7 +609,7 @@ impl Store {
                        {from_where}
                        GROUP BY k
                      ) n
-                     ORDER BY nullif({field}, '') IS NULL, {field} {dir}, n.d DESC"
+                     ORDER BY nullif({field}, '') IS NULL, {field} {dir}, n.d DESC, n.k DESC"
                 )
             }
         };
@@ -566,8 +628,16 @@ impl Store {
         // exists for — the conversation has left the view, so the view can
         // no longer say what it sorted under, and its newest message
         // anywhere is the closest thing to the answer.
-        let cursor_value: Option<String> = match (sort.key, before) {
-            (SortKey::Sender | SortKey::Subject, Some((_, cursor_k))) => {
+        //
+        // Unless the caller says what the row showed when it was listed.
+        // Then that is the value, folded by SQLite's own lower() as the walk
+        // folds it, and the cursor is a position rather than a row to find.
+        let cursor_value: Option<String> = match (sort.key, before, shown.as_deref()) {
+            (SortKey::Sender | SortKey::Subject, Some(_), Some(text)) => Some(
+                self.conn
+                    .query_row("SELECT lower(?1)", params![text], |r| r.get(0))?,
+            ),
+            (SortKey::Sender | SortKey::Subject, Some((_, cursor_k)), None) => {
                 let expr = match sort.key {
                     SortKey::Sender => {
                         if aliased {
@@ -675,6 +745,10 @@ impl Store {
         };
         let mut seen: std::collections::HashSet<i64> = Default::default();
         let mut ordered: Vec<i64> = Vec::with_capacity(want.min(1024));
+        // By sender or subject the query's third column is what each row
+        // sorts under, kept for the rows the page lists (`sort_value`).
+        let by_value = matches!(sort.key, SortKey::Sender | SortKey::Subject);
+        let mut values: std::collections::HashMap<i64, String> = Default::default();
         let mut skipping = before.is_some();
         let mut found_cursor = before.is_none();
         while let Some(row) = rows.next()? {
@@ -695,6 +769,19 @@ impl Store {
                             continue;
                         }
                         // This row is the first of the page.
+                        skipping = false;
+                        found_cursor = true;
+                    }
+                    // Told what the cursor row showed: a position, as by
+                    // date. The page starts at the first row past where the
+                    // row was listed, wherever that conversation sorts now;
+                    // come back further down, it is a row the caller has.
+                    (_, Some((cursor_d, cursor_k))) if shown.is_some() => {
+                        let cv = cursor_value.as_deref().unwrap_or_default();
+                        let v: String = row.get(2)?;
+                        if !sorts_after_at(&v, d, k, cv, cursor_d, cursor_k, sort.ascending) {
+                            continue;
+                        }
                         skipping = false;
                         found_cursor = true;
                     }
@@ -729,18 +816,23 @@ impl Store {
                     (_, None) => unreachable!("skipping only with a cursor"),
                 }
             }
+            if by_value {
+                values.insert(k, row.get(2)?);
+            }
             ordered.push(k);
             if ordered.len() >= want {
                 break;
             }
         }
         if before.is_some() && !found_cursor {
-            return Ok(Vec::new());
+            return Ok(PageKeys::default());
         }
-        if before.is_some() {
-            return Ok(ordered);
-        }
-        Ok(ordered.into_iter().skip(offset as usize).collect())
+        let keys = if before.is_some() {
+            ordered
+        } else {
+            ordered.into_iter().skip(offset as usize).collect()
+        };
+        Ok(PageKeys { keys, values })
     }
 
     /// The full row for each of a known set of conversations.
@@ -866,6 +958,7 @@ impl Store {
                 tags: parse_row_tags(row.get::<_, Option<String>>(12)?),
                 attachment_name: row.get::<_, Option<String>>(13)?,
                 match_snippet: None,
+                sort_value: None,
             })
         })?;
         let mut out = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1133,11 +1226,23 @@ impl Store {
                  AND snoozed_until_ms > (strftime('%s','now') * 1000)",
                 total,
             )?,
-            ListView::Outbox => self.count_on_partial_index(
-                account,
-                "idx_messages_send_after",
-                "send_after_ms IS NOT NULL",
-                total,
+            // What the Outbox lists (`outbox()`): messages, not conversations,
+            // and one deleted forever while it waited, which still goes. The
+            // count of conversations that skipped it read "0 waiting · 1 need
+            // you" above its own row, and two replies waiting in one
+            // conversation as one.
+            ListView::Outbox => self.conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM messages INDEXED BY idx_messages_send_after
+                      WHERE account_id = ?1 AND send_after_ms IS NOT NULL{unread}",
+                    unread = if total {
+                        String::new()
+                    } else {
+                        format!(" AND flags & {} = 0", flags::SEEN)
+                    },
+                ),
+                params![account],
+                |r| r.get(0),
             )?,
             _ => return Ok(None),
         };
@@ -1292,6 +1397,7 @@ impl Store {
                 tags: parse_row_tags(row.get::<_, Option<String>>(12)?),
                 attachment_name: row.get::<_, Option<String>>(13)?,
                 match_snippet: None,
+                sort_value: None,
             })
         })?;
         let mut out = rows.collect::<std::result::Result<Vec<_>, _>>()?;

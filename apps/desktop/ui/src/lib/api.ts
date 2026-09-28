@@ -46,6 +46,9 @@ export type Thread = {
   /** Why this row matched, when it came from a search: the text around the hit
    *  with the matched words wrapped in `[` and `]`. Null in an ordinary list. */
   match_snippet: string | null;
+  /** What a list sorted by sender or subject placed the row under, as the
+   *  engine read it; sent back with the cursor for the next page. */
+  sort_value?: string | null;
 };
 
 export type Tag = { id: number; name: string; colour: string; thread_count: number };
@@ -572,6 +575,7 @@ const mock = {
     _asc = false,
     _beforeDateMs?: number,
     _beforeThreadId?: number,
+    _beforeShown?: string,
   ) => {
     const rows = mockRows(Math.min(limit, 100), offset);
     // Enough fidelity to exercise the view switch: the browser mock is not the
@@ -884,6 +888,8 @@ const real = {
     ascending = false,
     beforeDateMs?: number,
     beforeThreadId?: number,
+    /** What the cursor row showed for a sender or subject sort. */
+    beforeShown?: string,
   ) =>
     invoke<Thread[]>('list_threads', {
       view,
@@ -895,6 +901,7 @@ const real = {
         beforeDateMs != null && beforeThreadId != null
           ? [beforeDateMs, beforeThreadId]
           : null,
+      beforeShown: beforeShown ?? null,
     }),
   threadById: (threadId: number) => invoke<Thread | null>('thread_by_id', { threadId }),
   /** One conversation as `view` lists it, or null when it has nothing there. */

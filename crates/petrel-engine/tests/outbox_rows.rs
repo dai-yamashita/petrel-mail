@@ -641,3 +641,93 @@ fn the_clock_knows_when_to_wake() {
         "only the retry remains"
     );
 }
+
+/// The Outbox's number is what the Outbox lists: messages, not conversations,
+/// and one deleted forever while it waits, which still goes. Counted by
+/// conversation, two replies waiting in one read as one, and a message
+/// deleted while it waited on a decision read "0 waiting · 1 need you" above
+/// its own row.
+#[test]
+fn the_outbox_counts_what_it_lists() {
+    use petrel_engine::actions::{ActionKind, PlacementPolicy};
+    use petrel_engine::store::{DraftEnvelope, ListView};
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("p.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    let (first, conversation) = reply_in_a_conversation(&mut store, &blobs, account);
+
+    // A second reply to the same message, threaded the same way: its pushed
+    // copy comes back through Drafts.
+    let envelope = DraftEnvelope {
+        in_reply_to: Some("<m1@example.com>".into()),
+        references: vec!["<m1@example.com>".into()],
+        ..Default::default()
+    };
+    let second = store
+        .save_draft_full(
+            account,
+            None,
+            "sam@example.com",
+            "",
+            "Re: Plans",
+            "also",
+            "",
+            &envelope,
+        )
+        .unwrap();
+    store
+        .set_draft_msgid(second, "draft-r2@example.com")
+        .unwrap();
+    let drafts = store.ensure_folder(account, "drafts", "Drafts").unwrap();
+    let copy = b"From: Me <me@example.com>\r\nTo: sam@example.com\r\n\
+Subject: Re: Plans\r\nDate: Tue, 18 Aug 2026 14:06:00 +0000\r\n\
+Message-ID: <draft-r2@example.com>\r\nIn-Reply-To: <m1@example.com>\r\n\
+References: <m1@example.com>\r\nMIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\r\nalso\r\n";
+    store
+        .ingest_raw(&blobs, account, Some(drafts), Some(8), copy)
+        .unwrap();
+    assert_eq!(store.thread_of(second).unwrap(), Some(conversation));
+
+    store.schedule_send(first, Some(1_000)).unwrap();
+    store.schedule_send(second, Some(2_000)).unwrap();
+    let count = |store: &Store| store.count_view(&ListView::Outbox, true).unwrap();
+    let rail = |store: &Store, key: &str| {
+        store
+            .view_counts(&Default::default())
+            .unwrap()
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, n)| n)
+            .unwrap_or(0)
+    };
+    assert_eq!(count(&store), 2, "two replies in one conversation are two");
+    assert_eq!(count(&store), store.outbox(account).unwrap().len() as i64);
+
+    // One waits on a decision, and is deleted forever with its conversation.
+    store
+        .set_send_state(
+            second,
+            SendState::NeedsAttention,
+            Some("dropped"),
+            None,
+            None,
+        )
+        .unwrap();
+    for kind in [ActionKind::Trash, ActionKind::DeleteForever] {
+        store
+            .apply_thread_action(
+                account,
+                conversation,
+                kind,
+                None,
+                PlacementPolicy::Exclusive,
+            )
+            .unwrap();
+    }
+    assert_eq!(store.outbox(account).unwrap().len(), 2, "both still listed");
+    assert_eq!(count(&store), 2, "and both still counted");
+    assert_eq!(rail(&store, "outbox"), 2);
+    assert_eq!(rail(&store, "outbox:attention"), 1);
+}

@@ -44,6 +44,7 @@ function thread(over: Partial<Thread> & Pick<Thread, 'thread_id'>): Thread {
     tags: over.tags ?? [],
     attachment_name: over.attachment_name ?? null,
     match_snippet: over.match_snippet ?? null,
+    sort_value: over.sort_value ?? null,
   };
 }
 
@@ -95,6 +96,20 @@ describe('loadMoreCall', () => {
       42,
       9,
     ]);
+  });
+
+  it('by sender or subject, also says what the last row showed', () => {
+    // The conversation may sort elsewhere by the time the page is asked for,
+    // and the next page has to start from where it was listed.
+    const named = thread({ thread_id: 9, date_ms: 42, from_display: 'Sam Lee', from_addr: 'sam@example.com', subject: 'Plans' });
+    const bare = thread({ thread_id: 9, date_ms: 42, from_display: '', from_addr: 'sam@example.com' });
+    const at = ['inbox', 0, LIST_PAGE];
+    expect(loadMoreCall('inbox', { key: 'sender', ascending: true }, named)).toEqual([...at, 'sender', true, 42, 9, 'Sam Lee']);
+    expect(loadMoreCall('inbox', { key: 'sender', ascending: false }, bare)).toEqual([...at, 'sender', false, 42, 9, 'sam@example.com']);
+    expect(loadMoreCall('inbox', { key: 'subject', ascending: true }, named)).toEqual([...at, 'subject', true, 42, 9, 'Plans']);
+    // The engine's own value, when the row carries it, is what goes.
+    const valued = thread({ thread_id: 9, date_ms: 42, from_display: 'Sam Lee', sort_value: 'bob' });
+    expect(loadMoreCall('inbox', { key: 'sender', ascending: true }, valued)).toEqual([...at, 'sender', true, 42, 9, 'bob']);
   });
 });
 

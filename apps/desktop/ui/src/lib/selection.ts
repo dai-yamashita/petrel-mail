@@ -57,6 +57,40 @@ export function extend(
   return next;
 }
 
+/**
+ * Where a range grows from once the row it grew from has left the list: the
+ * nearest row still listed and selected, looking first toward where the range
+ * went, or none.
+ *
+ * A reply can carry the anchor's conversation past the loaded page. `extend`
+ * then found no anchor, and the next ⇧J selected only the row it moved to,
+ * which E archived alone.
+ *
+ * `prev` is the list as it was, and `anchor` and `toward` are ids in it.
+ * `kept` gives a row's id in the list now, if it is still listed and
+ * selected, or null.
+ */
+export function reanchor(
+  prev: readonly number[],
+  anchor: number,
+  toward: number | null,
+  kept: (id: number) => number | null,
+): number | null {
+  const at = prev.indexOf(anchor);
+  if (at < 0) return null;
+  const end = toward == null ? -1 : prev.indexOf(toward);
+  const first = end >= 0 && end < at ? -1 : 1;
+  for (let d = 1; d < prev.length; d += 1) {
+    for (const step of [first, -first]) {
+      const i = at + step * d;
+      if (i < 0 || i >= prev.length) continue;
+      const k = kept(prev[i]);
+      if (k != null) return k;
+    }
+  }
+  return null;
+}
+
 /** Drops ids no longer in the list, so a selection cannot outlive its rows. */
 export function prune(selected: ReadonlySet<number>, order: readonly number[]): Set<number> {
   const present = new Set(order);

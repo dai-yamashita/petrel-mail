@@ -154,6 +154,31 @@ impl Store {
             .optional()?)
     }
 
+    /// Where the server holds copies of a draft: `(folder path, UID)` for
+    /// each numbered placement in Drafts, or in the Trash or Spam that a
+    /// conversation took it to.
+    ///
+    /// What is dropped once the draft has gone or been discarded. Only Drafts
+    /// was looked in, so a reply binned with its conversation left its copy in
+    /// the bin, and it synced back as a draft there. A placement with no UID
+    /// is not addressed: none was learned, or a UIDVALIDITY reset took it.
+    pub fn draft_copies(&self, draft_id: i64) -> Result<Vec<(String, u32)>> {
+        // In the draft's own account only: the copies are expunged by
+        // signing in to that account.
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, p.uid FROM placements p
+               JOIN folders f ON f.id = p.folder_id
+              WHERE p.message_id = ?1 AND p.uid IS NOT NULL
+                AND f.role IN ('drafts', 'trash', 'spam')
+                AND f.account_id = (SELECT account_id FROM messages WHERE id = ?1)
+              ORDER BY f.path, p.uid",
+        )?;
+        let rows = stmt.query_map(params![draft_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// The draft's server identity: its stable Message-ID and the UID of the
     /// copy currently in the server's Drafts folder.
     pub fn draft_sync_state(&self, draft_id: i64) -> Result<(Option<String>, Option<u32>)> {

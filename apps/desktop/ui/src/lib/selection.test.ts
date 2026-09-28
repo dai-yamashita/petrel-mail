@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extend, facing, prune, rowsOf, tagsOnAll, targets, toggle } from './selection';
+import { extend, facing, prune, reanchor, rowsOf, tagsOnAll, targets, toggle } from './selection';
 
 const order = [1, 2, 3, 4, 5];
 
@@ -72,6 +72,43 @@ describe('extend', () => {
 
   it('ignores an id that is not in the list', () => {
     expect([...extend(new Set([1]), order, 1, 99)]).toEqual([1]);
+  });
+});
+
+describe('reanchor', () => {
+  // Rows 1 to 5, as the list was. 108 and 109 of the review's case are 3 and 4.
+  const listedAndSelected = (ids: number[]) => (id: number) => (ids.includes(id) ? id : null);
+
+  it('moves to the nearest selected row still listed, toward the range first', () => {
+    // Anchor 4 left; the range ran from 4 up to 2.
+    expect(reanchor(order, 4, 2, listedAndSelected([2, 3, 5]))).toBe(3);
+    // The same, the range running down: the nearer row below wins.
+    expect(reanchor(order, 2, 4, listedAndSelected([1, 3]))).toBe(3);
+  });
+
+  it('looks the other way when nothing is selected toward the range', () => {
+    expect(reanchor(order, 3, 5, listedAndSelected([1]))).toBe(1);
+  });
+
+  it('follows a row to its new id', () => {
+    expect(reanchor(order, 4, 3, (id) => (id === 3 ? 30 : null))).toBe(30);
+  });
+
+  it('is none when no selected row is left, or the anchor was never listed', () => {
+    expect(reanchor(order, 4, 3, () => null)).toBeNull();
+    expect(reanchor(order, 9, 3, listedAndSelected([1, 2]))).toBeNull();
+  });
+
+  it('gives extend an anchor it can grow from again', () => {
+    // The review's case: 3 and 4 ticked, the cursor on 3, 4 leaves the list.
+    const now = [1, 2, 3, 5];
+    const selected = new Set([3, 4]);
+    const anchor = reanchor(order, 4, 3, (id) => (selected.has(id) && now.includes(id) ? id : null));
+    expect(anchor).toBe(3);
+    // ⇧J from 3 to 5 keeps 3 in the range, where the anchor it had lost
+    // selected 5 alone.
+    expect([...extend(selected, now, anchor, 5)].sort()).toEqual([3, 4, 5]);
+    expect([...extend(selected, now, 4, 5)]).toEqual([5]);
   });
 });
 

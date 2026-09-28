@@ -177,13 +177,10 @@ pub(crate) fn schedule_draft_push(state: Arc<AppState>, draft_id: i64) {
     });
 }
 
-/// Deletes the draft's server copy, if one was recorded — for a draft being
-/// discarded, or one that just became a sent message. Reads through the
-/// caller's guard, because two of the three callers already hold the lock.
+/// Deletes the draft's server copies — for a draft being discarded, or one
+/// that just became a sent message. Reads through the caller's guard,
+/// because two of the three callers already hold the lock.
 pub(crate) fn drop_server_draft_using(state: &AppState, store: &Store, draft_id: i64) {
-    let Ok((_, Some(uid))) = store.draft_sync_state(draft_id) else {
-        return;
-    };
     // The draft's account, not the active one. This runs from the send
     // worker after the undo window, by which time the rail may show another
     // account — and expunging this UID in *that* account's Drafts destroys
@@ -194,22 +191,44 @@ pub(crate) fn drop_server_draft_using(state: &AppState, store: &Store, draft_id:
     let Some(cfg) = imap_config_for(store, account) else {
         return;
     };
-    let Some(path) = store
+    let copies = server_copies(store, account, draft_id);
+    if copies.is_empty() {
+        return;
+    }
+    let uidplus = state.caps(account).has_uidplus;
+    tauri::async_runtime::spawn(async move {
+        // UIDPLUS makes the expunge surgical. Without it a copy is only
+        // flagged \Deleted, because a bare EXPUNGE would commit other
+        // clients' deletions too, and it stays until the server expunges it.
+        for (path, uid) in copies {
+            if let Err(e) = petrel_providers::imap::expunge_uid(&cfg, &path, uid, uidplus).await {
+                log_sync(&format!("server draft copy (uid {uid}) not removed: {e}"));
+            }
+        }
+    });
+}
+
+/// The server copies of a draft to drop, by folder path and UID: every one
+/// the store has numbered in Drafts, or in the Trash or Spam a conversation
+/// took it to (`Store::draft_copies`), and the copy the last push recorded,
+/// which Drafts may not have numbered yet. Each once.
+fn server_copies(store: &Store, account: i64, draft_id: i64) -> Vec<(String, u32)> {
+    let mut copies = store.draft_copies(draft_id).unwrap_or_default();
+    let pushed = store
+        .draft_sync_state(draft_id)
+        .ok()
+        .and_then(|(_, uid)| uid);
+    let drafts = store
         .folder_for_role(account, "drafts")
         .ok()
         .flatten()
-        .and_then(|fid| store.folder_path(fid).ok().flatten())
-    else {
-        return;
-    };
-    let uidplus = state.caps(account).has_uidplus;
-    tauri::async_runtime::spawn(async move {
-        // UIDPLUS makes the expunge surgical; without it the fallback path
-        // inside expunge_uid does the careful dance. Read fresh per call.
-        if let Err(e) = petrel_providers::imap::expunge_uid(&cfg, &path, uid, uidplus).await {
-            log_sync(&format!("server draft copy (uid {uid}) not removed: {e}"));
-        }
-    });
+        .and_then(|fid| store.folder_path(fid).ok().flatten());
+    if let (Some(uid), Some(path)) = (pushed, drafts)
+        && !copies.contains(&(path.clone(), uid))
+    {
+        copies.push((path, uid));
+    }
+    copies
 }
 
 /// Splits a recipient field the way the composer's chip field does —
@@ -222,4 +241,83 @@ fn addresses_of(field: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod server_copies_tests {
+    use super::server_copies;
+    use petrel_engine::actions::{ActionKind, PlacementPolicy};
+    use petrel_engine::store::Store;
+
+    /// A draft pushed once: the copy's UID recorded, and numbered in Drafts.
+    fn pushed() -> (Store, i64, i64) {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store.ensure_test_account().unwrap();
+        store.ensure_folder(account, "drafts", "Drafts").unwrap();
+        store.ensure_folder(account, "trash", "Trash").unwrap();
+        let id = store
+            .save_draft(account, None, "sam@example.com", "Plans", "yes", "")
+            .unwrap();
+        store.set_draft_server_uid(id, Some(7)).unwrap();
+        store.heal_placement_uid(id, account, "Drafts", 7).unwrap();
+        (store, account, id)
+    }
+
+    #[test]
+    fn a_draft_in_drafts_drops_its_one_copy() {
+        let (store, account, id) = pushed();
+        assert_eq!(
+            server_copies(&store, account, id),
+            vec![("Drafts".to_string(), 7)]
+        );
+    }
+
+    /// A reply binned with its conversation has its copy in the Trash, and
+    /// that goes too. Only Drafts was looked in, and the copy synced back as
+    /// a draft inside the binned conversation.
+    #[test]
+    fn a_binned_draft_drops_its_copy_in_the_bin() {
+        let (store, account, id) = pushed();
+        store
+            .apply_message_action(
+                account,
+                id,
+                ActionKind::Trash,
+                None,
+                PlacementPolicy::Exclusive,
+            )
+            .unwrap();
+        store.heal_placement_uid(id, account, "Trash", 12).unwrap();
+        assert_eq!(
+            server_copies(&store, account, id),
+            vec![("Trash".to_string(), 12), ("Drafts".to_string(), 7)]
+        );
+    }
+
+    /// Nothing is expunged by a number the store does not hold, or anywhere
+    /// but Drafts and the bins.
+    #[test]
+    fn only_numbered_copies_in_drafts_and_the_bins_are_dropped() {
+        let (store, account, id) = pushed();
+        let archive = store.ensure_folder(account, "archive", "Archive").unwrap();
+        store.place_message_at(id, archive, 30).unwrap();
+        assert_eq!(
+            server_copies(&store, account, id),
+            vec![("Drafts".to_string(), 7)]
+        );
+        // Moved to the Trash, with no UID there yet: only the push's copy.
+        store
+            .apply_message_action(
+                account,
+                id,
+                ActionKind::Trash,
+                None,
+                PlacementPolicy::Exclusive,
+            )
+            .unwrap();
+        assert_eq!(
+            server_copies(&store, account, id),
+            vec![("Drafts".to_string(), 7)]
+        );
+    }
 }

@@ -81,7 +81,7 @@ import {
   stageDropped,
   type Attached,
 } from './lib/attachments';
-import { extend, facing, prune, rowsOf, tagsOnAll, targets, toggle } from './lib/selection';
+import { extend, facing, prune, reanchor, rowsOf, tagsOnAll, targets, toggle } from './lib/selection';
 import { arrivalsSince, notifiable, postDesktopNotification, shouldNotify } from './lib/notify';
 import { Help } from './components/Help';
 import { Settings } from './components/Settings';
@@ -800,9 +800,11 @@ export function App() {
   const [listSeen, setListSeen] = useState({ items, epoch: replaceEpoch });
   if (listSeen.items !== items) {
     setListSeen({ items, epoch: replaceEpoch });
-    if (listSeen.epoch === replaceEpoch && !listsPerMessage(view)) {
-      const moved = renumbered(listSeen.items, items);
-      const follow = (id: number) => moved.get(id) ?? id;
+    const sameWindow = listSeen.epoch === replaceEpoch;
+    const moved =
+      sameWindow && !listsPerMessage(view) ? renumbered(listSeen.items, items) : new Map<number, number>();
+    const follow = (id: number) => moved.get(id) ?? id;
+    if (sameWindow && !listsPerMessage(view)) {
       if (activeId != null && moved.has(activeId)) {
         followed.current = { from: activeId, to: follow(activeId) };
         setActiveId(follow(activeId));
@@ -822,6 +824,26 @@ export function App() {
         // the conversation, not to a row no longer drawn, where it did nothing.
         if (pickerFor?.some((id) => moved.has(id))) setPickerFor(pickerFor.map(follow));
         if (rowMenu && moved.has(rowMenu.id)) setRowMenu({ ...rowMenu, id: follow(rowMenu.id) });
+      }
+    }
+    // The row a range grows from, gone from the list: a reply carried its
+    // conversation past the loaded page, or another client filed it. The next
+    // ⇧J grew from nowhere and selected one row, which E then archived alone.
+    // The range grows from the nearest selected row still here, or anew.
+    if (sameWindow) {
+      const listed = new Set(items.map((m) => m.id));
+      if (anchor != null && !listed.has(follow(anchor))) {
+        setAnchor(
+          reanchor(
+            listSeen.items.map((m) => m.id),
+            anchor,
+            rangeEnd ?? activeId,
+            (id) => (selected.has(id) && listed.has(follow(id)) ? follow(id) : null),
+          ),
+        );
+        setRangeEnd(null);
+      } else if (rangeEnd != null && !listed.has(follow(rangeEnd))) {
+        setRangeEnd(null);
       }
     }
   }

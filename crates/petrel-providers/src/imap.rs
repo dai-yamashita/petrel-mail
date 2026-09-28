@@ -2801,10 +2801,11 @@ where
 /// committed yet. Deleting one message is not a licence to commit someone
 /// else's pending deletions.
 ///
-/// Without UIDPLUS the message is marked \Deleted and left there. That is the
-/// conservative half of the job — it disappears from Petrel either way, and the
-/// server drops it at the next compaction — and it is a great deal better than
-/// taking unrelated mail with it. The caller is told which happened.
+/// Without UIDPLUS the message is marked \Deleted and left there, for the
+/// server to drop when it next expunges. That is the conservative half of the
+/// job, and a great deal better than taking unrelated mail with it. Petrel
+/// does not hide a message for its \Deleted flag, so until then a sync can
+/// bring it back. The caller is told which happened.
 pub async fn expunge_uid(
     cfg: &ImapConfig,
     folder: &str,

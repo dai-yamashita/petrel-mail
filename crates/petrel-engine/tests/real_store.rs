@@ -63,18 +63,23 @@ fn every_count_matches_its_listing() {
             let n = store.conversations_in(&view).unwrap();
             let dt = t.elapsed();
             let t = Instant::now();
-            let rows = store
-                .list_threads(&view, 0, 1_000_000, Sort::default())
-                .unwrap();
+            // The Outbox's list is its own: messages, from `outbox()`.
+            let listed = if matches!(view, ListView::Outbox) {
+                store.outbox(account).unwrap().len()
+            } else {
+                store
+                    .list_threads(&view, 0, 1_000_000, Sort::default())
+                    .unwrap()
+                    .len()
+            };
             let dl = t.elapsed();
-            let ok = n == rows.len() as i64;
+            let ok = n == listed as i64;
             println!(
-                "acct {account} {name}: count={n} ({dt:.1?}) list={} ({dl:.1?}) {}",
-                rows.len(),
+                "acct {account} {name}: count={n} ({dt:.1?}) list={listed} ({dl:.1?}) {}",
                 if ok { "OK" } else { "MISMATCH" }
             );
             if !ok {
-                mismatches.push(format!("acct {account} {name}: {n} vs {}", rows.len()));
+                mismatches.push(format!("acct {account} {name}: {n} vs {listed}"));
             }
         }
         let t = Instant::now();
@@ -133,8 +138,16 @@ fn every_view_pages_to_the_end_without_gaps() {
                         break;
                     }
                     let t = Instant::now();
+                    // As the list asks: with what the last row sorted under.
                     page = store
-                        .list_threads_after(&view, 100, sort, last.date_ms, last.thread_id)
+                        .list_threads_after_shown(
+                            &view,
+                            100,
+                            sort,
+                            last.date_ms,
+                            last.thread_id,
+                            last.sort_value.as_deref(),
+                        )
                         .unwrap();
                     slowest = slowest.max(t.elapsed());
                     assert!(pages < 10_000, "runaway walk in {name}");

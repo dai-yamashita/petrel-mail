@@ -557,6 +557,12 @@ pub struct ThreadListing {
     pub match_snippet: Option<String>,
     /// First attachment filename, for the row chip; the reader lists them all.
     pub attachment_name: Option<String>,
+    /// What a list sorted by sender or subject placed this row under, as the
+    /// walk read it. The list sends it back with the cursor for the next page
+    /// (`list_threads_after_shown`). Read off the row's own sender or subject
+    /// instead, it could name the other of two messages sent in the same
+    /// second, and the next page started in the wrong place. None otherwise.
+    pub sort_value: Option<String>,
 }
 
 /// A list-ready row shared by recents and search results (UI surfaces).

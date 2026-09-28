@@ -12,6 +12,7 @@ export type ThreadFetchers = {
     ascending?: boolean,
     beforeDateMs?: number,
     beforeThreadId?: number,
+    beforeShown?: string,
   ) => Promise<Thread[]>;
   search: (query: string, sort?: string, ascending?: boolean) => Promise<Thread[]>;
   /** One conversation as the view lists it; see `refreshHead`. */
@@ -25,10 +26,19 @@ export function firstPageCall(view: string, sort: Sort): Parameters<ThreadFetche
 }
 
 /** Next listing page — cursor taken from `last`, the row the page before it
- *  ended on. */
+ *  ended on.
+ *
+ *  By sender or subject, the cursor also carries what that row was listed
+ *  under: the engine's own value when the row has it, else its sender (the
+ *  name, or the address where there is none) or its subject. The
+ *  conversation may have taken a reply that sorts it elsewhere since, and a
+ *  page started from where it sorts now skipped the rows between. */
 export function loadMoreCall(view: string, sort: Sort, last: Thread): Parameters<ThreadFetchers['threads']> {
   const wire = wireSort(sort);
-  return [view, 0, LIST_PAGE, wire.key, wire.ascending, last.date_ms, last.thread_id];
+  const at = [view, 0, LIST_PAGE, wire.key, wire.ascending, last.date_ms, last.thread_id] as const;
+  if (sort.key === 'sender') return [...at, last.sort_value ?? (last.from_display || last.from_addr || '')];
+  if (sort.key === 'subject') return [...at, last.sort_value ?? (last.subject || '')];
+  return [...at];
 }
 
 export function replaceLoadHasMore(query: string, rowCount: number): boolean {

@@ -9,6 +9,7 @@ use tauri::{Manager, State};
 /// The list shows conversations, not messages — the count chip is the thread
 /// size (docs 06). Flags are rolled up across the thread by the engine.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub fn list_threads(
     view: Option<String>,
     offset: u32,
@@ -16,6 +17,9 @@ pub fn list_threads(
     sort: Option<String>,
     ascending: Option<bool>,
     before: Option<(i64, i64)>,
+    // What the cursor row showed for a sender or subject sort, so the next
+    // page starts where it was listed (`Store::list_threads_after_shown`).
+    before_shown: Option<String>,
     state: State<Arc<AppState>>,
 ) -> Result<Vec<ThreadListing>, String> {
     let _t = Timed::new("list_threads");
@@ -35,7 +39,9 @@ pub fn list_threads(
     // amount of work while the window tried to scroll.
     let limit = limit.min(100);
     match before {
-        Some((d, k)) => store.list_threads_after(&view, limit, sort, d, k),
+        Some((d, k)) => {
+            store.list_threads_after_shown(&view, limit, sort, d, k, before_shown.as_deref())
+        }
         None => store.list_threads(&view, offset, limit, sort),
     }
     .map_err(|e| e.to_string())
