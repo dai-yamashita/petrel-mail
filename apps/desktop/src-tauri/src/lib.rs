@@ -3,8 +3,9 @@
 //! `petrel-msg://` custom protocol for sanitized message documents.
 //!
 //! Two source modes: with `PETREL_IMAP_*` set it syncs a real mailbox through
-//! the engine's ingest path; without, it seeds synthetic mail so the UI is
-//! exercisable with no account. Both run the same store, index, and queries.
+//! the engine's ingest path; with `PETREL_DEMO=1` and no account, it seeds
+//! synthetic mail so the UI is exercisable without one. Both run the same
+//! store, index, and queries. With neither, a first run shows onboarding.
 //!
 //! What lives where: `state` is what every part shares; `commands` is the IPC
 //! surface, one file per area of the UI; `sync` and `send` are the workers
@@ -42,7 +43,10 @@ use config::{
     adopt_legacy_keychain_items, adopt_store_identity, imap_config_from_env,
     imap_config_from_servers, keychain_entry, remember_password,
 };
-use demo::{decorate_demo_store, reseed_demo_if_stale, spawn_demo_seeding};
+use demo::{
+    NoAccount, decorate_demo_store, demo_requested, no_account, reseed_demo_if_stale,
+    spawn_demo_seeding,
+};
 use diag::{DIAG, SELFTEST, data_dir, log_sync};
 use message_view::ViewTokens;
 use state::{AppState, now_ms};
@@ -681,33 +685,48 @@ pub fn run() {
                     spawn_real_sync(state.clone(), account, cfg);
                 }
                 (_, None) => {
-                    // No account anywhere: whatever is on screen is synthetic,
-                    // and the window is told so rather than being left to infer
-                    // a first run from the absence of one.
-                    state.demo.store(true, Ordering::Relaxed);
-                    // Demo data is for an empty first run only. Seeding it into a store
-                    // that already holds real mail would mix fabricated messages into
-                    // someone's actual mailbox — found the hard way when a persistence
-                    // test relaunched without credentials and buried a real message
-                    // under 10,000 synthetic ones.
                     let existing = state
                         .store
                         .lock()
                         .ok()
                         .and_then(|s| s.message_count().ok())
                         .unwrap_or(0);
-                    if existing > 0 {
-                        state.seeded.store(existing as usize, Ordering::Relaxed);
-                        state.seeding.store(false, Ordering::Relaxed);
-                        *state.source.lock().unwrap_or_else(|p| p.into_inner()) =
-                            "no account configured · showing stored mail".into();
-                        if !reseed_demo_if_stale(&state, account) {
-                            decorate_demo_store(&state, account);
+                    match no_account(demo_requested(), existing) {
+                        // A first run. Nothing is fetched and nothing is
+                        // invented: the window shows onboarding, which asks
+                        // for the account. Adding it removes the bootstrap
+                        // row, and with it anything this store was holding.
+                        NoAccount::Onboard => {
+                            state.seeding.store(false, Ordering::Relaxed);
+                            *state.source.lock().unwrap_or_else(|p| p.into_inner()) =
+                                "no account configured".into();
                         }
-                    } else {
-                        *state.source.lock().unwrap_or_else(|p| p.into_inner()) =
-                            "synthetic demo data".into();
-                        spawn_demo_seeding(state.clone(), account);
+                        // The synthetic mailbox, asked for. The window is told
+                        // so rather than being left to infer a first run from
+                        // the absence of an account.
+                        //
+                        // Demo data is for an empty store only. Seeding it into
+                        // one that already holds real mail would mix fabricated
+                        // messages into someone's actual mailbox — found the
+                        // hard way when a persistence test relaunched without
+                        // credentials and buried a real message under 10,000
+                        // synthetic ones.
+                        NoAccount::Keep => {
+                            state.demo.store(true, Ordering::Relaxed);
+                            state.seeded.store(existing as usize, Ordering::Relaxed);
+                            state.seeding.store(false, Ordering::Relaxed);
+                            *state.source.lock().unwrap_or_else(|p| p.into_inner()) =
+                                "no account configured · showing stored mail".into();
+                            if !reseed_demo_if_stale(&state, account) {
+                                decorate_demo_store(&state, account);
+                            }
+                        }
+                        NoAccount::Seed => {
+                            state.demo.store(true, Ordering::Relaxed);
+                            *state.source.lock().unwrap_or_else(|p| p.into_inner()) =
+                                "synthetic demo data".into();
+                            spawn_demo_seeding(state.clone(), account);
+                        }
                     }
                 }
             }

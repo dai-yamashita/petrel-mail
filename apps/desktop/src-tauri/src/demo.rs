@@ -1,4 +1,5 @@
-//! The synthetic mailbox: what the app shows when no account is configured.
+//! The synthetic mailbox: what the app shows, when asked, with no account
+//! configured.
 
 use crate::state::AppState;
 use petrel_engine::store::NewMessage;
@@ -7,6 +8,41 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 const DEMO_MESSAGES: usize = 10_000;
+
+/// What a launch does when no account can sign in.
+#[derive(Debug, PartialEq)]
+pub(crate) enum NoAccount {
+    /// A first run: the window shows onboarding, the way to add one.
+    Onboard,
+    /// The synthetic mailbox, seeded into an empty store.
+    Seed,
+    /// The synthetic mailbox already in the store, kept.
+    Keep,
+}
+
+/// Decided from whether the synthetic mailbox was asked for and how much
+/// mail the store holds.
+///
+/// Only ever on request (`PETREL_DEMO=1`, which `scripts/run-demo.sh` sets).
+/// It used to follow from no account being set up, which is every first run:
+/// a fresh install opened on ten thousand invented messages under
+/// test@example.com, and onboarding never showed.
+pub(crate) fn no_account(requested: bool, stored: i64) -> NoAccount {
+    match (requested, stored) {
+        (false, _) => NoAccount::Onboard,
+        (true, n) if n <= 0 => NoAccount::Seed,
+        (true, _) => NoAccount::Keep,
+    }
+}
+
+/// Whether this launch asked for the synthetic mailbox.
+pub(crate) fn demo_requested() -> bool {
+    wants_demo(std::env::var("PETREL_DEMO").ok().as_deref())
+}
+
+fn wants_demo(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "yes"))
+}
 
 /// The demo dataset's version. Bumping it makes the next launch throw the old
 /// synthetic mail away and seed afresh; seeding stamps it, so a store that was
@@ -211,4 +247,29 @@ pub(crate) fn decorate_demo_store(state: &Arc<AppState>, account: i64) {
         "[demo] decorated {} messages with tags and flags",
         ids.len()
     );
+}
+
+#[cfg(test)]
+mod no_account_tests {
+    use super::{NoAccount, no_account, wants_demo};
+
+    /// A first run is onboarding, whatever the store holds, unless the
+    /// synthetic mailbox was asked for.
+    #[test]
+    fn only_a_launch_that_asks_gets_the_synthetic_mailbox() {
+        assert_eq!(no_account(false, 0), NoAccount::Onboard);
+        assert_eq!(no_account(false, 10_000), NoAccount::Onboard);
+        assert_eq!(no_account(true, 0), NoAccount::Seed);
+        assert_eq!(no_account(true, 10_000), NoAccount::Keep);
+    }
+
+    #[test]
+    fn asking_means_saying_so() {
+        for yes in ["1", "true", "yes", " 1 "] {
+            assert!(wants_demo(Some(yes)), "{yes:?}");
+        }
+        for no in [None, Some(""), Some("0"), Some("false"), Some("no")] {
+            assert!(!wants_demo(no), "{no:?}");
+        }
+    }
 }

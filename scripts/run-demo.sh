@@ -28,7 +28,9 @@ if PID="$(lsof -t "$DATA_DIR/petrel.db" 2>/dev/null | head -1)" && [ -n "$PID" ]
 fi
 
 echo "store : $DATA_DIR"
-open -n "$ROOT/target/Petrel.app" --env "PETREL_DATA_DIR=$DATA_DIR"
+# PETREL_DEMO asks for the synthetic mailbox. Without it, an app with no
+# account shows onboarding, as a fresh install does.
+open -n "$ROOT/target/Petrel.app" --env "PETREL_DATA_DIR=$DATA_DIR" --env "PETREL_DEMO=1"
 
 # Seeding is 10,000 synthetic messages and the filing that follows it. Waiting
 # for the Inbox to actually hold mail is the difference between a screenshot of
