@@ -9,6 +9,10 @@ use tauri::State;
 
 #[derive(serde::Serialize)]
 pub(crate) struct Status {
+    /// The account this describes: the one on screen when it was read. The
+    /// window drops a status for any other — after a switch it holds one
+    /// that is still the previous account's until the next poll.
+    account: Option<i64>,
     /// Whether any account can sign in — set up in the app, or given by the
     /// environment. `false` is the first-run signal: the window shows
     /// onboarding instead of an empty mailbox pretending to be a mailbox.
@@ -17,7 +21,16 @@ pub(crate) struct Status {
     /// `configured`: both are false on a first run, but only one of them
     /// means "there is a mailbox here to look at".
     demo: bool,
+    /// Whether the account on screen is in its first pass: at launch, just
+    /// added, or just signed in again.
     seeding: bool,
+    /// Why the account on screen cannot sign in, if it cannot: "missing"
+    /// (no password Petrel can read) or "refused" (the server said no).
+    /// The window offers "Sign in again" on either.
+    signin: Option<crate::signin::SignIn>,
+    /// Every account that cannot sign in, on screen or not, so the window can
+    /// say so for an account the person is not looking at.
+    signins: Vec<AccountSignIn>,
     count: usize,
     /// What the server says it holds across the synced folders, or 0 if it has
     /// not been asked yet.
@@ -41,6 +54,9 @@ pub(crate) struct Status {
     /// the rule's word rides the status poll instead. Each entry is said
     /// once, by whichever poll picks it up.
     notify: Vec<(String, String)>,
+    /// New mail in the inboxes of accounts not on screen, drained on read:
+    /// see `announce_elsewhere`.
+    elsewhere: Vec<crate::state::Elsewhere>,
     /// Things a background worker needs the person to know, by key, drained
     /// the same way. A worker has no words of its own — the window owns
     /// those, and translates them — so it raises a key and the window says
@@ -49,8 +65,18 @@ pub(crate) struct Status {
     alerts: Vec<String>,
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct AccountSignIn {
+    account: i64,
+    signin: crate::signin::SignIn,
+}
+
 #[tauri::command(async)]
 pub fn status(state: State<Arc<AppState>>) -> Status {
+    status_of(&state)
+}
+
+pub(crate) fn status_of(state: &AppState) -> Status {
     let _t = Timed::new("status");
     let notify = state
         .pending_notify
@@ -62,7 +88,12 @@ pub fn status(state: State<Arc<AppState>>) -> Status {
         .lock()
         .map(|mut p| std::mem::take(&mut *p))
         .unwrap_or_default();
-    let (configured, count, retention) = match state.store_read() {
+    let elsewhere = state
+        .pending_elsewhere
+        .lock()
+        .map(|mut p| std::mem::take(&mut *p))
+        .unwrap_or_default();
+    let (configured, count, retention, active) = match state.store_read() {
         Ok(s) => {
             let account = s.active_account().ok().flatten();
             // Presence of stored servers, deliberately not a password
@@ -98,20 +129,29 @@ pub fn status(state: State<Arc<AppState>>) -> Status {
                 .ok()
                 .map(|m| m.describe().to_string())
                 .unwrap_or_default();
-            (configured, count, retention)
+            (configured, count, retention, account)
         }
         Err(_) => (
             imap_config_from_env().is_some(),
             state.status_count.load(Ordering::Relaxed),
             String::new(),
+            None,
         ),
     };
     Status {
+        account: active,
         configured,
         demo: state.demo.load(Ordering::Relaxed),
         notify,
+        elsewhere,
         alerts,
-        seeding: state.seeding.load(Ordering::Relaxed),
+        seeding: active.is_some_and(|a| state.is_seeding(a)),
+        signin: active.and_then(|a| state.signin(a)),
+        signins: state
+            .signins()
+            .into_iter()
+            .map(|(account, signin)| AccountSignIn { account, signin })
+            .collect(),
         count,
         server_total: state.server_total.load(Ordering::Relaxed),
         last_sync_ms: state.last_sync_ms.load(Ordering::Relaxed),
@@ -359,14 +399,117 @@ pub fn import_settings(path: String, state: State<Arc<AppState>>) -> Result<Stri
         return Err("This file was written by a newer Petrel.".into());
     }
     let store = state.store()?;
+    let before = store.account_ids().map_err(|e| e.to_string())?;
     let (applied, updated, added) = apply_settings_file(&store, &file)?;
+    await_passwords(&state, &store, &before)?;
     Ok(format!("{applied}/{updated}/{added}"))
+}
+
+/// Accounts an import added wait for their passwords, which stayed in the
+/// other machine's keychain. Said so, with a way to enter them, rather than
+/// an empty mailbox that never syncs. A password cached under a reused id
+/// belongs to whatever had the id before, and is forgotten.
+fn await_passwords(
+    state: &AppState,
+    store: &petrel_engine::store::Store,
+    before: &[i64],
+) -> Result<(), String> {
+    for id in store.account_ids().map_err(|e| e.to_string())? {
+        if before.contains(&id) {
+            continue;
+        }
+        crate::config::forget_password(id);
+        let has_servers = store
+            .account_servers(id)
+            .ok()
+            .flatten()
+            .is_some_and(|s| !s.imap_host.is_empty());
+        if has_servers {
+            state.set_signin(id, crate::signin::SignIn::Missing);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::status_of;
+
+    /// A status says which account it describes. The window shows one account
+    /// and polls the status every few seconds, so for a moment after a switch
+    /// it holds a status that is still the previous account's: read as the new
+    /// one's, its count made an account that held nothing look full, and its
+    /// sign-in state put the other account's name on the banner.
+    #[test]
+    fn a_status_names_the_account_it_describes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_state(dir.path());
+        let first = state.account_id;
+        let second = {
+            let store = state.store().unwrap();
+            let second = store.ensure_test_account().unwrap();
+            store.set_active_account(first).unwrap();
+            second
+        };
+        let read = |s: &super::Status| serde_json::to_value(s).unwrap()["account"].clone();
+        assert_eq!(read(&status_of(&state)), serde_json::json!(first));
+        state.store().unwrap().set_active_account(second).unwrap();
+        assert_eq!(read(&status_of(&state)), serde_json::json!(second));
+    }
 }
 
 #[cfg(test)]
 mod backup_tests {
-    use super::{SettingsFile, apply_settings_file, build_settings_file};
+    use super::{SettingsFile, apply_settings_file, await_passwords, build_settings_file};
     use petrel_engine::store::Store;
+
+    /// An account an import brings has servers and no password: the window
+    /// is to say so and offer the password field, not show an empty
+    /// mailbox that never syncs. One the store already had is untouched.
+    #[test]
+    fn an_imported_account_waits_for_its_password() {
+        let _turn = crate::config::cache_turn();
+        use crate::signin::SignIn;
+        use petrel_engine::store::AccountServers;
+
+        let a = Store::open_in_memory().unwrap();
+        a.add_account(
+            "imap",
+            "new@example.com",
+            "",
+            &AccountServers {
+                imap_host: "imap.example.com".into(),
+                imap_port: 993,
+                smtp_host: "smtp.example.com".into(),
+                smtp_port: 465,
+                username: "new@example.com".into(),
+                provider: String::new(),
+            },
+        )
+        .unwrap();
+        let file = build_settings_file(&a).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_state(dir.path());
+        let here = state.account_id;
+        let store = state.store().unwrap();
+        let before = store.account_ids().unwrap();
+        apply_settings_file(&store, &file).unwrap();
+        await_passwords(&state, &store, &before).unwrap();
+        let added: Vec<i64> = store
+            .account_ids()
+            .unwrap()
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added.len(), 1);
+        assert_eq!(state.signin(added[0]), Some(SignIn::Missing));
+        assert_eq!(
+            state.signin(here),
+            None,
+            "the account already here is left alone"
+        );
+    }
 
     #[test]
     fn a_file_that_carries_a_store_id_does_not_rekey_the_keychain() {

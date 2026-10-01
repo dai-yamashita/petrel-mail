@@ -84,14 +84,29 @@ const ALLOWED_CSS: &[&str] = &[
 ];
 
 /// The URL as a browser would read it, before anyone decides anything about
-/// it: leading and trailing space gone, and ASCII tabs and newlines removed
-/// from anywhere inside, exactly as URL parsing does. `ht<TAB>tps://` is https
-/// to the frame, so it has to be https here or it loads uncounted.
+/// it: C0 controls and spaces gone from both ends, and ASCII tabs and
+/// newlines removed from anywhere inside, exactly as URL parsing does.
+/// `ht<TAB>tps://` is https to the frame, so it has to be https here or it
+/// loads uncounted, and `&#1;//host` is `//host` (docs/25 #88). Unicode
+/// whitespace goes from the ends too, which a browser keeps: reading one
+/// more URL as remote than a browser would only blocks it.
 fn as_the_browser_reads_it(url: &str) -> String {
-    url.trim()
+    url.trim_matches(|c: char| c.is_whitespace() || c.is_ascii_control())
         .chars()
         .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
         .collect()
+}
+
+/// Whether the URL names a host and no scheme: `//host`, and the spellings a
+/// browser on a web origin reads the same way, with either slash written as a
+/// backslash. `\\host\p.gif` is a fetch from `host` to anyone whose client
+/// opens a reply that quotes it.
+fn is_scheme_relative(cleaned: &str) -> bool {
+    let mut chars = cleaned.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('/' | '\\'), Some('/' | '\\'))
+    )
 }
 
 /// Whether the value is a `data:` URL at all.
@@ -112,7 +127,7 @@ fn is_remote(url: &str) -> bool {
     let cleaned = as_the_browser_reads_it(url);
     // Protocol-relative first: it has no scheme of its own to parse, and the
     // frame would give it one.
-    if cleaned.starts_with("//") {
+    if is_scheme_relative(&cleaned) {
         return true;
     }
     // Parsed rather than prefix-matched, because a browser accepts far more
@@ -141,6 +156,13 @@ fn absolute_scheme(url: &str) -> std::borrow::Cow<'static, str> {
     let cleaned = as_the_browser_reads_it(url);
     if cleaned.starts_with("//") {
         return format!("https:{cleaned}").into();
+    }
+    // The backslashed spellings, read with a scheme as a browser reads them.
+    if is_scheme_relative(&cleaned)
+        && let Ok(parsed) = url::Url::parse(&format!("https:{cleaned}"))
+        && parsed.scheme() == "https"
+    {
+        return parsed.to_string().into();
     }
     match url::Url::parse(&cleaned) {
         Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => parsed.to_string().into(),
@@ -638,31 +660,96 @@ pub fn resolve_cids(
     attachments: &[crate::Attachment],
     href: impl Fn(usize) -> String,
 ) -> String {
-    let mut out = html.to_string();
+    // The first part with a given id answers for it, as it always has.
+    let mut parts: HashMap<String, usize> = HashMap::new();
     for (index, att) in attachments.iter().enumerate() {
-        let Some(id) = att.content_id.as_deref() else {
-            continue;
-        };
-        // The id as the sanitizer would have serialized it inside an
-        // attribute. Angle brackets are already stripped at parse time.
-        let escaped = id
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;");
-        let target = href(index);
-        // Any attribute that names the cid — `src` on an img and `background`
-        // on a table both survive sanitization — and only in the form the
-        // serializer writes, double-quoted. A single-quoted form cannot be an
-        // attribute of sanitized HTML: the serializer escapes `"` inside a
-        // value and leaves `'` alone, so `='cid:…'` only ever matched text
-        // inside another attribute's value, and the `"` written in its place
-        // closed that value early. The rest of it became attributes the
-        // sanitizer had never seen — an unprefixed id, a style, a remote
-        // `src` that an unedited reply then carried to everyone on it.
-        let needle = format!("=\"cid:{escaped}\"");
-        out = out.replace(&needle, &format!("=\"{target}\""));
+        if let Some(id) = att.content_id.as_deref() {
+            parts.entry(cid_in_attribute(id)).or_insert(index);
+        }
     }
+    if parts.is_empty() {
+        return html.to_string();
+    }
+    let named = cids_named(html);
+    let targets: HashMap<&str, String> = parts
+        .iter()
+        .filter(|(id, _)| named.contains(id.as_str()))
+        .map(|(id, &index)| (id.as_str(), href(index)))
+        .collect();
+    rewrite_cids(html, |id| targets.get(id).map(String::as_str))
+}
+
+/// A Content-ID as the sanitizer serializes it inside an attribute value.
+/// Angle brackets are already stripped at parse time.
+pub(crate) fn cid_in_attribute(id: &str) -> String {
+    id.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The opening of a `cid:` reference in an attribute, in the only form the
+/// serializer writes: double-quoted. A single-quoted form cannot be an
+/// attribute of sanitized HTML: the serializer escapes `"` inside a value and
+/// leaves `'` alone, so `='cid:…'` only ever matched text inside another
+/// attribute's value, and the `"` written in its place closed that value
+/// early. The rest of it became attributes the sanitizer had never seen — an
+/// unprefixed id, a style, a remote `src` that an unedited reply then carried
+/// to everyone on it.
+const CID_ATTRIBUTE: &str = "=\"cid:";
+
+/// Every id a `="cid:ID"` names in sanitized HTML, from one walk of it. Any
+/// attribute counts — `src` on an img and `background` on a table both
+/// survive sanitization.
+pub(crate) fn cids_named(html: &str) -> HashSet<&str> {
+    let mut named = HashSet::new();
+    let mut from = 0;
+    while let Some(rel) = html[from..].find(CID_ATTRIBUTE) {
+        let start = from + rel;
+        let id_start = start + CID_ATTRIBUTE.len();
+        let Some(len) = html[id_start..].find('"') else {
+            break;
+        };
+        named.insert(&html[id_start..id_start + len]);
+        from = start + 1;
+    }
+    named
+}
+
+/// Rewrites each `="cid:ID"` that `target` answers for to `="<target>"`, in
+/// one walk of the body. The loop this replaced did a full-body replace once
+/// per part, so a message of forty thousand inline parts and a megabyte of
+/// text took ten seconds to draw, every time it was opened (docs/25 #87).
+///
+/// A reference `target` does not answer for stays as it is. The walk takes
+/// the same matches the replace loop did, left to right and never inside a
+/// value it has just written.
+pub(crate) fn rewrite_cids<'t>(
+    html: &str,
+    mut target: impl FnMut(&str) -> Option<&'t str>,
+) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(rel) = html[from..].find(CID_ATTRIBUTE) {
+        let start = from + rel;
+        let id_start = start + CID_ATTRIBUTE.len();
+        let Some(len) = html[id_start..].find('"') else {
+            break;
+        };
+        match target(&html[id_start..id_start + len]) {
+            Some(to) => {
+                out.push_str(&html[copied..start]);
+                out.push_str("=\"");
+                out.push_str(to);
+                out.push('"');
+                copied = id_start + len + 1;
+                from = copied;
+            }
+            None => from = start + 1,
+        }
+    }
+    out.push_str(&html[copied..]);
     out
 }
 
@@ -1011,6 +1098,120 @@ mod tests {
         assert!(!out.contains("cid:"), "{out}");
     }
 
+    /// The loop `resolve_cids` was until docs/25 #87: one full-body replace
+    /// per part. Kept here as the reference the one-pass version must match.
+    fn resolve_cids_by_replace(
+        html: &str,
+        attachments: &[crate::Attachment],
+        href: impl Fn(usize) -> String,
+    ) -> String {
+        let mut out = html.to_string();
+        for (index, att) in attachments.iter().enumerate() {
+            let Some(id) = att.content_id.as_deref() else {
+                continue;
+            };
+            let escaped = id
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;");
+            out = out.replace(
+                &format!("=\"cid:{escaped}\""),
+                &format!("=\"{}\"", href(index)),
+            );
+        }
+        out
+    }
+
+    fn inline(cid: Option<&str>) -> crate::Attachment {
+        crate::Attachment {
+            filename: None,
+            content_type: Some("image/png".into()),
+            size: 8,
+            content_id: cid.map(str::to_string),
+            is_inline: true,
+        }
+    }
+
+    /// Random bodies and part lists, every answer identical to the replace
+    /// loop: repeated, missing, duplicated and escaped ids, ids inside text,
+    /// unterminated attributes, and ids that begin other ids.
+    #[test]
+    fn resolving_in_one_pass_matches_the_replace_loop() {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let ids = [
+            "a", "a1", "1", "10", "logo@x", "x&y", "<w>", "q\"z", "=", "cid:a", "",
+        ];
+        let pieces = [
+            "<p>t</p>",
+            "<img src=\"cid:",
+            "\">",
+            "<td background=\"cid:",
+            "cid:",
+            "=\"cid:",
+            "\"",
+            "=",
+            " alt=\"=&quot;cid:a&quot;\" ",
+        ];
+        for _ in 0..20_000 {
+            let mut html = String::new();
+            for _ in 0..(next() % 12) {
+                if next() % 2 == 0 {
+                    html.push_str(pieces[(next() % pieces.len() as u64) as usize]);
+                } else {
+                    let id = ids[(next() % ids.len() as u64) as usize];
+                    let id = id
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                        .replace('"', "&quot;");
+                    html.push_str(&format!("<img src=\"cid:{id}\">"));
+                }
+            }
+            let parts: Vec<crate::Attachment> = (0..(next() % 6))
+                .map(|_| match next() % 4 {
+                    0 => inline(None),
+                    _ => inline(Some(ids[(next() % ids.len() as u64) as usize])),
+                })
+                .collect();
+            let href = |i: usize| format!("/attachment/tok/{i}");
+            assert_eq!(
+                resolve_cids(&html, &parts, href),
+                resolve_cids_by_replace(&html, &parts, href),
+                "{html:?} with {:?}",
+                parts
+                    .iter()
+                    .map(|p| p.content_id.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// docs/25 #87: forty thousand inline parts and a megabyte of body took
+    /// the replace loop ten seconds in a release build, on the thread that
+    /// draws the reading pane, every time the message was opened.
+    #[test]
+    fn forty_thousand_inline_parts_resolve_in_one_pass() {
+        let mut html = String::from("<p>hello</p><img src=\"cid:p0\">");
+        while html.len() < 1024 * 1024 {
+            html.push_str("<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>");
+        }
+        let parts: Vec<crate::Attachment> = (0..40_000)
+            .map(|i| inline(Some(&format!("p{i}"))))
+            .collect();
+        let started = std::time::Instant::now();
+        let out = resolve_cids(&html, &parts, |i| format!("/attachment/tok/{i}"));
+        let took = started.elapsed();
+        assert!(out.starts_with("<p>hello</p><img src=\"/attachment/tok/0\">"));
+        assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+    }
+
     #[test]
     fn a_cid_no_part_answers_stays_a_cid() {
         let attachments = vec![crate::Attachment {
@@ -1216,6 +1417,53 @@ mod tests {
             r#"<img src="cid:part@x"><img src="/relative.png"><a href="mailto:x@y.example">m</a>"#,
             false,
         );
+        assert_eq!(res.report.blocked_remote, 0, "{}", res.html);
+    }
+
+    /// docs/25 #88. A browser on a web origin reads a backslash as a slash and
+    /// drops C0 controls and spaces from a URL's ends, so each of these is a
+    /// fetch from `tracker.example` to whoever opens a reply quoting it. Each
+    /// went through uncounted and was kept, so the count under the message
+    /// said 0 and an unedited reply carried the tracker to everyone on it.
+    #[test]
+    fn backslashed_and_control_prefixed_hosts_are_remote_too() {
+        let spellings = [
+            r#"<img src="\\tracker.example\p.gif">"#,
+            r#"<img src="/\tracker.example/p.gif">"#,
+            r#"<img src="\/tracker.example/p.gif">"#,
+            "<img src=\"&#1;//tracker.example/p.gif\">",
+            "<img src=\"&#x1F;//tracker.example/p.gif\">",
+            "<img src=\"&#1;\\\\tracker.example\\p.gif\">",
+            r#"<table><tr><td background="\\tracker.example\bg.gif">x</td></tr></table>"#,
+            "<table background=\"&#2;//tracker.example/bg.gif\"><tr><td>x</td></tr></table>",
+        ];
+        for html in spellings {
+            let res = sanitize_html(html, false);
+            assert_eq!(res.report.blocked_remote, 1, "{html} -> {}", res.html);
+            assert!(
+                !res.html.contains("tracker.example"),
+                "{html} -> {}",
+                res.html
+            );
+        }
+
+        // Allowed, they are written out in full like `//host`, so the frame,
+        // served over a scheme of its own, can actually fetch them.
+        let res = sanitize_html(r#"<img src="\\cdn.example\logo.png">"#, true);
+        assert!(
+            res.html.contains(r#"src="https://cdn.example/logo.png""#),
+            "{}",
+            res.html
+        );
+        let res = sanitize_html("<img src=\"&#1;//cdn.example/logo.png\">", true);
+        assert!(
+            res.html.contains(r#"src="https://cdn.example/logo.png""#),
+            "{}",
+            res.html
+        );
+
+        // A single backslash is a path, to a browser as here.
+        let res = sanitize_html(r#"<img src="\images\logo.png">"#, false);
         assert_eq!(res.report.blocked_remote, 0, "{}", res.html);
     }
 

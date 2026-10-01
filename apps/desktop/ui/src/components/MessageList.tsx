@@ -18,6 +18,7 @@ import { useSettings } from '../lib/settings';
 import { t } from '../lib/strings';
 import { Tip } from './Tip';
 import { key } from '../lib/keys';
+import { mailKeyAllowed } from '../lib/useKeyboard';
 import {
   CHIP_ROW,
   COMPACT_ROW,
@@ -521,26 +522,15 @@ export const MessageList = memo(function MessageList({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
+      // The rule every single key obeys: not typed into a field, not under a
+      // dialog or a menu, and while a message is being written only from the
+      // rail, the list or the reader. Kept here, J and K walked the list from
+      // the composer's toolbar, and every letter after them was a command.
+      if (!mailKeyAllowed(e)) return;
       // The target is not always an element — a key pressed with nothing
       // focused reports the document or the window, neither of which has
-      // closest(). Guarding on instanceof keeps this from throwing and
-      // silently killing the handler.
+      // closest().
       const el = e.target instanceof HTMLElement ? e.target : null;
-      if (
-        el &&
-        (el.tagName === 'INPUT' ||
-          el.tagName === 'TEXTAREA' ||
-          el.tagName === 'SELECT' ||
-          el.isContentEditable)
-      ) {
-        return;
-      }
-      // Inside a dialog the list is not what the keys are for — and testing the
-      // event target is not enough, because with nothing focused the target is
-      // the body, which has no dialog ancestor. Ask whether a dialog is *open*,
-      // not where the keystroke came from: Ariakit keeps closed dialogs mounted
-      // and `hidden`, so the selector has to exclude those or it always matches.
-      if (document.querySelector('[role="dialog"]:not([hidden])')) return;
 
       const down = e.key === 'j' || e.key === 'ArrowDown';
       const up = e.key === 'k' || e.key === 'ArrowUp';

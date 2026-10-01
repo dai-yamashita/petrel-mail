@@ -241,16 +241,23 @@ enum Provider {
 /// it sends a person to fix something that was never broken.
 pub(crate) fn friendly_sync_error_for(host: &str, raw: &str) -> String {
     let r = raw.to_ascii_uppercase();
-    // IMAP says AUTHENTICATIONFAILED; submission says 535, or "not accepted",
-    // and the send worker records it under its stage. All of them are the
-    // password, and all of them get the same advice.
-    if r.contains("AUTHENTICATIONFAILED")
-        || r.contains("INVALID CREDENTIALS")
-        || r.starts_with("AUTH:")
-        || r.contains("535 ")
-        || r.contains("NOT ACCEPTED")
-        || r.contains("AUTHENTICATION FAILED")
-    {
+    // Before the password's advice: refused at sign-in, these too read as a
+    // refusal, but the password was right and the advice is not about it.
+    if r.contains("AUTHORIZATIONFAILED") || r.contains("WEBALERT") {
+        return match provider_of(host) {
+            Provider::Gmail => "The server accepted the password but refused access. \
+                For Gmail this usually means IMAP is switched off in settings."
+                .into(),
+            _ => "The server accepted the password but refused access. Check whether \
+                IMAP is switched on for this account."
+                .into(),
+        };
+    }
+    // Gmail's word for its ordinary password, with 2-Step Verification on,
+    // comes as an ALERT. `imap::sign_in` counts that one as refused, so it
+    // usually arrives marked; the words are matched as well for any path that
+    // reports the server's text unmarked.
+    if is_password_refusal(raw) || r.contains("APPLICATION-SPECIFIC PASSWORD REQUIRED") {
         return match provider_of(host) {
             Provider::Gmail => "Sign-in was refused. Gmail needs 2-Step Verification \
                 switched on and an app password — your ordinary account password will \
@@ -267,16 +274,6 @@ pub(crate) fn friendly_sync_error_for(host: &str, raw: &str) -> String {
             Provider::Other => "Sign-in was refused. Check the address and password. \
                 Many providers will not accept your ordinary password for mail and want \
                 an app password made in their security settings."
-                .into(),
-        };
-    }
-    if r.contains("AUTHORIZATIONFAILED") || r.contains("WEBALERT") {
-        return match provider_of(host) {
-            Provider::Gmail => "The server accepted the password but refused access. \
-                For Gmail this usually means IMAP is switched off in settings."
-                .into(),
-            _ => "The server accepted the password but refused access. Check whether \
-                IMAP is switched on for this account."
                 .into(),
         };
     }
@@ -318,6 +315,33 @@ pub(crate) fn friendly_sync_error_for(host: &str, raw: &str) -> String {
             .into();
     }
     raw.to_string()
+}
+
+/// Whether an IMAP failure is the server refusing the password at sign-in.
+///
+/// The provider's sign-in decides that by the reply's code
+/// (`ImapError::SignInRefused`, written "sign-in refused: …"), and this only
+/// reads its verdict back from text that has lost its type, such as a
+/// cycle's last failure. It reads no server words: a bare "535 " in the
+/// words matched Dovecot's timing figure on a refused MOVE, "(0.535 + 0.000
+/// secs)", and stood the whole account down for an hour. Where the error
+/// still has its type, ask it (`ImapError::is_sign_in_refused`).
+pub(crate) fn is_sign_in_refusal(raw: &str) -> bool {
+    raw.contains("sign-in refused: ")
+}
+
+/// Whether a failure is a refused password, for the advice on screen: the
+/// IMAP sign-in's verdict (`is_sign_in_refusal`), or SMTP's — the send
+/// worker's record of its sign-in stage ("auth: …"), or a 535 reply code at
+/// the start of the reply, followed by a space or a hyphen as SMTP writes
+/// it ("535 5.7.8 …", "535-5.7.8 …"). A 535 anywhere else is a number: a
+/// Dovecot timing figure, "(0.535 + 0.000 secs)", stood an account down.
+pub(crate) fn is_password_refusal(raw: &str) -> bool {
+    if is_sign_in_refusal(raw) || raw.starts_with("auth:") {
+        return true;
+    }
+    let reply = raw.trim_start();
+    reply.len() > 3 && reply.starts_with("535") && matches!(reply.as_bytes()[3], b' ' | b'-')
 }
 
 /// Whether an error string is too big, or too structured, to be a verdict.
@@ -413,7 +437,9 @@ mod address_tests {
 
 #[cfg(test)]
 mod sync_error_tests {
-    use super::{friendly_sync_error_for, is_imap_parse_error};
+    use super::{
+        friendly_sync_error_for, is_imap_parse_error, is_password_refusal, is_sign_in_refusal,
+    };
 
     /// Advice for the wrong provider is worse than none.
     ///
@@ -421,7 +447,96 @@ mod sync_error_tests {
     /// who mistyped a password was told to switch on 2-Step Verification, and
     /// an Outlook user was sent to make a Google app password. Both are being
     /// pointed at something that was never broken.
-    const REFUSED: &str = "code: None, info: Some(\"[AUTHENTICATIONFAILED] Invalid credentials\")";
+    const REFUSED: &str =
+        "sign-in refused: code: None, info: Some(\"[AUTHENTICATIONFAILED] Invalid credentials\")";
+
+    /// What stands an account down (signin.rs): the server refusing the
+    /// password at sign-in, as the provider's sign-in classifies it by the
+    /// reply's code (`ImapError::SignInRefused`, shown as "sign-in refused:"),
+    /// and nothing else. Words are not read: a bare "535 " matched Dovecot's
+    /// timing figure "(0.535 + 0.000 secs)" on a refused MOVE, and stood the
+    /// whole account down for an hour.
+    #[test]
+    fn only_a_refused_sign_in_reads_as_one() {
+        for raw in [
+            r#"sign-in refused: code: None, info: Some("LOGIN failed.")"#,
+            r#"sync cycle failed before any folder: sign-in refused: code: None, info: Some("[AUTHENTICATIONFAILED] Invalid credentials (Failure)")"#,
+        ] {
+            assert!(is_sign_in_refusal(raw), "{raw}");
+        }
+        for raw in [
+            r#"imap: no response: code: Some(TryCreate), info: Some("Mailbox doesn't exist: Archive (0.535 + 0.000 secs).")"#,
+            r#"imap: no response: code: Some(Alert), info: Some("Too many simultaneous connections. (Failure)")"#,
+            r#"imap: no response: code: None, info: Some("[AUTHENTICATIONFAILED] Invalid credentials")"#,
+            "Invalid credentials",
+            "smtp: 535 5.7.8 Username and Password not accepted",
+            "auth: rejected",
+            "network: Connection refused (os error 61)",
+            "tls: invalid peer certificate: UnknownIssuer",
+            "NO [UNAVAILABLE] Server busy, try later",
+            "no folder could be synced",
+        ] {
+            assert!(!is_sign_in_refusal(raw), "{raw}");
+        }
+    }
+
+    /// The advice on screen knows a refused password from either protocol:
+    /// the IMAP sign-in's classification, or SMTP's 535 as a reply code, at
+    /// the start of the reply and followed by a space or a hyphen, or the
+    /// send worker's record of its sign-in stage. A 535 anywhere else is a
+    /// number.
+    #[test]
+    fn the_advice_knows_an_smtp_refusal_by_its_reply_code() {
+        for raw in [
+            "auth: 535 5.7.8 Username and Password not accepted",
+            "535 5.7.8 Username and Password not accepted",
+            "535-5.7.8 Username and Password not accepted.",
+            "Outgoing (SMTP) — sign-in refused: 535 5.7.8 Authentication failed",
+            r#"sign-in refused: code: None, info: Some("LOGIN failed.")"#,
+        ] {
+            assert!(is_password_refusal(raw), "{raw}");
+        }
+        for raw in [
+            r#"imap: no response: code: Some(TryCreate), info: Some("Mailbox doesn't exist: Archive (0.535 + 0.000 secs).")"#,
+            "rcpt: 550 5.1.1 no such user",
+            "data: 5350 something",
+            "connect: 1535 refused",
+        ] {
+            assert!(!is_password_refusal(raw), "{raw}");
+        }
+    }
+
+    /// Gmail turns down an ordinary password, once 2-Step Verification is on,
+    /// with an ALERT. Marked by the sign-in (`imap::sign_in` counts it as
+    /// refused) or not, it gets the app password advice rather than the
+    /// server's words in a debug dump.
+    #[test]
+    fn gmails_app_password_alert_gets_the_app_password_advice() {
+        let alert = r#"code: Some(Alert), info: Some("Application-specific password required: https://support.google.com/accounts/answer/185833 (Failure)")"#;
+        let marked = format!("sign-in refused: {alert}");
+        assert!(is_password_refusal(&marked));
+        let unmarked = format!("imap: no response: {alert}");
+        assert!(!is_password_refusal(&unmarked));
+        for raw in [marked.as_str(), unmarked.as_str()] {
+            let said = friendly_sync_error_for("imap.gmail.com", raw);
+            assert!(said.contains("app password"), "{said}");
+        }
+    }
+
+    /// Refused at sign-in, an account the server will not let in for another
+    /// reason still gets that reason's advice, not the password's.
+    #[test]
+    fn a_sign_in_refused_for_another_reason_keeps_its_own_advice() {
+        let raw =
+            r#"sign-in refused: code: None, info: Some("[AUTHORIZATIONFAILED] IMAP disabled")"#;
+        let said = friendly_sync_error_for("imap.gmail.com", raw);
+        assert!(said.contains("IMAP is switched off"), "{said}");
+        let plain = r#"sign-in refused: code: None, info: Some("LOGIN failed.")"#;
+        assert!(
+            friendly_sync_error_for("mail.example.com", plain)
+                .contains("Check the address and password")
+        );
+    }
 
     #[test]
     fn gmail_still_gets_gmails_advice() {

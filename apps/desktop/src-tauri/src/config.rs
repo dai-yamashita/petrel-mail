@@ -123,6 +123,38 @@ pub(crate) fn remember_password(account_id: i64, pass: &str) {
     }
 }
 
+/// Drops an account's cached password: the account was removed, or its id
+/// was handed to an account that came without one. Ids are reused, and a
+/// cache that outlived its account gave the next one under the same id the
+/// old password — sent to the new account's server.
+pub(crate) fn forget_password(account_id: i64) {
+    if let Some(cache) = PASS_CACHE.get()
+        && let Ok(mut map) = cache.lock()
+    {
+        map.remove(&account_id);
+    }
+}
+
+/// What the cache holds for an account, without ever asking the keychain:
+/// a test must not read a real keychain item, and the low ids tests use are
+/// the legacy names a developer's machine may still hold.
+#[cfg(test)]
+pub(crate) fn cached_password(account_id: i64) -> Option<String> {
+    PASS_CACHE.get()?.lock().ok()?.get(&account_id).cloned()
+}
+
+/// A turn at the password cache, for a test that writes or reads it.
+///
+/// The cache is one map for the whole test process, keyed by account id, and
+/// every test's fresh store hands out the same small ids. Tests running side
+/// by side therefore saw each other's passwords: one that removed its account
+/// mid-sign-in and expected no password cached found another test's "p".
+#[cfg(test)]
+pub(crate) fn cache_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    TURN.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Passwords handed in by the environment, keyed by the account's own
 /// username. The dev launch script exports both accounts' credentials from
 /// the gitignored env files; when a username matches, the keychain is never
@@ -277,6 +309,7 @@ mod password_cache_tests {
     /// this off any real keychain item (absent items fail without a dialog).
     #[test]
     fn a_cache_miss_terminates() {
+        let _turn = crate::config::cache_turn();
         assert_eq!(account_password(i64::MAX), None);
         assert_eq!(account_password(i64::MAX), None);
     }

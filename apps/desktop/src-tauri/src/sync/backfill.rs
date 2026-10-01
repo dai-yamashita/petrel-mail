@@ -14,6 +14,9 @@ enum Stride {
     Worked,
     /// The server refused or the connection failed; the same stride retries.
     Failed,
+    /// The server refused the password at sign-in: the account stands
+    /// down, and history waits with it.
+    Refused,
     /// Every folder's floor is at 1, or there is nothing to walk.
     Done,
 }
@@ -54,6 +57,11 @@ pub(crate) fn spawn_backfill(
             if *stop.borrow() {
                 break;
             }
+            // A refused password waits with the rest of the account: four
+            // more refused sign-ins an hour from history is four too many.
+            if !crate::signin::wait_for_signin(&state, account, &mut stop).await {
+                break;
+            }
             yield_to_user(&state).await;
             // Recent history first; the deep archive once that is quiet.
             let stride = match run_backfill_tick(&state, account, &cfg).await {
@@ -61,6 +69,20 @@ pub(crate) fn spawn_backfill(
                 other => other,
             };
             let nap = match stride {
+                // Retried on the backoff, a password changed at the provider
+                // was six refused sign-ins in a minute from history alone,
+                // past fail2ban's five, while the IDLE session that predates
+                // the change kept the rest of the account looking well. The
+                // first refusal stands the account down; the walk waits at
+                // the top with everything else.
+                Stride::Refused => {
+                    if state.refused_by(account, &stop) {
+                        log_sync(&format!(
+                            "account {account}: backfill sign-in refused; standing down"
+                        ));
+                    }
+                    continue;
+                }
                 Stride::Worked => {
                     failures = 0;
                     std::time::Duration::from_secs(2)
@@ -160,6 +182,9 @@ async fn run_backfill_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig
         }
         Err(e) => {
             log_sync(&format!("backfill folder {folder_id} failed: {e}"));
+            if e.is_sign_in_refused() {
+                return Stride::Refused;
+            }
             // Failed is not finished: the same stride retries, after a wait
             // that grows with each failure.
             Stride::Failed
@@ -218,7 +243,7 @@ async fn run_allmail_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig)
             Ok(None) => return Stride::Done,
             Err(e) => {
                 log_sync(&format!("all-mail walk could not start: {e}"));
-                return Stride::Failed;
+                return refused_or_failed(&e);
             }
         },
     };
@@ -235,7 +260,7 @@ async fn run_allmail_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig)
         Ok(l) => l,
         Err(e) => {
             log_sync(&format!("all-mail stride failed: {e}"));
-            return Stride::Failed; // failed is not finished; retry after a wait
+            return refused_or_failed(&e); // failed is not finished; retry after a wait
         }
     };
     let mut claimed = 0usize;
@@ -244,24 +269,27 @@ async fn run_allmail_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig)
         let Ok(store) = state.store.lock() else {
             return Stride::Done;
         };
-        for (uid, mid) in &listed {
-            match mid
-                .as_deref()
-                .and_then(|m| store.message_by_msgid(account, m).ok().flatten())
-            {
+        // Claimed by Message-ID only where that cannot be the wrong row:
+        // one row carries the id and the stride lists it once. Anything else
+        // is fetched, and ingest places it by its bytes (docs/25 review).
+        let claims = store
+            .claims_by_message_id(account, &listed)
+            .unwrap_or_else(|_| listed.iter().map(|(uid, _)| (*uid, None)).collect());
+        for (uid, claim) in claims {
+            match claim {
                 Some(existing) => {
-                    if store.place_message_at(existing, folder_id, *uid).is_ok() {
+                    if store.place_message_at(existing, folder_id, uid).is_ok() {
                         claimed += 1;
                     }
                 }
-                None => strangers.push(*uid),
+                None => strangers.push(uid),
             }
         }
     }
     let mut fetched = 0usize;
     if !strangers.is_empty() {
         let st = Arc::clone(state);
-        fetched =
+        let got =
             petrel_providers::imap::fetch_uids_each(cfg, &path, &strangers, |uid, flags, raw| {
                 let _ = st.blobs.write(raw);
                 let Ok(mut store) = st.store.lock() else {
@@ -273,8 +301,18 @@ async fn run_allmail_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig)
                     st.seeded.fetch_add(1, Ordering::Relaxed);
                 }
             })
-            .await
-            .unwrap_or(0);
+            .await;
+        fetched = match got {
+            Ok(n) => n,
+            // Refused, the floor stays where it is: the strangers in this
+            // stride are fetched when the account signs in again, not
+            // passed over.
+            Err(e) if e.is_sign_in_refused() => {
+                log_sync(&format!("all-mail stride failed: {e}"));
+                return Stride::Refused;
+            }
+            Err(_) => 0,
+        };
     }
     if let Ok(mut store) = state.store.lock() {
         let _ = store.set_backfill_floor(folder_id, first);
@@ -285,6 +323,16 @@ async fn run_allmail_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig)
         ));
     }
     Stride::Worked
+}
+
+/// A failed stride, told apart from one the server refused the password
+/// for, which stands the account down instead of backing off.
+fn refused_or_failed(e: &petrel_providers::imap::ImapError) -> Stride {
+    if e.is_sign_in_refused() {
+        Stride::Refused
+    } else {
+        Stride::Failed
+    }
 }
 
 /// Parks a background task while the user is working. Returns when the UI

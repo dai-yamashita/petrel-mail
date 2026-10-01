@@ -56,6 +56,7 @@ reader-forward = Weiterleiten
 reader-failed = Diese Konversation konnte nicht geöffnet werden
 reader-to = an { $who }
 reader-cc = Kopie { $who }
+reader-bcc = Blindkopie { $who }
 reader-collapse = Nachricht von { $who } einklappen
 msg-reply = Auf diese Nachricht antworten
 msg-reply-all = Allen auf diese Nachricht antworten
@@ -129,6 +130,17 @@ onb-inbox-ready = Der Posteingang ist bereit
 onb-start = Lesen beginnen
 onb-failed = Anmeldung nicht möglich: { $error }
 onb-add-failed = Konto konnte nicht gespeichert werden: { $error }
+signin-title = Bei { $email } anmelden
+signin-help = Geben Sie das Passwort für dieses Konto ein. Petrel prüft es bei Ihrem Anbieter, bevor etwas gespeichert wird.
+signin-address = Adresse
+signin-checking = Wird bei Ihrem Anbieter geprüft…
+signin-done = Bei { $email } angemeldet. Ihre Nachrichten werden abgerufen…
+signin-first = Melden Sie sich zuerst erneut an: Petrel erreicht den Server dieses Kontos erst mit einem Passwort, das funktioniert.
+signin-outbox-waiting = Wartet darauf, dass Sie sich erneut anmelden. Nichts wird gesendet, bis das Konto ein Passwort hat, das funktioniert.
+signin-outbox-scheduled = Geht um { $when } raus, sobald Sie sich erneut angemeldet haben. Sie können das noch ändern.
+signin-outbox-check-waits = Petrel kann das prüfen, sobald Sie sich erneut angemeldet haben.
+signin-sending-waiting = Noch nicht gesendet: „{ $subject }“ wartet auf Ihre erneute Anmeldung
+signin-again = Erneut anmelden…
 att-preview = Vorschau
 att-open = Öffnen
 att-save = { $name } sichern
@@ -184,6 +196,10 @@ empty-loading = Ihre Nachrichten werden geladen…
 empty-syncing = Ihre Nachrichten werden geholt. Bisher { $count }…
 sync-failed-title = Ihre Nachrichten waren nicht erreichbar
 sync-failed-body = Angezeigt wird, was Petrel bereits hatte. Nichts ist verloren. Einzelheiten in sync.log.
+signin-needed = Anmeldung erforderlich
+signin-refused = Der Server hat das Passwort für { $email } abgelehnt.
+signin-missing = Petrel hat kein Passwort für { $email }.
+signin-empty-title = Melden Sie sich an, um Ihre Nachrichten abzurufen
 compose-undo = Senden widerrufen
 compose-undo-help = Nach dem Senden hält Petrel die Nachricht so lange zurück und zeigt eine Rückgängig-Schaltfläche.
 compose-undo-off-label = Aus
@@ -201,6 +217,8 @@ compose-reply = Antworten
 compose-from = Von
 compose-to = An
 compose-cc = Kopie
+compose-bcc = Blindkopie
+compose-bcc-hint = Blindkopie, für die anderen Empfänger unsichtbar ({ $key })
 compose-subject = Betreff
 compose-body = Nachricht
 compose-send = Senden
@@ -211,7 +229,7 @@ compose-attach-failed = Anhängen nicht möglich: { $error }
 compose-missing-attachment = Hier ist von einem Anhang die Rede, aber keiner dabei. Drücken Sie erneut auf Senden, um trotzdem zu senden.
 compose-no-recipient = Fügen Sie jemanden hinzu, an den gesendet werden soll.
 compose-bad-recipient = Keine Adresse: { $addr }
-compose-sending = Wird in { $count } s gesendet
+compose-sending = Wird in { $count } s gesendet: { $subject }
 compose-send-now = Jetzt senden
 compose-sent = Gesendet
 compose-saved = In Entwürfen gesichert
@@ -261,6 +279,16 @@ notify-many = { $count ->
     [one] { $count } neue Nachricht
    *[other] { $count } neue Nachrichten
 }
+notify-from-people = { $count ->
+    [one] Von { $count } Person
+   *[other] Von { $count } Personen
+}
+notify-one-in = Neue Nachricht von { $who } in { $account }
+notify-many-in = { $count ->
+    [one] { $count } neue Nachricht in { $account }
+   *[other] { $count } neue Nachrichten in { $account }
+}
+notify-subject-in = { $subject } ({ $account })
 status-synced = Gerade synchronisiert
 status-synced-min = Vor { $min } Min. synchronisiert
 status-synced-hr = Vor { $hr } Std. synchronisiert
@@ -315,6 +343,7 @@ identity-signature-placeholder = Wird unten an Nachrichten angefügt, die Sie sc
 identity-signature-replies = Diese Signatur auch bei Antworten verwenden
 identity-signature-replies-help = Aus heißt nur bei neuen Nachrichten. Eine Signatur, die sich durch einen langen Verlauf wiederholt, ist das, worüber sich Leute beschweren.
 identity-save-failed = Konnte nicht gesichert werden: { $error }
+identity-no-account = Konnte nicht gespeichert werden: Das Konto ist nicht mehr da.
 privacy-remote = Externe Inhalte
 privacy-remote-help = Bilder und andere Dateien, die eine Nachricht aus dem Internet lädt. Sie zu laden verrät dem Absender, dass Sie die Nachricht geöffnet haben.
 privacy-remote-block = Blockieren
@@ -429,10 +458,19 @@ account-switch-failed = Konto konnte nicht gewechselt werden: { $error }
 account-switch-draft-failed = Der offene Entwurf konnte nicht gespeichert werden, deshalb wurde das Konto nicht gewechselt: { $error }
 view-switch-draft-failed = Der offene Entwurf konnte nicht gespeichert werden, deshalb wurde das Postfach nicht geöffnet: { $error }
 accounts-add = Konto hinzufügen
+accounts-signin = Anmeldung
+accounts-signin-help = Passwort geändert oder ein neues App-Passwort erstellt? Geben Sie es hier ein.
+accounts-needs-signin = Anmeldung erforderlich
 accounts-remove = Konto entfernen
 accounts-remove-help = Entfernt dieses Konto, seine E-Mails und sein Passwort. Auf dem Server ändert sich nichts.
 accounts-remove-confirm = { $email } entfernen?
-accounts-remove-body = Seine Nachrichten werden von diesem Computer gelöscht und sein Passwort aus dem Passwortspeicher des Systems. Die Mail selbst bleibt unangetastet auf dem Server.
+accounts-remove-body = Seine Nachrichten und sein Passwort werden von diesem Computer gelöscht. Was auf dem Server liegt, bleibt dort, aber was es nur hier gibt, ist endgültig weg: Mail in lokalen oder importierten Ordnern, Mail, die der Server schon gelöscht hat, sowie Entwürfe und Nachrichten, die auf das Senden warten. „Zuerst exportieren“ sichert die Mail; Entwürfe und wartende Nachrichten sind nicht enthalten, also senden oder kopieren Sie diese vorher.
+accounts-remove-export = Zuerst exportieren…
+accounts-remove-exporting = Wird exportiert…
+accounts-remove-exported = { $count ->
+    [one] { $count } Nachricht aus { $account } exportiert. Entwürfe und wartende Nachrichten sind nicht enthalten.
+   *[other] { $count } Nachrichten aus { $account } exportiert. Entwürfe und wartende Nachrichten sind nicht enthalten.
+}
 accounts-none = Noch keine Konten.
 accounts-failed = Ihre Konten konnten nicht gelesen werden
 accounts-synced = synchronisiert { $when }
@@ -673,6 +711,7 @@ folder-created = „{ $name }“ erstellt
 folder-deleted = „{ $name }“ gelöscht
 folder-failed = Ordneränderung fehlgeschlagen: { $error }
 folder-server-pending = „{ $name }“ konnte noch nicht auf dem Server angelegt werden: { $error }. Der Ordner bleibt hier erhalten, und die nächste Synchronisierung versucht es erneut.
+folder-made-here-signin = „{ $name }“ hier angelegt. Auf den Server kommt der Ordner, sobald Sie sich erneut angemeldet haben.
 folder-name-taken = Dort gibt es bereits einen Ordner namens „{ $name }“.
 folder-bin-refuses = In den Papierkorb dieses Kontos verschobene Mail würde nicht gelöscht. Löschen Sie „{ $name }“ stattdessen über sein Menü.
 tag-new = Neues Schlagwort
@@ -788,6 +827,7 @@ status-demo = Demo-Nachrichten · kein Konto
 sc-account = Aktives Konto wechseln
 sc-archive = Archivieren
 sc-back = Zurück zur Liste
+sc-bcc = Blindkopie hinzufügen
 sc-compose = Verfassen
 sc-find-in-message = In dieser Unterhaltung suchen
 sc-goto = Zu Posteingang · Markiert · Gesendet · Entwürfe · Alle Nachrichten

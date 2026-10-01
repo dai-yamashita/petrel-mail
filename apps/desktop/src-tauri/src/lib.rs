@@ -29,7 +29,10 @@ mod diag;
 // live in this module, and they are worth asserting on rather than trusting.
 pub mod message_view;
 mod notify;
+#[cfg(test)]
+mod scripted_imap;
 mod send;
+mod signin;
 // The webview isolation matrix: hostile documents served to a real frame so
 // the layers can be measured from outside. Useful, and not something a
 // shipping binary should be able to serve — a release build has no such
@@ -49,6 +52,7 @@ use demo::{
 };
 use diag::{DIAG, SELFTEST, data_dir, log_sync};
 use message_view::ViewTokens;
+use signin::{SignIn, split_by_password};
 use state::{AppState, now_ms};
 use sync::spawn_real_sync;
 
@@ -111,6 +115,18 @@ fn startup_message(what: &str, path: &std::path::Path, error: &str) -> String {
         "Petrel could not start.\n\n{what}\n\n{}\n\n{error}",
         path.display()
     )
+}
+
+/// What to tell a person whose mailbox would not open. A store written by a
+/// newer Petrel is the one case they can fix themselves, by going forward
+/// again (docs/25 #91), so it says how.
+fn why_it_cannot_open(e: &petrel_engine::store::StoreError) -> &'static str {
+    match e {
+        petrel_engine::store::StoreError::NewerSchema { .. } => {
+            "This mailbox was made by a newer version of Petrel. Install the newer version to open it."
+        }
+        _ => "Its mailbox could not be opened.",
+    }
 }
 
 /// Says so, natively, and leaves.
@@ -321,7 +337,7 @@ pub fn run() {
     let db = dir.join("petrel.db");
     let store = match Store::open(&db) {
         Ok(s) => s,
-        Err(e) => cannot_start("Its mailbox could not be opened.", &db, &e.to_string()),
+        Err(e) => cannot_start(why_it_cannot_open(&e), &db, &e.to_string()),
     };
     if let Some(step) = store.deferred_step() {
         log_sync(&format!("store upgrade left for the next launch: {step}"));
@@ -423,7 +439,12 @@ pub fn run() {
         read_index: Mutex::new(read_index),
         readers_live: AtomicBool::new(readers_live),
         blobs,
-        seeding: AtomicBool::new(true),
+        seeding: Mutex::new(std::collections::HashMap::new()),
+        seeding_marks: std::sync::atomic::AtomicU64::new(0),
+        signin: Mutex::new(std::collections::HashMap::new()),
+        signin_changed: tokio::sync::watch::channel(0).0,
+        held: Mutex::new(std::collections::HashMap::new()),
+        turns: Mutex::new(std::collections::HashMap::new()),
         demo: AtomicBool::new(false),
         seeded: AtomicUsize::new(0),
         status_count: AtomicUsize::new(0),
@@ -440,6 +461,7 @@ pub fn run() {
         folder_sync_inflight: Mutex::new(std::collections::HashSet::new()),
         folder_synced_at: Mutex::new(std::collections::HashMap::new()),
         pending_notify: Mutex::new(Vec::new()),
+        pending_elsewhere: Mutex::new(Vec::new()),
         pending_alerts: Mutex::new(Vec::new()),
         last_sync_ms: std::sync::atomic::AtomicI64::new(0),
         extraction_gen: std::sync::atomic::AtomicI64::new(0),
@@ -613,10 +635,18 @@ pub fn run() {
                         .collect()
                 })
                 .unwrap_or_default();
-            let configs: Vec<(i64, ImapConfig)> = server_rows
-                .into_iter()
-                .filter_map(|(id, servers)| imap_config_from_servers(id, servers).map(|c| (id, c)))
-                .collect();
+            // An account whose password cannot be read waits for one. It used
+            // to drop out here without a word, and the window showed "Inbox is
+            // clear" over an account that would never sync: an import's
+            // accounts, a keychain prompt answered Deny, a locked keyring.
+            let (configs, missing): (Vec<(i64, ImapConfig)>, Vec<i64>) =
+                split_by_password(server_rows, imap_config_from_servers);
+            for id in &missing {
+                state.set_signin(*id, SignIn::Missing);
+                log_sync(&format!(
+                    "account {id}: no password to sign in with; waiting for one"
+                ));
+            }
             // Re-own the keychain items, once. A keychain item remembers the
             // app that created it, and these were created by ad-hoc builds —
             // a different "app" every rebuild — so even the signed build had
@@ -680,6 +710,12 @@ pub fn run() {
             }
             match (started, configured) {
                 (n, _) if n > 0 => {}
+                // Accounts are set up, and all of them are waiting for a
+                // password: not a first run, and not one for demo mail.
+                (_, None) if !missing.is_empty() => {
+                    *state.source.lock().unwrap_or_else(|p| p.into_inner()) =
+                        "waiting for a password".into();
+                }
                 (_, Some(cfg)) => {
                     eprintln!("[sync] account configured: {} @ {}", cfg.user, cfg.host);
                     spawn_real_sync(state.clone(), account, cfg);
@@ -697,7 +733,6 @@ pub fn run() {
                         // for the account. Adding it removes the bootstrap
                         // row, and with it anything this store was holding.
                         NoAccount::Onboard => {
-                            state.seeding.store(false, Ordering::Relaxed);
                             *state.source.lock().unwrap_or_else(|p| p.into_inner()) =
                                 "no account configured".into();
                         }
@@ -714,7 +749,6 @@ pub fn run() {
                         NoAccount::Keep => {
                             state.demo.store(true, Ordering::Relaxed);
                             state.seeded.store(existing as usize, Ordering::Relaxed);
-                            state.seeding.store(false, Ordering::Relaxed);
                             *state.source.lock().unwrap_or_else(|p| p.into_inner()) =
                                 "no account configured · showing stored mail".into();
                             if !reseed_demo_if_stale(&state, account) {
@@ -778,6 +812,8 @@ pub fn run() {
             commands::accounts::test_account,
             commands::accounts::add_account,
             commands::accounts::remove_account,
+            commands::accounts::account_form,
+            commands::accounts::update_account,
             commands::accounts::set_active_account,
             commands::attachments::attachment_is_executable,
             commands::attachments::save_attachment,
@@ -1110,6 +1146,24 @@ mod staged_sweep_tests {
 #[cfg(test)]
 mod startup_tests {
     use super::{main_navigation_allowed, print_navigation_allowed, startup_message};
+
+    /// docs/25 #91: an older Petrel refuses a store a newer one wrote, and
+    /// the dialog says what to do about it rather than only that it failed.
+    #[test]
+    fn a_store_from_a_newer_petrel_says_to_install_the_newer_version() {
+        let newer = petrel_engine::store::StoreError::NewerSchema {
+            found: 33,
+            supported: 28,
+        };
+        let what = super::why_it_cannot_open(&newer);
+        assert!(what.contains("newer version of Petrel"), "{what}");
+        assert!(what.contains("Install the newer version"), "{what}");
+        let other = petrel_engine::store::StoreError::Rejected("disk".into());
+        assert_eq!(
+            super::why_it_cannot_open(&other),
+            "Its mailbox could not be opened."
+        );
+    }
 
     /// The message is the only thing a person sees when the app cannot
     /// start, so it has to say which file and what went wrong. Before this

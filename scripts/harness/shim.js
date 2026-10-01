@@ -241,6 +241,25 @@
       window.__PETREL_FILED__ = true;
     }, FILE_AFTER);
   }
+  // ?arriveAfter=N models one new, unread message reaching the inbox N ms
+  // after launch, so the new-mail announcement can be told apart from the
+  // mail that was already there when the window opened.
+  var ARRIVE_AFTER = Number((String(location.search).match(/[?&]arriveAfter=(\d+)/) || [])[1] || 0);
+  if (ARRIVE_AFTER) {
+    window.setTimeout(function () {
+      var at = Date.now();
+      rows.unshift({
+        thread_id: -999, id: 999, from_display: 'Riley Chen', from_addr: 'riley@example.com',
+        subject: 'Just arrived', snippet: 'body text here', date_ms: at, message_count: 1,
+        participants: 'Riley Chen', unread: true, starred: false, has_attachments: false,
+        tags: [], attachment_name: '', filed: '', snoozed: 0,
+        newest: { id: 999, from_display: 'Riley Chen', from_addr: 'riley@example.com',
+          snippet: 'body text here', date_ms: at, unread: true },
+      });
+      mailGen += 1;
+      window.__PETREL_ARRIVED__ = true;
+    }, ARRIVE_AFTER);
+  }
   function afterIndexDelay(value) {
     if (!INDEX_DELAY) return value;
     return new Promise(function (resolve) { setTimeout(function () { resolve(value); }, INDEX_DELAY); });
@@ -423,6 +442,23 @@
     signature_on_reply: false,
   };
 
+  // The account on screen, as list_accounts reports it.
+  function activeAccountId() {
+    try { return Number(localStorage.getItem('__petrel_active_account') || 1); } catch (e) { return 1; }
+  }
+  // Which accounts need signing in again, `missing` or `refused`, by the
+  // account each names: __petrel_signin_<id>. The bare __petrel_signin is
+  // account 1's, for the probes written before there was a second account;
+  // it used to follow whichever account was on screen, so after ⌘2 both read
+  // as signed out, which misled a review. Cleared by update_account.
+  function signinFor(id) {
+    try {
+      var own = localStorage.getItem('__petrel_signin_' + id);
+      if (own) return own;
+      if (id === 1) return localStorage.getItem('__petrel_signin') || null;
+    } catch (e) {}
+    return null;
+  }
   function savedSearches() {
     try { return JSON.parse(localStorage.getItem('__petrel_saved_searches') || '[]'); } catch (e) { return []; }
   }
@@ -446,9 +482,22 @@
       var configured = true;
       try { configured = localStorage.getItem('__petrel_unconfigured') !== '1'; } catch (e) {}
       return {
+        // The account this describes, as the engine says: the one on screen.
+        account: activeAccountId(),
         last_sync_ms: Date.now() - 3 * 60000,
         extraction_gen: extractionGen(),
         mail_gen: mailGen,
+        // ?elsewhereAfter=N: one new message reaches the inbox of the account
+        // not on screen N ms after launch, handed over once, as the engine
+        // drains it.
+        elsewhere: (function () {
+          var m = String(location.search).match(/[?&]elsewhereAfter=(\d+)/);
+          if (!m || window.__ELSEWHERE_SAID__) return [];
+          if (performance.now() < Number(m[1])) return [];
+          window.__ELSEWHERE_SAID__ = true;
+          var other = activeAccountId() === 1 ? 2 : 1;
+          return [{ account: other, who: 'Riley Chen', subject: 'Lunch on Friday' }];
+        })(),
         notify: (function () {
           if (location.search.indexOf('ruleNotify=1') === -1) return [];
           window.__STATUS_N__ = (window.__STATUS_N__ || 0) + 1;
@@ -490,6 +539,14 @@
         sync_error: (function () {
           try { return localStorage.getItem('__petrel_sync_error') || null; } catch (e) { return null; }
         })(),
+        // Set localStorage.__petrel_signin_<id> (or __petrel_signin, account
+        // 1's) to `missing` or `refused` to model an account that needs its
+        // password entered again; this is the one on screen's.
+        signin: signinFor(activeAccountId()),
+        // Every account that cannot sign in, on screen or not.
+        signins: [1, 2]
+          .map(function (id) { return { account: id, signin: signinFor(id) }; })
+          .filter(function (s) { return s.signin; }),
       };
     },
     // The view on screen, as the engine is told it; recorded so a probe can
@@ -558,6 +615,11 @@
     },
     // One conversation as the view lists it: the same row list_threads gives
     // it, from the same model, or null when the view has none.
+    // The pop-out window asks for its conversation by id. Answered from the
+    // same rows the list reads, so a probe can open ?message=<thread id>.
+    thread_by_id: function (a) {
+      return rows.filter(function (r) { return r.thread_id === a.threadId; })[0] || null;
+    },
     thread_in_view: function (a) {
       var all = handlers.list_threads({ view: a.view });
       for (var i = 0; i < all.length; i += 1) {
@@ -649,10 +711,10 @@
       return [
         { id: 1, kind: 'gmail', email: 'you@example.com', display_name: '',
           color: '#0E7C86', local_archive: 0, active: active === 1, message_count: rows.length,
-          unread_count: 0, last_sync_ms: now, folders: [] },
+          unread_count: 0, last_sync_ms: now, folders: [], signin: signinFor(1) },
         { id: 2, kind: 'imap', email: 'tom@northbay.example', display_name: '',
           color: '#9A6B1F', local_archive: 0, active: active === 2, message_count: 41,
-          unread_count: 3, last_sync_ms: now, folders: [] },
+          unread_count: 3, last_sync_ms: now, folders: [], signin: signinFor(2) },
       ];
     },
     set_active_account: function (a) {
@@ -758,6 +820,9 @@
           from_addr: row.from_addr,
           to: ['me'],
           cc: [],
+          // Opt-in, as the store gives it for your own sent copy that kept
+          // its Bcc header: set window.__PETREL_DETAIL_BCC__ to display names.
+          bcc: window.__PETREL_DETAIL_BCC__ || [],
           snippet: row.snippet,
           unread: !!row.unread,
           date_ms: row.date_ms,
@@ -824,6 +889,8 @@
         from_addr: card.from_addr,
         to: ['me'],
         cc: [],
+        // Opt-in, as thread_detail: window.__PETREL_DETAIL_BCC__.
+        bcc: window.__PETREL_DETAIL_BCC__ || [],
         snippet: row.snippet,
         unread: !!row.unread,
         date_ms: row.date_ms,
@@ -873,7 +940,11 @@
     // The browser cannot hand a URL to the system, and navigating the
     // harness tab away would take the app under test with it.
     open_external: function () { return null; },
-    empty_trash: function () { return '7/0'; },
+    // Refused, as the shell refuses, while the account cannot sign in.
+    empty_trash: function (a) {
+      if (signinFor(a.accountId || activeAccountId())) throw new Error('sign in to this account again first');
+      return '7/0';
+    },
     // Modelled, not stubbed. The engine numbers the ids it is handed from
     // zero and orders by that number, so a shim that accepted the call and
     // did nothing would let a reorder saving half the list look correct —
@@ -922,6 +993,17 @@
     install_update: function () { return null; },
     restart_for_update: function () { return null; },
     load_draft: function (a) {
+      var saved = window.__PETREL_DRAFTS__ && window.__PETREL_DRAFTS__[a.id];
+      if (saved) {
+        return {
+          id: a.id, to: saved.to || '', cc: saved.cc || '', subject: saved.subject || '',
+          body: saved.body || '', html: saved.html || '',
+          envelope: {
+            in_reply_to: saved.inReplyTo || null, references: saved.references || [],
+            attachments: saved.attachments || [], bcc: saved.bcc || '',
+          },
+        };
+      }
       // The shape load_draft really returns: cc and the envelope included.
       // Without the envelope, resuming a draft threw before the composer
       // opened, and the harness could not prove the Drafts view at all.
@@ -1068,6 +1150,7 @@
       return 1204;
     },
     mark_folder_read: function (a) {
+      if (signinFor(activeAccountId())) throw new Error('sign in to this account again first');
       // Modelled, not faked: the rows the harness holds actually change, so
       // the sidebar's number moves afterwards the way it would for real.
       var n = 0;
@@ -1124,8 +1207,10 @@
     unsubscribe_one_click: function () { return null; },
     delete_folder: function () { return null; },
     // Set localStorage.__petrel_push_fails to the server's refusal to model
-    // a folder whose create on the server did not go through.
+    // a folder whose create on the server did not go through. Signed out, the
+    // shell does not ask, and says so.
     push_folder: function () {
+      if (signinFor(activeAccountId())) throw new Error('sign in to this account again first');
       var refusal = null;
       try { refusal = localStorage.getItem('__petrel_push_fails'); } catch (e) {}
       if (refusal) throw refusal;
@@ -1246,10 +1331,40 @@
       try { localStorage.removeItem('__petrel_unconfigured'); } catch (e) {}
       return 2;
     },
+    // Where an account signs in, never its password.
+    account_form: function (a) {
+      var email = a.accountId === 2 ? 'tom@northbay.example' : 'you@example.com';
+      return { email: email, username: email,
+               imap_host: a.accountId === 2 ? 'mail.privateemail.com' : 'imap.gmail.com', imap_port: 993,
+               smtp_host: a.accountId === 2 ? 'mail.privateemail.com' : 'smtp.gmail.com', smtp_port: 465,
+               provider: a.accountId === 2 ? 'Namecheap Private Email' : 'Gmail' };
+    },
+    // The password `wrong` is refused, as the server's test would refuse it,
+    // and nothing changes. Anything else signs the account in again.
+    update_account: function (a) {
+      if (a.setup && a.setup.password === 'wrong') {
+        throw new Error('Incoming (IMAP) — Sign-in was refused. Check the address and password.');
+      }
+      try {
+        localStorage.removeItem('__petrel_signin_' + a.accountId);
+        if (a.accountId === 1) localStorage.removeItem('__petrel_signin');
+      } catch (e) {}
+      return null;
+    },
     remove_account: function () { return null; },
     list_outbox: function () {
       var now = Date.now();
-      return [
+      // Set localStorage.__petrel_outbox_later to add a message scheduled
+      // three hours out, as Send later leaves one.
+      var later = [];
+      try {
+        if (localStorage.getItem('__petrel_outbox_later') === '1') {
+          later.push({ id: 906, subject: 'Quarterly letter', to: 'board@northbay.example',
+            send_after_ms: now + 3 * 3600000, state: 'RetryQueued', error: null, attempts: 0,
+            next_ms: null, attachments: 0 });
+        }
+      } catch (e) {}
+      return later.concat([
         { id: 901, subject: 'Re: Q3 vendor contracts — pricing before Friday', to: 'Sam Ortiz, Dana Wu',
           send_after_ms: now + 7000, state: 'RetryQueued', error: null, attempts: 0, next_ms: null, attachments: 0 },
         { id: 902, subject: 'Invoice 2214', to: 'accounts@clientco.example',
@@ -1264,11 +1379,15 @@
         { id: 905, subject: 'Welcome aboard!', to: 'j.smith@oldcompany.example',
           send_after_ms: now - 400000, state: 'FailedPermanent', error: '550 — no such user here',
           attempts: 1, next_ms: null, attachments: 0 },
-      ];
+      ]);
     },
     outbox_send_now: function () { return null; },
     outbox_edit: function () { return null; },
-    outbox_check: function () { return 'NeedsAttention'; },
+    // Signed out, Sent is not looked in, as the shell refuses it.
+    outbox_check: function () {
+      if (signinFor(activeAccountId())) throw new Error('sign in to this account again first');
+      return 'NeedsAttention';
+    },
     quote_message: function () {
       return {
         // With the empty paragraph the command now writes between two worded
@@ -1289,9 +1408,19 @@
       return null;
     },
     save_draft: function (a) {
-      if (a && a.draftId != null) return a.draftId;
-      nextDraftId += 1;
-      return nextDraftId;
+      var id;
+      if (a && a.draftId != null) {
+        id = a.draftId;
+      } else {
+        nextDraftId += 1;
+        id = nextDraftId;
+      }
+      // Opt-in: a probe that sets window.__PETREL_DRAFTS__ = {} gets each
+      // save remembered, and load_draft hands it back as written — Cc and
+      // Bcc included — instead of the fixture. Off by default, so every
+      // probe written against the fixture still sees the fixture.
+      if (window.__PETREL_DRAFTS__) window.__PETREL_DRAFTS__[id] = a;
+      return id;
     },
     authentication_info: function (a) {
       // A pass for the long machine sender, so the verified pill can be seen

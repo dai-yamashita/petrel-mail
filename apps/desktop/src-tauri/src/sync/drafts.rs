@@ -2,6 +2,7 @@
 
 use crate::config::imap_config_for;
 use crate::diag::log_sync;
+use crate::signin::SignIn;
 use crate::state::AppState;
 use petrel_engine::store::Store;
 use std::sync::Arc;
@@ -48,12 +49,25 @@ pub(crate) async fn push_draft_to_server(
         if store.has_send_time(draft_id).map_err(|e| e.to_string())? {
             return Ok(());
         }
+        // Signed out: the push waits for the account to sign in, rather than
+        // asking a server that refuses the password. The autosave's every
+        // thirty seconds was one refused sign-in each.
+        if state.signin(account).is_some() {
+            state.hold_draft(account, draft_id);
+            return Ok(());
+        }
         let record = store.load_draft(draft_id).map_err(|e| e.to_string())?;
         let (msgid, old_uid) = store
             .draft_sync_state(draft_id)
             .map_err(|e| e.to_string())?;
         let Some(cfg) = imap_config_for(&store, account) else {
-            // No server to push to is not a failure of the draft.
+            // No server to push to is not a failure of the draft. Servers and
+            // no password Petrel can read is not "no server": the account
+            // needs its password, and the push waits for it.
+            if has_servers(&store, account) {
+                state.set_signin(account, SignIn::Missing);
+                state.hold_draft(account, draft_id);
+            }
             return Ok(());
         };
         let drafts_path = store
@@ -99,23 +113,12 @@ pub(crate) async fn push_draft_to_server(
         return Ok(());
     };
 
-    let msg = petrel_providers::smtp::Outgoing {
+    let raw = draft_copy(
+        &record,
         from_addr,
-        from_name: identity.map(|i| i.display_name).unwrap_or_default(),
-        to: addresses_of(&record.to),
-        cc: addresses_of(&record.cc),
-        subject: record.subject.clone(),
-        body_text: record.body.clone(),
-        body_html: Some(record.html.clone()).filter(|h| !h.trim().is_empty()),
-        in_reply_to: record.envelope.in_reply_to.clone(),
-        references: record.envelope.references.clone(),
-        // Attachment files stay local until send: a draft's paths may not
-        // even exist by the time it is reopened, and pushing megabytes on
-        // every autosave is the wrong trade. The text notes nothing; other
-        // clients see the words, which is what a draft is.
-        attachments: Vec::new(),
-    };
-    let raw = msg.render_with_id(&msgid);
+        identity.map(|i| i.display_name).unwrap_or_default(),
+        &msgid,
+    );
 
     petrel_providers::imap::append_message(&cfg, &drafts_path, Some("(\\Draft \\Seen)"), &raw)
         .await
@@ -188,24 +191,148 @@ pub(crate) fn drop_server_draft_using(state: &AppState, store: &Store, draft_id:
     let Some(account) = store.account_of_message(draft_id).ok().flatten() else {
         return;
     };
-    let Some(cfg) = imap_config_for(store, account) else {
-        return;
-    };
     let copies = server_copies(store, account, draft_id);
     if copies.is_empty() {
         return;
     }
+    // Signed out, the copies wait to be removed until the account signs in.
+    // Left alone they would sync back as drafts of mail already sent; asked
+    // for now, each would be a refused sign-in.
+    if state.signin(account).is_some() {
+        state.hold_drops(account, copies);
+        return;
+    }
+    let Some(cfg) = imap_config_for(store, account) else {
+        if has_servers(store, account) {
+            state.set_signin(account, SignIn::Missing);
+            state.hold_drops(account, copies);
+        }
+        return;
+    };
     let uidplus = state.caps(account).has_uidplus;
     tauri::async_runtime::spawn(async move {
-        // UIDPLUS makes the expunge surgical. Without it a copy is only
-        // flagged \Deleted, because a bare EXPUNGE would commit other
-        // clients' deletions too, and it stays until the server expunges it.
-        for (path, uid) in copies {
-            if let Err(e) = petrel_providers::imap::expunge_uid(&cfg, &path, uid, uidplus).await {
-                log_sync(&format!("server draft copy (uid {uid}) not removed: {e}"));
-            }
-        }
+        expunge_copies(&cfg, copies, uidplus).await;
     });
+}
+
+/// Removes server copies of a draft, one by one.
+async fn expunge_copies(
+    cfg: &petrel_providers::imap::ImapConfig,
+    copies: Vec<(String, u32)>,
+    uidplus: bool,
+) {
+    // UIDPLUS makes the expunge surgical. Without it a copy is only
+    // flagged \Deleted, because a bare EXPUNGE would commit other
+    // clients' deletions too, and it stays until the server expunges it.
+    for (path, uid) in copies {
+        if let Err(e) = petrel_providers::imap::expunge_uid(cfg, &path, uid, uidplus).await {
+            log_sync(&format!("server draft copy (uid {uid}) not removed: {e}"));
+        }
+    }
+}
+
+/// Whether the account has servers, which makes a missing password a
+/// missing password rather than an account with no server to reach.
+fn has_servers(store: &Store, account: i64) -> bool {
+    store
+        .account_servers(account)
+        .ok()
+        .flatten()
+        .is_some_and(|s| !s.imap_host.is_empty())
+}
+
+/// Does what waited for the account to sign in: the drafts whose push was
+/// held, and the server copies whose removal was. Called whenever signing in
+/// has just worked — a first pass, the hourly retry, a cycle that reached the
+/// server — however the folders fared. A failure is logged, as any push's
+/// is. What meets the account signed out again is held again, and what a
+/// worker stopped part-way had not reached is handed back for the account's
+/// next run. Held work lives in memory, so a quit still loses it (docs/25
+/// #98).
+pub(crate) async fn push_held(
+    state: &Arc<AppState>,
+    account: i64,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) {
+    let held = state.take_held(account);
+    if held == crate::signin::Held::default() {
+        return;
+    }
+    log_sync(&format!(
+        "account {account}: {} held draft push(es) and {} held removal(s) go now",
+        held.drafts.len(),
+        held.drops.len()
+    ));
+    // Whose mailbox the removals were meant for, as the store has it now.
+    let mailbox = mailbox_of(state, account);
+    let mut drafts = held.drafts.into_iter();
+    while let Some(draft) = drafts.next() {
+        if *stop.borrow() {
+            let rest = std::iter::once(draft).chain(drafts).collect();
+            hand_back(state, account, &mailbox, rest, held.drops);
+            return;
+        }
+        // Signed out meanwhile, the push holds the draft again itself.
+        if let Err(e) = push_draft_to_server(state, draft).await {
+            log_sync(&format!("draft {draft} push failed: {e}"));
+        }
+    }
+    if held.drops.is_empty() {
+        return;
+    }
+    let cfg = if state.signin(account).is_some() {
+        None
+    } else {
+        let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
+        imap_config_for(&store, account)
+    };
+    let Some(cfg) = cfg else {
+        hand_back(state, account, &mailbox, Vec::new(), held.drops);
+        return;
+    };
+    let uidplus = state.caps(account).has_uidplus;
+    let mut drops = held.drops.into_iter();
+    while let Some(copy) = drops.next() {
+        // One sign-in each: a stopped worker's password may be the one Sign
+        // in again just replaced, and a refusal met meanwhile stands.
+        if *stop.borrow() || state.signin(account).is_some() {
+            let rest = std::iter::once(copy).chain(drops).collect();
+            hand_back(state, account, &mailbox, Vec::new(), rest);
+            return;
+        }
+        expunge_copies(&cfg, vec![copy], uidplus).await;
+    }
+}
+
+/// The server and login an account's mail lives under, as the store has it.
+fn mailbox_of(state: &AppState, account: i64) -> Option<(String, String)> {
+    let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
+    let servers = store.account_servers(account).ok().flatten()?;
+    Some((servers.imap_host, servers.username))
+}
+
+/// Holds again what `push_held` did not reach, for the account's next run.
+///
+/// Only while the account runs: a removed account's work dies with it. And
+/// removals only for the mailbox they were meant for, because ids are
+/// reused — an account set up under this one's id, on another server,
+/// would have had UIDs in its own folders expunged.
+fn hand_back(
+    state: &AppState,
+    account: i64,
+    mailbox: &Option<(String, String)>,
+    drafts: Vec<i64>,
+    drops: Vec<(String, u32)>,
+) {
+    if *state.stop_signal(account).borrow() {
+        return;
+    }
+    for draft in drafts {
+        state.hold_draft(account, draft);
+    }
+    if !drops.is_empty() && mailbox.is_some() && mailbox_of(state, account) == *mailbox {
+        state.hold_drops(account, drops);
+    }
 }
 
 /// The server copies of a draft to drop, by folder path and UID: every one
@@ -231,16 +358,82 @@ fn server_copies(store: &Store, account: i64, draft_id: i64) -> Vec<(String, u32
     copies
 }
 
+/// The copy of a draft that goes to the server's Drafts folder.
+///
+/// The sender's copy, Bcc header and all, as Thunderbird keeps it: a draft
+/// picked up on the phone or in webmail still has its blind copies, and a
+/// draft only ever goes to its own account's Drafts.
+pub(crate) fn draft_copy(
+    record: &petrel_engine::store::DraftRecord,
+    from_addr: String,
+    from_name: String,
+    msgid: &str,
+) -> Vec<u8> {
+    let msg = petrel_providers::smtp::Outgoing {
+        from_addr,
+        from_name,
+        to: addresses_of(&record.to),
+        cc: addresses_of(&record.cc),
+        bcc: addresses_of(&record.envelope.bcc),
+        subject: record.subject.clone(),
+        body_text: record.body.clone(),
+        body_html: Some(record.html.clone()).filter(|h| !h.trim().is_empty()),
+        in_reply_to: record.envelope.in_reply_to.clone(),
+        references: record.envelope.references.clone(),
+        // Attachment files stay local until send: a draft's paths may not
+        // even exist by the time it is reopened, and pushing megabytes on
+        // every autosave is the wrong trade. The text notes nothing; other
+        // clients see the words, which is what a draft is.
+        attachments: Vec::new(),
+    };
+    msg.sender_copy(&msg.render_with_id(msgid))
+}
+
 /// Splits a recipient field the way the composer's chip field does —
 /// commas and semicolons — for rendering a draft whose addresses are still
 /// one string. A draft may legitimately have none at all.
-fn addresses_of(field: &str) -> Vec<String> {
+pub(crate) fn addresses_of(field: &str) -> Vec<String> {
     field
         .split([',', ';'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod draft_copy_tests {
+    use super::draft_copy;
+    use petrel_engine::store::{DraftEnvelope, DraftRecord};
+
+    /// The copy in the server's Drafts carries the blind copies as a Bcc
+    /// header, so the draft opened on the phone or in webmail still has them.
+    #[test]
+    fn the_server_copy_of_a_draft_keeps_its_blind_copies() {
+        let record = DraftRecord {
+            id: 1,
+            to: "dana@example.com".into(),
+            cc: String::new(),
+            subject: "Numbers".into(),
+            body: "In.".into(),
+            html: String::new(),
+            envelope: DraftEnvelope {
+                bcc: "priya@example.net, board@example.org".into(),
+                ..Default::default()
+            },
+        };
+        let raw = draft_copy(
+            &record,
+            "sam@example.com".into(),
+            "Sam".into(),
+            "d1@example.com",
+        );
+        let parsed = petrel_mime::parse_message(&raw).unwrap();
+        let bcc: Vec<&str> = parsed.bcc.iter().map(|(_, a)| a.as_str()).collect();
+        assert_eq!(bcc, vec!["priya@example.net", "board@example.org"]);
+        assert_eq!(parsed.message_id.as_deref(), Some("d1@example.com"));
+        assert_eq!(parsed.to, vec![(None, "dana@example.com".to_string())]);
+    }
 }
 
 #[cfg(test)]
@@ -319,5 +512,89 @@ mod server_copies_tests {
             server_copies(&store, account, id),
             vec![("Drafts".to_string(), 7)]
         );
+    }
+}
+
+#[cfg(test)]
+mod signed_out_tests {
+    //! The review's probe D. A draft's push asked the server whether or not
+    //! the account could sign in: writing a reply while the password was
+    //! refused was a refused sign-in every thirty seconds.
+    use super::push_draft_to_server;
+    use crate::scripted_imap::{Srv, serve};
+    use crate::signin::SignIn;
+    use crate::signin::test_support::{servers_at, unkeyed_account};
+    use crate::state::{AppState, test_state};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    fn a_draft(state: &AppState, account: i64) -> i64 {
+        let mut store = state.store.lock().unwrap();
+        store
+            .sync_folders(
+                account,
+                &[
+                    ("INBOX".into(), Some("inbox".into())),
+                    ("Drafts".into(), Some("drafts".into())),
+                ],
+            )
+            .unwrap();
+        store
+            .save_draft_full(
+                account,
+                None,
+                "dana@example.com",
+                "",
+                "Numbers",
+                "words",
+                "",
+                &petrel_engine::store::DraftEnvelope::default(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_draft_waits_for_the_account_to_sign_in() {
+        let _turn = crate::config::cache_turn();
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let account = unkeyed_account(&state);
+        let srv = Srv::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\\Drafts")], &[]);
+        tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            servers_at(&state, account, port);
+            let draft = a_draft(&state, account);
+            crate::config::remember_password(account, "revoked");
+            state.set_signin(account, SignIn::Refused);
+            for _ in 0..3 {
+                push_draft_to_server(&state, draft).await.unwrap();
+            }
+            let conns = srv.conns.load(Ordering::SeqCst);
+            let held = state.take_held(account);
+            crate::config::forget_password(account);
+            assert_eq!(conns, 0, "sign-in attempts from three pushes");
+            assert!(held.drafts.contains(&draft), "the draft waits, to go later");
+        });
+    }
+
+    /// Servers and no password Petrel can read: not "no server to push to",
+    /// which used to drop the push for good. The account needs its password.
+    #[test]
+    fn a_draft_of_an_account_without_its_password_waits_too() {
+        let _turn = crate::config::cache_turn();
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let account = unkeyed_account(&state);
+        let srv = Srv::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\\Drafts")], &[]);
+        tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            servers_at(&state, account, port);
+            crate::config::forget_password(account);
+            let draft = a_draft(&state, account);
+            push_draft_to_server(&state, draft).await.unwrap();
+            assert_eq!(srv.conns.load(Ordering::SeqCst), 0);
+            assert_eq!(state.signin(account), Some(SignIn::Missing));
+            assert!(state.take_held(account).drafts.contains(&draft));
+        });
     }
 }

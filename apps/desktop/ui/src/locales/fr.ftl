@@ -56,6 +56,7 @@ reader-forward = Transférer
 reader-failed = Impossible d’ouvrir cette conversation
 reader-to = à { $who }
 reader-cc = Cc { $who }
+reader-bcc = Cci { $who }
 reader-collapse = Réduire le message de { $who }
 msg-reply = Répondre à ce message
 msg-reply-all = Répondre à tous sur ce message
@@ -129,6 +130,17 @@ onb-inbox-ready = La boîte de réception est prête
 onb-start = Commencer à lire
 onb-failed = Impossible de se connecter : { $error }
 onb-add-failed = Impossible d’enregistrer le compte : { $error }
+signin-title = Se connecter à { $email }
+signin-help = Saisissez le mot de passe de ce compte. Petrel le vérifie auprès de votre fournisseur avant d’enregistrer quoi que ce soit.
+signin-address = Adresse
+signin-checking = Vérification auprès de votre fournisseur…
+signin-done = Connecté à { $email }. Récupération de votre courrier…
+signin-first = Reconnectez-vous d’abord : Petrel ne peut joindre le serveur de ce compte qu’avec un mot de passe qui fonctionne.
+signin-outbox-waiting = En attente de votre reconnexion. Rien n’est envoyé tant que le compte n’a pas un mot de passe qui fonctionne.
+signin-outbox-scheduled = Part à { $when }, une fois que vous vous serez reconnecté. Vous pouvez encore le changer.
+signin-outbox-check-waits = Petrel pourra vérifier une fois que vous vous serez reconnecté.
+signin-sending-waiting = Pas encore envoyé : « { $subject } » attend votre reconnexion
+signin-again = Se reconnecter…
 att-preview = Aperçu
 att-open = Ouvrir
 att-save = Enregistrer { $name }
@@ -184,6 +196,10 @@ empty-loading = Chargement de votre courrier…
 empty-syncing = Récupération de votre courrier. { $count } jusqu’ici…
 sync-failed-title = Impossible d’accéder à votre courrier
 sync-failed-body = Voici ce que Petrel avait déjà. Rien n’est perdu. Détails dans sync.log.
+signin-needed = Connexion nécessaire
+signin-refused = Le serveur a refusé le mot de passe de { $email }.
+signin-missing = Petrel n’a pas le mot de passe de { $email }.
+signin-empty-title = Connectez-vous pour récupérer votre courrier
 compose-undo = Annuler l’envoi
 compose-undo-help = Après l’envoi, Petrel retient le message pendant ce temps et affiche un bouton Annuler.
 compose-undo-off-label = Désactivé
@@ -201,6 +217,8 @@ compose-reply = Répondre
 compose-from = De
 compose-to = À
 compose-cc = Cc
+compose-bcc = Cci
+compose-bcc-hint = Copie cachée, invisible pour les autres destinataires ({ $key })
 compose-subject = Objet
 compose-body = Message
 compose-send = Envoyer
@@ -211,7 +229,7 @@ compose-attach-failed = Impossible de joindre ceci : { $error }
 compose-missing-attachment = Ce message parle d’une pièce jointe et n’en a aucune. Appuyez de nouveau sur Envoyer pour l’envoyer quand même.
 compose-no-recipient = Ajoutez un destinataire.
 compose-bad-recipient = Ce n’est pas une adresse : { $addr }
-compose-sending = Envoi dans { $count } s
+compose-sending = Envoi dans { $count } s : { $subject }
 compose-send-now = Envoyer maintenant
 compose-sent = Envoyé
 compose-saved = Enregistré dans les brouillons
@@ -261,6 +279,16 @@ notify-many = { $count ->
     [one] { $count } nouveau message
    *[other] { $count } nouveaux messages
 }
+notify-from-people = { $count ->
+    [one] De { $count } personne
+   *[other] De { $count } personnes
+}
+notify-one-in = Nouveau message de { $who } dans { $account }
+notify-many-in = { $count ->
+    [one] { $count } nouveau message dans { $account }
+   *[other] { $count } nouveaux messages dans { $account }
+}
+notify-subject-in = { $subject } ({ $account })
 status-synced = Synchronisé à l’instant
 status-synced-min = Synchronisé il y a { $min } min
 status-synced-hr = Synchronisé il y a { $hr } h
@@ -315,6 +343,7 @@ identity-signature-placeholder = Ajoutée au bas des messages que vous écrivez.
 identity-signature-replies = Utiliser cette signature aussi dans les réponses
 identity-signature-replies-help = Désactivé signifie nouveaux messages uniquement. Une signature répétée tout au long d’un long fil est ce dont les gens se plaignent.
 identity-save-failed = Impossible d’enregistrer : { $error }
+identity-no-account = Enregistrement impossible : le compte n’est plus là.
 privacy-remote = Contenu distant
 privacy-remote-help = Images et autres fichiers qu’un message charge depuis internet. Les charger indique à l’expéditeur que vous avez ouvert son message.
 privacy-remote-block = Bloquer
@@ -429,10 +458,19 @@ account-switch-failed = Impossible de changer de compte : { $error }
 account-switch-draft-failed = Le brouillon ouvert n'a pas pu être enregistré, le compte n'a donc pas été changé : { $error }
 view-switch-draft-failed = Le brouillon ouvert n'a pas pu être enregistré, la boîte n'a donc pas été ouverte : { $error }
 accounts-add = Ajouter un compte
+accounts-signin = Connexion
+accounts-signin-help = Vous avez changé de mot de passe ou créé un nouveau mot de passe d’application ? Saisissez-le ici.
+accounts-needs-signin = Connexion nécessaire
 accounts-remove = Supprimer le compte
 accounts-remove-help = Supprime ce compte, son courrier et son mot de passe. Rien ne change sur le serveur.
 accounts-remove-confirm = Supprimer { $email } ?
-accounts-remove-body = Ses messages sont supprimés de cet ordinateur et son mot de passe du gestionnaire de mots de passe du système. Le courrier lui-même reste intact sur le serveur.
+accounts-remove-body = Ses messages et son mot de passe sont supprimés de cet ordinateur. Ce qui est sur le serveur y reste, mais ce qui n’existe qu’ici disparaît pour de bon : le courrier des dossiers locaux ou importés, le courrier que le serveur a déjà supprimé, et les brouillons et messages en attente d’envoi. « Exporter d’abord » sauvegarde le courrier ; les brouillons et les messages en attente n’y sont pas, alors envoyez-les ou copiez-les avant.
+accounts-remove-export = Exporter d’abord…
+accounts-remove-exporting = Exportation…
+accounts-remove-exported = { $count ->
+    [one] { $count } message exporté de { $account }. Les brouillons et les messages en attente n’y sont pas.
+   *[other] { $count } messages exportés de { $account }. Les brouillons et les messages en attente n’y sont pas.
+}
 accounts-none = Aucun compte pour l’instant.
 accounts-failed = Impossible de lire vos comptes
 accounts-synced = synchronisé { $when }
@@ -673,6 +711,7 @@ folder-created = « { $name } » créé
 folder-deleted = « { $name } » supprimé
 folder-failed = Échec de la modification du dossier : { $error }
 folder-server-pending = Impossible de créer « { $name } » sur le serveur pour l’instant : { $error }. Il est conservé ici et la prochaine synchronisation réessaiera.
+folder-made-here-signin = « { $name } » créé ici. Il sera créé sur le serveur une fois que vous vous serez reconnecté.
 folder-name-taken = Un dossier nommé « { $name } » s’y trouve déjà.
 folder-bin-refuses = Le courrier déplacé vers la corbeille de ce compte ne serait pas supprimé. Supprimez « { $name } » depuis son menu.
 tag-new = Nouvelle étiquette
@@ -788,6 +827,7 @@ status-demo = Courrier de démonstration · aucun compte
 sc-account = Changer de compte actif
 sc-archive = Archiver
 sc-back = Retour à la liste
+sc-bcc = Ajouter Cci
 sc-compose = Écrire
 sc-find-in-message = Rechercher dans cette conversation
 sc-goto = Aller à Boîte de réception · Suivis · Envoyés · Brouillons · Tous les messages

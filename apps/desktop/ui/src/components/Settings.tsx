@@ -74,7 +74,13 @@ export function Settings({
   // Elements, not components: building the record costs nine element objects
   // and renders none of them — only the one looked up below ever mounts.
   const PANE_VIEWS: Record<PaneId, ReactNode> = {
-    accounts: <Accounts onAddAccount={onAddAccount} onAccountRemoved={onAccountRemoved} />,
+    accounts: (
+      <Accounts
+        onAddAccount={onAddAccount}
+        onAccountRemoved={onAccountRemoved}
+        onMessage={onMessage}
+      />
+    ),
     identities: <Identities onMessage={onMessage} />,
     composing: <Composing />,
     notifications: <Notifications />,

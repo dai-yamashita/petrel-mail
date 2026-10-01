@@ -11,8 +11,16 @@ import { BINDINGS } from './shortcuts';
 describe('the keyboard map', () => {
   const available = BINDINGS.filter((s) => s.available);
 
-  const signature = (c: { key: string; shift?: boolean; meta?: boolean; then?: string }) =>
-    [c.meta ? 'meta' : '', c.shift ? 'shift' : '', c.key, c.then ?? ''].filter(Boolean).join('+');
+  const signature = (c: {
+    key: string;
+    shift?: boolean;
+    meta?: boolean;
+    alt?: boolean;
+    then?: string;
+  }) =>
+    [c.meta ? 'meta' : '', c.alt ? 'alt' : '', c.shift ? 'shift' : '', c.key, c.then ?? '']
+      .filter(Boolean)
+      .join('+');
 
   it('never gives one chord to two actions', () => {
     const seen = new Map<string, string>();

@@ -86,11 +86,24 @@ export function sendable(entry: string): boolean {
   return true;
 }
 
-/** The first To or Cc entry the wire would drop, or null when every entry
- *  would go. What a send checks before it does anything else. */
-export function firstUnsendable(d: { to: string; cc: string }): string | null {
-  for (const entry of [...splitRecipients(d.to), ...splitRecipients(d.cc)]) {
+/** The first To, Cc or Bcc entry the wire would drop, or null when every
+ *  entry would go. What a send checks before it does anything else. */
+export function firstUnsendable(d: { to: string; cc: string; bcc?: string }): string | null {
+  for (const entry of [
+    ...splitRecipients(d.to),
+    ...splitRecipients(d.cc),
+    ...splitRecipients(d.bcc ?? ''),
+  ]) {
     if (!sendable(entry)) return entry;
   }
   return null;
+}
+
+/** Whether a message names anyone at all to send to: To, Cc or Bcc.
+ *
+ *  Any of the three will do, as in every other client: a note to a list of
+ *  parents goes in Bcc and nowhere else. The send path agrees, counting the
+ *  same three on the envelope. */
+export function hasRecipient(d: { to: string; cc: string; bcc?: string }): boolean {
+  return [d.to, d.cc, d.bcc ?? ''].some((field) => splitRecipients(field).length > 0);
 }

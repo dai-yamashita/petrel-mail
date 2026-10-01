@@ -298,6 +298,10 @@ export function useThreadWindow(args: {
   /** The conversation open in the reader, read when a refresh lands; see
    *  `refreshHead`. */
   openThread?: () => number | null;
+  /** Bumped to load the same window again, from the top. Not an account
+   *  change: whatever watches the account's mail — the new-mail announcer —
+   *  carries on from what it had seen. */
+  reload?: number;
   /** False until the saved settings are in. The first window waits for them:
    *  loaded in the default order, its first row, the newest conversation,
    *  became the open one, and was kept when the saved order replaced the
@@ -328,6 +332,7 @@ export function useThreadWindow(args: {
     fetchers,
     onRefreshFailed,
     openThread,
+    reload = 0,
     ready = true,
   } = args;
 
@@ -437,7 +442,7 @@ export function useThreadWindow(args: {
       live = false;
       window.clearTimeout(handle);
     };
-  }, [query, view, sort, accountEpoch, ready]);
+  }, [query, view, sort, accountEpoch, reload, ready]);
 
   // On a reset, remember the count without treating it as new mail.
   useEffect(() => {

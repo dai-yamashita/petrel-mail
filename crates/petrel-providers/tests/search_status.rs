@@ -13,8 +13,8 @@
 use std::sync::{Arc, Mutex};
 
 use petrel_providers::imap::{
-    Credential, FolderPass, ImapConfig, PassOutcome, RemovalCheck, Security, find_message_id,
-    move_uid, sync_pass, uids_for_message_id, uids_in_folder,
+    Credential, FolderPass, ImapConfig, PassOutcome, RemovalCheck, Security, Stored,
+    find_message_id, move_uid, sync_pass, uids_for_message_id, uids_in_folder,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -113,6 +113,24 @@ fn cfg(port: u16) -> ImapConfig {
 
 fn is_search(line: &str) -> bool {
     line.to_ascii_uppercase().contains(" SEARCH ")
+}
+
+/// The FETCH that checks a Message-ID search's hits.
+fn is_header_fetch(line: &str) -> bool {
+    line.to_ascii_uppercase()
+        .contains("HEADER.FIELDS (MESSAGE-ID)")
+}
+
+/// When the scripted messages arrived; a COPY keeps it.
+const ARRIVED: &str = "01-Oct-2026 09:00:00 +0000";
+
+/// One FETCH item carrying a message's size, arrival and Message-ID header.
+fn fetched(seq: u32, uid: u32, message_id: &str, size: u32) -> String {
+    let header = format!("Message-ID: {message_id}\r\n\r\n");
+    format!(
+        "* {seq} FETCH (UID {uid} RFC822.SIZE {size} INTERNALDATE \"{ARRIVED}\" BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{header})\r\n",
+        header.len()
+    )
 }
 
 /// The store holds five placements here, and the server now counts three:
@@ -342,6 +360,14 @@ async fn an_answered_message_id_search_names_its_hits() {
         if is_search(line) {
             return Reply::Bytes(format!("* SEARCH 4 2\r\n{tag} OK search done\r\n"));
         }
+        // Each hit is checked: both carry exactly this id.
+        if is_header_fetch(line) {
+            return Reply::Bytes(format!(
+                "{}{}{tag} OK fetched\r\n",
+                fetched(1, 2, "<m1@example.com>", 100),
+                fetched(2, 4, "<m1@example.com>", 100)
+            ));
+        }
         Reply::Bytes(format!("{tag} OK done\r\n"))
     })
     .await;
@@ -385,7 +411,10 @@ async fn a_move_retry_whose_search_is_refused_still_copies() {
         "Archive",
         false,
         true,
-        Some("<m3@example.com>"),
+        Some(Stored {
+            message_id: "<m3@example.com>",
+            size: Some(100),
+        }),
     )
     .await
     .expect("the move completes");
@@ -407,6 +436,19 @@ async fn a_move_retry_whose_copy_landed_does_not_copy_again() {
         if is_search(line) {
             return Reply::Bytes(format!("* SEARCH 9\r\n{tag} OK search done\r\n"));
         }
+        // The hit is this message: the same id, and the same size as the
+        // source the move is about to copy.
+        if is_header_fetch(line) {
+            return Reply::Bytes(format!(
+                "{}{tag} OK fetched\r\n",
+                fetched(1, 9, "<m3@example.com>", 100)
+            ));
+        }
+        if line.to_ascii_uppercase().contains("RFC822.SIZE") {
+            return Reply::Bytes(format!(
+                "* 3 FETCH (UID 3 RFC822.SIZE 100 INTERNALDATE \"{ARRIVED}\")\r\n{tag} OK fetched\r\n"
+            ));
+        }
         Reply::Bytes(format!("{tag} OK done\r\n"))
     })
     .await;
@@ -417,7 +459,10 @@ async fn a_move_retry_whose_copy_landed_does_not_copy_again() {
         "Archive",
         false,
         true,
-        Some("<m3@example.com>"),
+        Some(Stored {
+            message_id: "<m3@example.com>",
+            size: Some(100),
+        }),
     )
     .await
     .expect("the move completes");

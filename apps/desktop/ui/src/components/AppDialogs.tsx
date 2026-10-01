@@ -3,6 +3,7 @@ import { api, type ActionKind, type Folder, type OutboxRow, type Thread } from '
 import { count as fmtCount } from '../lib/format';
 import { t } from '../lib/strings';
 import { outboxRefusal } from '../lib/outbox-refusal';
+import { signinRefusal } from '../lib/signin-refusal';
 import {
   binDestination,
   binTakesFolders,
@@ -19,6 +20,7 @@ import { MAILBOX_LOOK, type MailboxKey } from '../lib/mailboxes';
 import { Confirm } from './Confirm';
 import { Dialog } from '@ariakit/react';
 import { Picker, type PickerOption } from './Picker';
+import { RiskyLinkDialog } from './RiskyLinkDialog';
 
 /**
  * The app's confirmation stack: every dialog that stands between a click
@@ -301,7 +303,7 @@ export function AppDialogs({
               say(
                 nameIsTaken(e)
                   ? t('folder-name-taken', { name: leaf })
-                  : t('folder-failed', { error: String(e) }),
+                  : (signinRefusal(e) ?? t('folder-failed', { error: String(e) })),
               ),
             );
         }}
@@ -355,7 +357,7 @@ export function AppDialogs({
               say(
                 nameIsTaken(e)
                   ? t('folder-name-taken', { name: leaf })
-                  : t('folder-failed', { error: String(e) }),
+                  : (signinRefusal(e) ?? t('folder-failed', { error: String(e) })),
               ),
             );
         }}
@@ -383,7 +385,7 @@ export function AppDialogs({
               say(t('folder-trashed-all', { count: fmtCount(n) }));
               onTrashedAll();
             })
-            .catch((e) => say(t('folder-failed', { error: String(e) })));
+            .catch((e) => say(signinRefusal(e) ?? t('folder-failed', { error: String(e) })));
         }}
       />
 
@@ -452,41 +454,7 @@ export function AppDialogs({
           </div>
         </div>
       </Dialog>
-      {/* A link that reads as one address and resolves to another. Both
-          spellings are shown, and the safe answer is the default: doing
-          nothing leaves the browser unopened. */}
-      <Dialog
-        open={riskyLink !== null}
-        onClose={onDismissRiskyLink}
-        className="confirm-backdrop"
-        backdrop={<div className="palette-scrim" />}
-        aria-label={t('link-risk-title')}
-      >
-        <div className="confirm" role="alertdialog">
-          <div className="confirm-title">{t('link-risk-title')}</div>
-          <p className="confirm-detail">
-            {t('link-risk-body', {
-              typed: riskyLink?.risk.asTyped ?? '',
-              real: riskyLink?.risk.asPunycode ?? '',
-            })}
-          </p>
-          <div className="confirm-foot">
-            <button type="button" className="reply" onClick={onDismissRiskyLink}>
-              {t('link-risk-stay')}
-            </button>
-            <button
-              type="button"
-              className="reply danger"
-              onClick={() => {
-                riskyLink?.open();
-                onDismissRiskyLink();
-              }}
-            >
-              {t('link-risk-open')}
-            </button>
-          </div>
-        </div>
-      </Dialog>
+      <RiskyLinkDialog risky={riskyLink} onDismiss={onDismissRiskyLink} />
       <Confirm
         open={emptyingTrash}
         title={t('trash-empty-confirm')}

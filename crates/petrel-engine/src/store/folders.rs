@@ -27,6 +27,35 @@ pub(super) fn like_escape(literal: &str) -> String {
 /// confirmed yet. See `folder_awaits_server`.
 const PENDING_CREATE: &str = "pending_create";
 
+/// Where a folder's name stands among the conventional names for its role,
+/// lower first; any other name sorts after all of them. Compared on the
+/// last segment, so `INBOX.Trash` and `[Gmail]/Sent Mail` read as their
+/// leaves, and without regard to case — cPanel's spam folder is `spam`.
+fn canonical_rank(role: &str, path: &str) -> usize {
+    let names: &[&str] = match role {
+        "inbox" => &["INBOX"],
+        "sent" => &["Sent", "Sent Mail", "Sent Items", "Sent Messages"],
+        "drafts" => &["Drafts", "Draft"],
+        "trash" => &["Trash", "Deleted Items", "Deleted Messages", "Bin"],
+        "spam" => &[
+            "Spam",
+            "Junk",
+            "Junk E-mail",
+            "Junk Email",
+            "Junk Mail",
+            "Bulk Mail",
+        ],
+        "archive" => &["Archive", "Archives", "All Mail"],
+        "starred" => &["Starred", "Flagged"],
+        _ => &[],
+    };
+    let leaf = path.rsplit(['/', '.']).next().unwrap_or(path);
+    names
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(leaf))
+        .unwrap_or(names.len())
+}
+
 /// The `sync_state_json` key on a folder the server flags `\All` where that
 /// is not the archive. See `set_all_mail_folders`.
 const ALL_MAIL: &str = "all_mail";
@@ -102,10 +131,12 @@ fn repoint_queued_actions(
 impl Store {
     /// The folder holding a role for this account, if one is mapped.
     pub fn folder_for_role(&self, account_id: i64, role: &str) -> Result<Option<i64>> {
+        // A survey leaves one holder per role (`settle_roles`); the order is
+        // for anything that reaches here before one has run.
         Ok(self
             .conn
             .query_row(
-                "SELECT id FROM folders WHERE account_id = ?1 AND role = ?2 LIMIT 1",
+                "SELECT id FROM folders WHERE account_id = ?1 AND role = ?2 ORDER BY id LIMIT 1",
                 params![account_id, role],
                 |r| r.get(0),
             )
@@ -191,6 +222,18 @@ impl Store {
         account_id: i64,
         folders: &[(String, Option<String>)],
     ) -> Result<usize> {
+        // Who held which role before this survey said anything, for
+        // `settle_roles`: the holder keeps its role over a newcomer.
+        let held_before: std::collections::HashMap<i64, String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, role FROM folders
+                  WHERE account_id = ?1 AND coalesce(role,'') <> ''",
+            )?;
+            let rows = stmt.query_map(params![account_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
         let mut n = 0;
         for (path, role) in folders {
             let name = path.rsplit('/').next().unwrap_or(path);
@@ -224,6 +267,9 @@ impl Store {
             }
             n += 1;
         }
+        let listed: std::collections::HashSet<&str> =
+            folders.iter().map(|(p, _)| p.as_str()).collect();
+        self.settle_roles(account_id, &listed, &held_before)?;
         // The roles a server may simply never mark. Namecheap flags \Sent,
         // \Trash, \Drafts and \Junk but no \Archive, so the engine believed
         // the account had no archive at all: the Archive mailbox listed
@@ -280,8 +326,6 @@ impl Store {
         // deleted elsewhere, or (the day this was written) a \Noselect
         // container that stopped being reported as a mailbox. Their rows and
         // placements go; their mail stays, as it does everywhere else here.
-        let known: std::collections::HashSet<&str> =
-            folders.iter().map(|(p, _)| p.as_str()).collect();
         let stale: Vec<i64> = {
             let mut stmt = self
                 .conn
@@ -290,7 +334,7 @@ impl Store {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             })?;
             rows.filter_map(|r| r.ok())
-                .filter(|(_, path)| !known.contains(path.as_str()))
+                .filter(|(_, path)| !listed.contains(path.as_str()))
                 .map(|(id, _)| id)
                 // A local folder is absent from every survey by definition —
                 // imported mail lives in one, and pruning it would delete the
@@ -303,12 +347,14 @@ impl Store {
                 // sync. Pruning either deleted the folder the person had just
                 // made, with no word to say it had gone.
                 .filter(|id| !self.folder_awaits_server(*id).unwrap_or(false))
-                // Nor a folder wearing a role. Those are the app's own
+                // Nor a folder still wearing a role. Those are the app's own
                 // structure rather than the server's listing, and one can
                 // legitimately exist here before the server has been told —
                 // an Archive created a moment ago, its message already in it,
                 // the drain still queued. Pruning it there destroys the mail
-                // in the gap between the two.
+                // in the gap between the two. A role folder the server has
+                // replaced lost its role in `settle_roles` above, and goes
+                // here like any other folder the server no longer lists.
                 .filter(|id| {
                     !self
                         .conn
@@ -337,6 +383,142 @@ impl Store {
             }
         }
         Ok(n)
+    }
+
+    /// Leaves one folder holding each role.
+    ///
+    /// A server may flag several mailboxes with one special use. cPanel's
+    /// Dovecot flags its own `Trash` and Apple's `Deleted Messages` both
+    /// `\Trash`, `Spam` and `Junk` both `\Junk`, and `Sent`, `Sent Items` and
+    /// `Sent Messages` all `\Sent`. With all of them wearing the role, the
+    /// sync took the first in rail order and triage the lowest id: on a real
+    /// account the Trash being synced was a `Deleted Messages` the server had
+    /// deleted weeks before, while the real Trash and Spam were reached only
+    /// by the twenty-minute reconcile.
+    ///
+    /// So each role has one holder, the same for every reader, chosen in this
+    /// order:
+    /// 1. a folder this survey listed, over one it did not;
+    /// 2. the folder that held the role before the survey — so emptying the
+    ///    Trash never hands the role to the folder beside it that still has
+    ///    mail in it;
+    /// 3. a folder already holding mail synced from the server;
+    /// 4. the conventional name (`canonical_rank`);
+    /// 5. the lowest id, which is the order the server listed them.
+    ///
+    /// The others become ordinary folders. Their mail stays placed and syncs
+    /// as any folder's does, as Thunderbird lists every one of them.
+    ///
+    /// Only folders this survey listed, local folders and folders made here
+    /// that the server has not confirmed are candidates. A role holder that
+    /// is none of those — the server's folder is gone, or the role was
+    /// invented here before any survey — keeps the role only while nothing
+    /// else can take it. Once something can, it gives way, and whatever was
+    /// filed into it here without a server number goes to the new holder
+    /// first: that is mail waiting for the drain, and pruning the folder with
+    /// it still inside would take it out of every view.
+    ///
+    /// Outside Gmail a mailbox the server flags `\All` is a view of every
+    /// message, which the last survey marked (`set_all_mail_folders`). It
+    /// never holds the archive: archiving into it is a move the server
+    /// cannot make, while the plain Archive beside it went unused.
+    fn settle_roles(
+        &self,
+        account_id: i64,
+        listed: &std::collections::HashSet<&str>,
+        held_before: &std::collections::HashMap<i64, String>,
+    ) -> Result<()> {
+        let gmail: bool = self
+            .conn
+            .query_row(
+                "SELECT kind = 'gmail' FROM accounts WHERE id = ?1",
+                params![account_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        let holders: Vec<(i64, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, role, path FROM folders
+                  WHERE account_id = ?1 AND coalesce(role,'') <> ''
+                  ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![account_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut by_role: std::collections::BTreeMap<String, Vec<(i64, String)>> =
+            std::collections::BTreeMap::new();
+        for (id, role, path) in holders {
+            if role == "archive" && !gmail && self.folder_is_all_mail(id)? {
+                self.conn
+                    .execute("UPDATE folders SET role = NULL WHERE id = ?1", params![id])?;
+                continue;
+            }
+            by_role.entry(role).or_default().push((id, path));
+        }
+        for (role, group) in by_role {
+            if group.len() < 2 {
+                continue;
+            }
+            // (id, path, listed, may stand unlisted)
+            let mut scored = Vec::with_capacity(group.len());
+            for (id, path) in group {
+                let is_listed = listed.contains(path.as_str());
+                let kept_here = self.folder_is_local(id)? || self.folder_awaits_server(id)?;
+                scored.push((id, path, is_listed, kept_here));
+            }
+            let mut candidates = Vec::new();
+            for (id, path, is_listed, kept_here) in &scored {
+                if !(*is_listed || *kept_here) {
+                    continue;
+                }
+                let has_mail: bool = self.conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM placements
+                                     WHERE folder_id = ?1 AND uid IS NOT NULL)",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                let held = held_before.get(id).is_some_and(|r| *r == role);
+                // Larger is better; `max_by_key` keeps the last of equals, so
+                // the id is negated to make the lowest win.
+                let key = (
+                    *is_listed,
+                    held,
+                    has_mail,
+                    std::cmp::Reverse(canonical_rank(&role, path)),
+                    std::cmp::Reverse(*id),
+                );
+                candidates.push((key, *id));
+            }
+            let Some(winner) = candidates.iter().max_by_key(|(k, _)| *k).map(|(_, id)| *id) else {
+                // Nothing the server lists and nothing made to stay here:
+                // the role stays where it was until a survey lists a folder
+                // that can take it.
+                continue;
+            };
+            for (id, _, is_listed, kept_here) in scored {
+                if id == winner {
+                    continue;
+                }
+                self.conn
+                    .execute("UPDATE folders SET role = NULL WHERE id = ?1", params![id])?;
+                if !is_listed && !kept_here {
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO placements(message_id, folder_id)
+                         SELECT message_id, ?2 FROM placements
+                          WHERE folder_id = ?1 AND uid IS NULL",
+                        params![id, winner],
+                    )?;
+                    self.conn.execute(
+                        "DELETE FROM placements WHERE folder_id = ?1 AND uid IS NULL",
+                        params![id],
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A folder the user named, looked up by path and created if new.
@@ -776,23 +958,28 @@ impl Store {
             |r| r.get(0),
         )?;
         let mut out = RemapOutcome::default();
-        for (uid, mid) in server {
-            let matched = match mid {
-                Some(mid) => tx.execute(
-                    "UPDATE placements SET uid = ?1 WHERE folder_id = ?2 AND message_id = (
-                         SELECT id FROM messages WHERE account_id = ?3 AND message_id_hdr = ?4
-                     )",
-                    params![*uid as i64, folder_id, account, mid],
+        // Matched only where the listing cannot be wrong about which row a
+        // number belongs to (`claims_by_message_id`). Two messages under one
+        // Message-ID — two rows, or one id listed twice — are fetched again
+        // and placed by their bytes; matching by the id handed the plain row
+        // the other's number and hid the other (docs/25 review).
+        let claims = self.claims_by_message_id(account, server)?;
+        for (uid, claim) in claims {
+            let matched = match claim {
+                Some(holder) => tx.execute(
+                    "UPDATE placements SET uid = ?1 WHERE folder_id = ?2 AND message_id = ?3",
+                    params![uid as i64, folder_id, holder],
                 )?,
                 // No Message-ID on the wire: indistinguishable from mail we
                 // have (whose ingest key was a blob hash), so refetch it and
-                // let ingest's own dedupe decide.
+                // let ingest's own dedupe decide. Likewise an id more than one
+                // message carries.
                 None => 0,
             };
             if matched > 0 {
                 out.rematched += 1;
             } else {
-                out.to_fetch.push(*uid);
+                out.to_fetch.push(uid);
             }
         }
         if complete {
@@ -1006,10 +1193,14 @@ impl Store {
         if self.folder_is_local(folder_id)? {
             return Ok(out);
         }
-        let by_msgid: std::collections::HashMap<&str, u32> = server
-            .iter()
-            .filter_map(|(uid, mid)| mid.as_deref().map(|m| (m, *uid)))
-            .collect();
+        // Each Message-ID the listing holds, with every UID it is listed at.
+        let mut listed: std::collections::HashMap<&str, Vec<u32>> =
+            std::collections::HashMap::new();
+        for (uid, mid) in server {
+            if let Some(m) = mid.as_deref() {
+                listed.entry(m).or_default().push(*uid);
+            }
+        }
         let unaddressed: Vec<(i64, String)> = {
             let mut stmt = self.conn.prepare(&format!(
                 "SELECT p.message_id, coalesce(m.message_id_hdr, '')
@@ -1031,24 +1222,57 @@ impl Store {
         if unaddressed.is_empty() {
             return Ok(out);
         }
+        let account: i64 = self.conn.query_row(
+            "SELECT account_id FROM folders WHERE id = ?1",
+            params![folder_id],
+            |r| r.get(0),
+        )?;
+        // The numbers already given to rows in this folder: a listed copy
+        // under one of them is that row's, not a candidate for another.
+        let numbered: std::collections::HashSet<u32> =
+            self.placement_uids(folder_id)?.into_iter().collect();
         let tx = self.conn.unchecked_transaction()?;
         let mut dropped: Vec<i64> = Vec::new();
         for (message_id, key) in unaddressed {
-            match by_msgid.get(key.as_str()) {
-                Some(uid) => {
-                    tx.execute(
-                        "UPDATE placements SET uid = ?3 WHERE message_id = ?1 AND folder_id = ?2",
-                        params![message_id, folder_id, *uid as i64],
-                    )?;
-                    out.rematched += 1;
-                }
-                None => {
-                    tx.execute(
-                        "DELETE FROM placements WHERE message_id = ?1 AND folder_id = ?2",
-                        params![message_id, folder_id],
-                    )?;
-                    dropped.push(message_id);
-                }
+            // The copies listed under the row's wire id that no other row in
+            // this folder has a number for. None, and the folder holds no
+            // copy that can be this one: the placement goes, as before. One,
+            // and only this row carries the id under its plain key: that is
+            // its number, as before. Anything else — two rows that could be
+            // the copy, the id listed twice, a row under a suffixed key — the
+            // listing cannot settle: the placement stays unnumbered, the copy
+            // is fetched by the folder's own sync, and ingest places it by its
+            // bytes. Matching by the plain key alone gave the plain row a
+            // copy that was another message's, and dropped every row under a
+            // suffixed key as absent (docs/25 review).
+            let free: Vec<u32> = super::wire_message_id(&key)
+                .and_then(|m| listed.get(m))
+                .map(|uids| {
+                    uids.iter()
+                        .copied()
+                        .filter(|u| !numbered.contains(u))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if free.is_empty() {
+                tx.execute(
+                    "DELETE FROM placements WHERE message_id = ?1 AND folder_id = ?2",
+                    params![message_id, folder_id],
+                )?;
+                dropped.push(message_id);
+                continue;
+            }
+            let wire = super::wire_message_id(&key).unwrap_or_default();
+            let only_this_row = listed.get(wire).is_some_and(|uids| uids.len() == 1)
+                && self.sole_holder_of(account, wire)? == Some(message_id);
+            if only_this_row {
+                tx.execute(
+                    "UPDATE placements SET uid = ?3 WHERE message_id = ?1 AND folder_id = ?2",
+                    params![message_id, folder_id, free[0] as i64],
+                )?;
+                out.rematched += 1;
+            } else {
+                out.to_fetch.extend(free);
             }
         }
         out.dropped = dropped.len();
@@ -1187,6 +1411,127 @@ impl Store {
             params![message_id, account_id, folder_path],
         )?;
         Ok(n > 0)
+    }
+
+    /// The one row a server copy known only by its Message-ID can be.
+    ///
+    /// Some paths learn of a server message from a listing — its UID and its
+    /// Message-ID, no bytes: a folder renumbered by a UIDVALIDITY reset, the
+    /// Gmail label sweep, the numbering of the inbox placements that sweep
+    /// makes, and the All Mail walk. Since a different message under a stored
+    /// one's Message-ID became a row of its own (docs/25 #78), more than one
+    /// row can carry an id, and handing a copy to the plain row gave one
+    /// message another's number: a renumbered folder hid the newer of two
+    /// scans and bound its server copy to the older, so deleting the older
+    /// deleted the newer on the server (docs/25 review).
+    ///
+    /// So this answers only where the answer cannot be wrong: exactly one
+    /// live row in the account carries the id, and it is the row under the
+    /// plain key — the case that has always matched. Otherwise `None`, and
+    /// the caller fetches the copy and lets ingest place it by its bytes.
+    pub fn sole_holder_of(&self, account_id: i64, msgid: &str) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT m.id, m.message_id_hdr = ?2 FROM messages m
+              WHERE m.account_id = ?1 AND m.deleted_at_ms IS NULL AND {}
+              LIMIT 2",
+            super::CARRIES_WIRE_ID
+        ))?;
+        let rows: Vec<(i64, bool)> = stmt
+            .query_map(params![account_id, msgid], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(match rows.as_slice() {
+            [(id, true)] => Some(*id),
+            _ => None,
+        })
+    }
+
+    /// Whether no other live row carries this message's Message-ID: no
+    /// different message kept under a content key, and no second copy.
+    ///
+    /// Then a server copy carrying the exact id can only be this message's
+    /// own, whatever its size — and the size is not a fair test for it,
+    /// because one row stands for every copy of the same message (sent to
+    /// yourself, delivered under an alias) and keeps the bytes of one of
+    /// them. The drain asks this before it refuses a copy for its size
+    /// (docs/25 review). A message with no Message-ID carries nothing
+    /// anyone could share.
+    pub fn carries_its_message_id_alone(&self, message_id: i64) -> Result<bool> {
+        let row: Option<(i64, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT account_id, message_id_hdr FROM messages WHERE id = ?1",
+                params![message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((account_id, Some(key))) = row else {
+            return Ok(true);
+        };
+        let Some(wire) = super::wire_message_id(&key) else {
+            return Ok(true);
+        };
+        let others: i64 = self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM messages m
+                  WHERE m.account_id = ?1 AND m.deleted_at_ms IS NULL AND m.id != ?3
+                    AND {}",
+                super::CARRIES_WIRE_ID
+            ),
+            params![account_id, wire, message_id],
+            |r| r.get(0),
+        )?;
+        Ok(others == 0)
+    }
+
+    /// Whether these bytes are this message by every field the identity
+    /// reads (`petrel_mime::feed_identity`): the same message as the row,
+    /// whatever trace headers the copy carries. False when either side
+    /// cannot be read.
+    pub fn is_same_message(
+        &self,
+        blobs: &crate::blob::BlobStore,
+        message_id: i64,
+        raw: &[u8],
+    ) -> Result<bool> {
+        let Some(hash) = self.blob_hash_for(message_id)? else {
+            return Ok(false);
+        };
+        let Ok(stored) = blobs.read(&hash) else {
+            return Ok(false);
+        };
+        Ok(
+            match (
+                super::content_identity(&stored),
+                super::content_identity(raw),
+            ) {
+                (Some((a, _)), Some((b, _))) => a == b,
+                _ => false,
+            },
+        )
+    }
+
+    /// The row each listed server copy may be claimed for without fetching
+    /// it, in the listing's order: `Some` only where `sole_holder_of` answers
+    /// and the listing names the id once. A Message-ID listed twice is two
+    /// messages on the server, and the listing cannot say which is which.
+    pub fn claims_by_message_id(
+        &self,
+        account_id: i64,
+        listed: &[(u32, Option<String>)],
+    ) -> Result<Vec<(u32, Option<i64>)>> {
+        let mut times: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for mid in listed.iter().filter_map(|(_, m)| m.as_deref()) {
+            *times.entry(mid).or_default() += 1;
+        }
+        let mut out = Vec::with_capacity(listed.len());
+        for (uid, mid) in listed {
+            let row = match mid.as_deref() {
+                Some(m) if times.get(m) == Some(&1) => self.sole_holder_of(account_id, m)?,
+                _ => None,
+            };
+            out.push((*uid, row));
+        }
+        Ok(out)
     }
 
     pub fn message_by_msgid(&self, account_id: i64, msgid: &str) -> Result<Option<i64>> {

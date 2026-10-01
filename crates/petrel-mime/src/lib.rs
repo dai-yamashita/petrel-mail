@@ -12,9 +12,11 @@ pub mod utf7;
 
 pub mod darken;
 pub mod ical;
+pub mod identity;
 pub mod parse;
 pub mod sanitize;
 
+pub use identity::{IdentityFacts, feed_identity};
 pub use parse::{
     Attachment, AuthVerdict, Authentication, ParsedMessage, QuotedPicture, Unsubscribe,
     attachment_bytes, authentication, data_url, embed_cid_images, parse_message, quoted_pictures,

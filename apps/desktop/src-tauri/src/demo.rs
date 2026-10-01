@@ -50,6 +50,9 @@ fn wants_demo(value: Option<&str>) -> bool {
 const DEMO_SEED_VERSION: &str = "3";
 
 pub(crate) fn spawn_demo_seeding(state: Arc<AppState>, account: i64) {
+    // Marked before the thread starts, so the window's next status poll
+    // already reads the synthetic mailbox as filling.
+    let seeding = state.mark_seeding(account);
     std::thread::spawn(move || {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -122,7 +125,7 @@ pub(crate) fn spawn_demo_seeding(state: Arc<AppState>, account: i64) {
         // and had no reason ever to look again. It used to come right by
         // accident: every read waited on the store's lock, which decorating
         // holds throughout. Reads have connections of their own now.
-        state.seeding.store(false, Ordering::Relaxed);
+        state.end_seeding(account, seeding);
     });
 }
 
@@ -159,7 +162,6 @@ pub(crate) fn reseed_demo_if_stale(state: &Arc<AppState>, account: i64) -> bool 
         Err(_) => return false,
     }
     state.seeded.store(0, Ordering::Relaxed);
-    state.seeding.store(true, Ordering::Relaxed);
     spawn_demo_seeding(state.clone(), account);
     true
 }

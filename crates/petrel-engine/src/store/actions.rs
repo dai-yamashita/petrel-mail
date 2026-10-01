@@ -593,6 +593,11 @@ impl Store {
             prior,
         };
         let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+        // The queued action and every local change it makes land together.
+        // Written one statement at a time, a failure partway queued a delete
+        // for the server over a message still live here, or tombstoned one
+        // the index still found (docs/25 #92).
+        let unit = self.atomic()?;
         self.conn.execute(
             "INSERT INTO actions(account_id, kind, payload_json, state, created_ms)
              VALUES (?1, ?2, ?3, ?5, ?4)",
@@ -728,6 +733,7 @@ impl Store {
                 }
             }
         }
+        unit.done()?;
 
         Ok(ActionReceipt {
             action_id,
@@ -1251,6 +1257,7 @@ impl Store {
     /// Tombstones one message the way delete-forever does: out of search at
     /// once, bytes reaped by the grace-period sweep rather than here.
     pub fn tombstone_message(&self, message_id: i64) -> Result<()> {
+        let unit = self.atomic()?;
         self.conn.execute(
             "UPDATE messages SET deleted_at_ms = (strftime('%s','now') * 1000)
              WHERE id = ?1 AND deleted_at_ms IS NULL",
@@ -1264,7 +1271,7 @@ impl Store {
             "DELETE FROM placements WHERE message_id = ?1",
             params![message_id],
         )?;
-        Ok(())
+        unit.done()
     }
 
     /// Creates a tag if it is new, returning its id either way. Names are the
@@ -1705,11 +1712,19 @@ impl Store {
         // the draft's own Message-ID, so without this the sweep found the row
         // and filed it like received mail.
         let held = format!(
-            "SELECT m.id FROM messages m
-             WHERE m.account_id = ?1 AND m.message_id_hdr = ?2 AND m.deleted_at_ms IS NULL
-               AND {}",
+            "SELECT 1 FROM messages m WHERE m.id = ?1 AND {}",
             folders::NOT_DRAFT_OR_OUTBOX
         );
+        // The sweep knows each message by its Message-ID alone. An id the
+        // sweep reports twice is two messages on the server, and one that more
+        // than one row carries cannot be told apart without the bytes: filing
+        // the plain row by labels that may be the other message's moved the
+        // wrong one (docs/25 review). Both are left for the fetch to settle.
+        let labelled: Vec<(&str, &[String], Option<u32>)> = labelled.collect();
+        let mut times: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (m, _, _) in &labelled {
+            *times.entry(*m).or_default() += 1;
+        }
 
         for (msg_id, labels, inbox_uid) in labelled {
             // A draft is not filed at all. Gmail keeps one in All Mail with no
@@ -1719,12 +1734,18 @@ impl Store {
             if has(labels, "Draft") {
                 continue;
             }
-            let existing: Option<i64> = self
-                .conn
-                .query_row(&held, params![account_id, msg_id], |r| r.get(0))
-                .optional()?;
-            // Not held. Knowing where a message we do not have lives is not
-            // worth a row we could not open.
+            if times.get(msg_id) != Some(&1) {
+                continue;
+            }
+            let existing = match self.sole_holder_of(account_id, msg_id)? {
+                Some(id) => self
+                    .conn
+                    .query_row(&held, params![id], |_| Ok(id))
+                    .optional()?,
+                None => None,
+            };
+            // Not held, or not held by one row. Knowing where a message we do
+            // not have lives is not worth a row we could not open.
             let Some(id) = existing else { continue };
             if self.message_has_pending(id)? {
                 continue;

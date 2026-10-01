@@ -47,6 +47,7 @@ async fn a_pasted_image_survives_real_delivery() {
         from_name: "Petrel Live Test".into(),
         to: vec![to.clone()],
         cc: vec![],
+        bcc: vec![],
         subject: "Petrel: pasted image, end to end".into(),
         body_text: "One pasted pixel below.\n[image]".into(),
         body_html: Some(format!(

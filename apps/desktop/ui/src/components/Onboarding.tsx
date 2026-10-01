@@ -30,7 +30,16 @@ function domainOf(address: string): string {
   return address.slice(address.lastIndexOf('@') + 1).toLowerCase();
 }
 
-export function Onboarding({ onDone }: { onDone: (added: { id: number; email: string } | null) => void }) {
+export function Onboarding({
+  onDone,
+  onAdded,
+}: {
+  onDone: (added: { id: number; email: string } | null) => void;
+  /** The account is stored and syncing. Said at once rather than at "Start
+   *  reading": on a first run the window replaces this screen with the
+   *  mailbox as soon as the account exists, and never gets to `onDone`. */
+  onAdded?: (added: { id: number; email: string }) => void;
+}) {
   const [step, setStep] = useState<Step>({ kind: 'ask' });
   const [address, setAddress] = useState('');
   const [password, setPassword] = useState('');
@@ -109,6 +118,7 @@ export function Onboarding({ onDone }: { onDone: (added: { id: number; email: st
     try {
       const id = await api.addAccount(setup);
       setAdded({ id, email: setup.email });
+      onAdded?.({ id, email: setup.email });
       setStep({ kind: 'syncing', address: setup.email });
     } catch (e) {
       setError(t('onb-add-failed', { error: String(e) }));
@@ -371,7 +381,7 @@ function TestLine({ state }: { state: 'idle' | 'imap' | 'smtp' | 'ok' | string }
   return <p className="onb-test bad">{t('onb-failed', { error: state })}</p>;
 }
 
-function ServerFields({
+export function ServerFields({
   label,
   value,
   onChange,

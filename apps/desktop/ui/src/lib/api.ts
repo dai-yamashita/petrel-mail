@@ -81,6 +81,22 @@ export type AccountSetup = {
   provider: string;
 };
 
+/** Why Petrel cannot sign in to an account: no password it can read, or one
+ *  the server refused. Either way the window offers "Sign in again". */
+export type SignIn = 'missing' | 'refused';
+
+/** Where an account signs in, to start the "Sign in again" form from.
+ *  Never its password. */
+export type AccountForm = {
+  email: string;
+  username: string;
+  imap_host: string;
+  imap_port: number;
+  smtp_host: string;
+  smtp_port: number;
+  provider: string;
+};
+
 /** One message in the outbox, with where its send attempt left it. */
 export type OutboxRow = {
   id: number;
@@ -154,6 +170,9 @@ export type ThreadMessage = {
   to: string[];
   /** Cc, display names. Empty when the message copied nobody. */
   cc: string[];
+  /** Bcc, display names: on your own sent copies, where the header was kept.
+   *  Never part of `recipients` or `recipient_addrs`, so no reply reaches them. */
+  bcc?: string[];
   recipients: string[];
   recipient_addrs: string[];
   attachments: Attachment[];
@@ -217,12 +236,17 @@ export type Account = {
   unread_count: number;
   newest_ms: number | null;
   folders: FolderMapping[];
+  /** Set when the account needs its password entered again. */
+  signin?: SignIn | null;
 };
 
 export type DraftEnvelope = {
   in_reply_to: string | null;
   references: string[];
   attachments: string[];
+  /** Blind copies as the composer's field holds them, comma-separated.
+   *  Absent from a draft saved before there was a Bcc. */
+  bcc?: string;
 };
 
 export type DraftRecord = {
@@ -331,6 +355,9 @@ export type ActionReceipt = {
 };
 
 export type Status = {
+  /** The account this describes: the one on screen when it was read. See
+   *  `statusFor`, which is how the window reads it. */
+  account?: number | null;
   /** Whether any account can sign in. `false` means first run: show
    *  onboarding rather than an empty mailbox. */
   configured: boolean;
@@ -341,6 +368,12 @@ export type Status = {
   /** Present when a sync failed. A login that fails must not read as an empty
    *  mailbox — the two look identical until something says so. */
   sync_error?: string | null;
+  /** Why the account on screen cannot sign in, if it cannot. */
+  signin?: SignIn | null;
+  /** Every account that cannot sign in, on screen or not. */
+  signins?: { account: number; signin: SignIn }[];
+  /** The account on screen is in its first pass: at launch, just added, or
+   *  just signed in again. */
   seeding: boolean;
   count: number;
   /** What the server holds across the synced folders, or 0 before it is asked.
@@ -351,6 +384,9 @@ export type Status = {
   data_dir: string;
   /** Arrivals a rule marked notify-anyway: [who, subject], said once. */
   notify?: [string, string][];
+  /** New mail in the inboxes of accounts not on screen, drained by the
+   *  engine as it hands them over, so each is said once. */
+  elsewhere?: { account: number; who: string; subject: string }[];
   /** Something that happened to the user's own mail and has to be said, by
    *  key: today only `sent-copy-failed`. Drained on read, like `notify`, so
    *  each one arrives once. */
@@ -667,7 +703,7 @@ const mock = {
   identity: async (): Promise<Identity> => ({
     address: 'you@example.com', display_name: 'You', signature: '', signature_on_reply: false,
   }),
-  setIdentity: async () => {},
+  setIdentity: async (_accountId: number) => {},
   saveDraft: async () => 1,
   loadDraft: async (): Promise<DraftRecord> => ({
     id: 1,
@@ -709,7 +745,7 @@ const mock = {
   respondInvitation: async () => {},
   draftConflict: async (): Promise<{ other_id: number } | null> => null,
   resolveDraftConflict: async () => {},
-  emptyTrash: async (): Promise<string> => '12/0',
+  emptyTrash: async (_accountId: number): Promise<string> => '12/0',
   folderMessageCount: async () => 1204,
   markFolderRead: async () => 37,
   trashFolderContents: async () => 1204,
@@ -781,6 +817,12 @@ const mock = {
   testAccount: async () => {},
   addAccount: async () => 2,
   removeAccount: async () => {},
+  accountForm: async (_accountId: number): Promise<AccountForm> => ({
+    email: 'you@example.com', username: 'you@example.com',
+    imap_host: 'imap.example.com', imap_port: 993,
+    smtp_host: 'smtp.example.com', smtp_port: 465, provider: '',
+  }),
+  updateAccount: async (_accountId: number, _setup: AccountSetup) => {},
   setActiveAccount: async () => {},
   attachmentIsExecutable: async (filename: string) =>
     /\.(exe|bat|sh|js|jar|dmg|app|py)$/i.test(filename),
@@ -914,6 +956,12 @@ const real = {
     invoke<void>('test_account', { setup, which: which ?? null }),
   addAccount: (setup: AccountSetup) => invoke<number>('add_account', { setup }),
   removeAccount: (accountId: number) => invoke<void>('remove_account', { accountId }),
+  /** Where an account signs in, without its password. */
+  accountForm: (accountId: number) => invoke<AccountForm>('account_form', { accountId }),
+  /** Signs an account in again. Tested with the server first: a password
+   *  it refuses changes nothing, and the error says which server and why. */
+  updateAccount: (accountId: number, setup: AccountSetup) =>
+    invoke<void>('update_account', { accountId, setup }),
   setActiveAccount: (accountId: number) => invoke<void>('set_active_account', { accountId }),
   attachmentIsExecutable: (filename: string) =>
     invoke<boolean>('attachment_is_executable', { filename }),
@@ -950,7 +998,10 @@ const real = {
   draftConflict: (id: number) => invoke<{ other_id: number } | null>('draft_conflict', { id }),
   resolveDraftConflict: (id: number, otherId: number, takeServer: boolean) =>
     invoke<void>('resolve_draft_conflict', { id, otherId, takeServer }),
-  emptyTrash: () => invoke<string>('empty_trash'),
+  // The account the confirmation was opened on, never the one on screen at the
+  // moment of confirming: ⌘2 under the open dialog used to empty the other
+  // account's Trash, permanently.
+  emptyTrash: (accountId: number) => invoke<string>('empty_trash', { accountId }),
   folderMessageCount: (folderId: number) =>
     invoke<number>('folder_message_count', { folderId }),
   markFolderRead: (folderId: number, read: boolean) =>
@@ -1076,8 +1127,12 @@ const real = {
   importMail: (paths: string[]) =>
     invoke<{ imported: number; duplicates: number; failed: number }>('import_mail', { paths }),
   identity: () => invoke<Identity>('get_identity'),
-  setIdentity: (displayName: string, signature: string, signatureOnReply: boolean) =>
-    invoke<void>('set_identity', { displayName, signature, signatureOnReply }),
+  setIdentity: (
+    accountId: number,
+    displayName: string,
+    signature: string,
+    signatureOnReply: boolean,
+  ) => invoke<void>('set_identity', { accountId, displayName, signature, signatureOnReply }),
   // The whole message, not only its text. A draft that drops its cc, its
   // reply headers or its attachments is fine as long as a draft is only ever
   // a draft; once every send waits in the outbox, it is the message.
@@ -1087,12 +1142,19 @@ const real = {
     subject: string,
     body: string,
     html: string,
-    rest: { cc?: string; inReplyTo?: string | null; references?: string[]; attachments?: string[] } = {},
+    rest: {
+      cc?: string;
+      bcc?: string;
+      inReplyTo?: string | null;
+      references?: string[];
+      attachments?: string[];
+    } = {},
   ) =>
     invoke<number>('save_draft', {
       draftId,
       to,
       cc: rest.cc ?? '',
+      bcc: rest.bcc ?? '',
       subject,
       body,
       html,

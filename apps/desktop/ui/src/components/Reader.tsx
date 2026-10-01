@@ -45,6 +45,7 @@ import { useHoveredLink } from '../lib/links';
 import { Marked } from '../lib/search-highlight';
 import { t } from '../lib/strings';
 import { Unsubscribe } from './Unsubscribe';
+import { mailKeyAllowed } from '../lib/useKeyboard';
 
 /** A message that is not the one you came here to read: one line, expandable. */
 function messageFromCard(
@@ -165,11 +166,18 @@ function Expanded({
                 <SenderAuth messageId={m.id} />
               </span>
             </span>
-            {(m.to.length > 0 || m.cc.length > 0) && (
+            {(m.to.length > 0 || m.cc.length > 0 || (m.bcc?.length ?? 0) > 0) && (
               <span className="msg-to">
-                {m.to.length > 0 && t('reader-to', { who: m.to.join(', ') })}
-                {m.to.length > 0 && m.cc.length > 0 && ' · '}
-                {m.cc.length > 0 && t('reader-cc', { who: m.cc.join(', ') })}
+                {/* Bcc appears only on your own copy, where the header was
+                    kept: who you blind-copied, as Apple Mail and Thunderbird
+                    show it. */}
+                {[
+                  m.to.length > 0 && t('reader-to', { who: m.to.join(', ') }),
+                  m.cc.length > 0 && t('reader-cc', { who: m.cc.join(', ') }),
+                  (m.bcc?.length ?? 0) > 0 && t('reader-bcc', { who: m.bcc!.join(', ') }),
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}
               </span>
             )}
           </span>
@@ -449,6 +457,8 @@ export function Reader({
   // never see the ones that matter most.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      // The same rule as every other single key, though these only scroll.
+      if (!mailKeyAllowed(e)) return;
       const body = bodyRef.current;
       const reader = body?.closest('.reader');
       // Only when the reading pane is where the user is. Otherwise Space would
@@ -610,16 +620,9 @@ export function Reader({
     const onKey = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key !== '[' && e.key !== ']') return;
-      const el = e.target instanceof HTMLElement ? e.target : null;
-      if (
-        el &&
-        (el.tagName === 'INPUT' ||
-          el.tagName === 'TEXTAREA' ||
-          el.isContentEditable)
-      ) {
-        return;
-      }
-      if (document.querySelector('[role="dialog"]:not([hidden])')) return;
+      // The rule every single key obeys; see `mailKeyAllowed`. Kept here, [
+      // and ] stepped and read messages from the composer's toolbar.
+      if (!mailKeyAllowed(e)) return;
       if (loadedThreadIdRef.current !== threadIdRef.current) return;
 
       const list = cardsRef.current;
@@ -751,7 +754,7 @@ export function Reader({
 
   if (!thread) {
     return (
-      <section className="reader" aria-label={t('reader-none-title')}>
+      <section className="reader" aria-label={t('reader-none-title')} tabIndex={-1}>
         <div className="empty">
           <h2>{t('reader-none-title')}</h2>
           <p>{t('reader-none-body')}</p>
@@ -763,7 +766,10 @@ export function Reader({
   const paneReady = hold;
 
   return (
-    <section className="reader" aria-label={subject}>
+    // Focusable at -1: a click on the header's text puts focus in the reader,
+    // not on the page, where single keys are refused while a message is
+    // being written.
+    <section className="reader" aria-label={subject} tabIndex={-1}>
       <header className="reader-head">
         <div className="reader-headrow">
           <div className="reader-title">

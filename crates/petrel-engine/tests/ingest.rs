@@ -81,23 +81,31 @@ fn resync_of_the_same_message_updates_instead_of_duplicating() {
     assert_eq!(again.message_id, first.message_id);
     assert_eq!(store.message_count().expect("count"), 1);
 
-    // And a server-side edit (same ID, changed content) refreshes the index
-    // rather than leaving a stale copy searchable.
-    let edited = fixture(
+    // Other words under the same ID are not an edit: IMAP never changes a
+    // delivered message, and a Message-ID is no secret, so anyone could
+    // otherwise rewrite what is stored (docs/25 #78; message_identity.rs).
+    // It is another message, stored beside the first, and each is found by
+    // its own words.
+    let other = fixture(
         "stable-id@example.com",
         "Amended subject",
         "second body zephyr",
     );
     let third = store
-        .ingest_raw(&blobs, account, None, Some(1), &edited)
-        .expect("edit");
-    assert_eq!(third.message_id, first.message_id);
-    assert_eq!(store.message_count().expect("count"), 1);
+        .ingest_raw(&blobs, account, None, Some(1), &other)
+        .expect("other");
+    assert_ne!(third.message_id, first.message_id);
+    assert!(third.was_new);
+    assert_eq!(store.message_count().expect("count"), 2);
     assert_eq!(store.search("zephyr", 10).expect("search").len(), 1);
-    assert!(
-        store.search("first body", 10).expect("search").is_empty(),
-        "superseded content must not linger in the index"
-    );
+    assert_eq!(store.search("first body", 10).expect("search").len(), 1);
+
+    // And fetched again, each lands on its own row.
+    let fourth = store
+        .ingest_raw(&blobs, account, None, Some(1), &other)
+        .expect("other again");
+    assert_eq!(fourth.message_id, third.message_id);
+    assert_eq!(store.message_count().expect("count"), 2);
     store.fts_integrity_check().expect("index consistent");
 }
 

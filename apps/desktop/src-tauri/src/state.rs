@@ -27,7 +27,22 @@ pub(crate) struct AppState {
     pub(crate) read_index: Mutex<Store>,
     pub(crate) readers_live: AtomicBool,
     pub(crate) blobs: BlobStore,
-    pub(crate) seeding: AtomicBool,
+    /// Accounts whose first pass is running, each with the mark that began
+    /// it. See `mark_seeding` in signin.rs.
+    pub(crate) seeding: Mutex<HashMap<i64, u64>>,
+    pub(crate) seeding_marks: std::sync::atomic::AtomicU64,
+    /// Accounts Petrel cannot sign in to, why, and since when (ms). See
+    /// signin.rs: a missing password waits for one, and a refused one is
+    /// asked about once an hour rather than every couple of minutes.
+    pub(crate) signin: Mutex<HashMap<i64, (crate::signin::SignIn, i64)>>,
+    /// Bumped on every change to `signin`, so a worker standing down can
+    /// wait for the change rather than poll for it.
+    pub(crate) signin_changed: tokio::sync::watch::Sender<u64>,
+    /// Work an account could not do while signed out: draft pushes, and the
+    /// removal of sent or discarded drafts' server copies. See signin.rs.
+    pub(crate) held: Mutex<HashMap<i64, crate::signin::Held>>,
+    /// One change to an account's sign-in at a time (`account_turn`).
+    pub(crate) turns: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
     /// True when the window is showing synthetic mail because no account is
     /// configured. The UI needs to tell that apart from a first run: both have
     /// no account, but one has a mailbox to show and the other has onboarding
@@ -103,6 +118,11 @@ pub(crate) struct AppState {
     /// poll to carry them to the announcer. Drained on read: each is said
     /// once.
     pub(crate) pending_notify: Mutex<Vec<(String, String)>>,
+    /// New mail in the inbox of an account that is not on screen, waiting
+    /// for the next status poll to carry it to the announcer: the window
+    /// watches only the inbox of the account it shows. Drained on read;
+    /// each is said once. See `announce_elsewhere`.
+    pub(crate) pending_elsewhere: Mutex<Vec<Elsewhere>>,
     /// Things a worker needs the person to know, by key, waiting for the
     /// next status poll. The window owns the words: a worker has no
     /// language of its own, and on two of the three platforms no way to
@@ -172,12 +192,26 @@ pub(crate) struct OutboxSignals {
     pub(crate) clock: tokio::sync::Notify,
 }
 
+/// One message new to the inbox of an account that is not on screen: who it
+/// is from and what it is about, for the window to say, and whose it is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Elsewhere {
+    pub(crate) account: i64,
+    pub(crate) who: String,
+    pub(crate) subject: String,
+}
+
 /// What one account's server advertised when it was probed.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ServerCaps {
     pub(crate) has_move: bool,
     pub(crate) has_uidplus: bool,
     pub(crate) is_gmail: bool,
+    pub(crate) has_idle: bool,
+    /// A probe has answered this session. Until one does, every `false`
+    /// above means "not known yet", not "the server cannot" — a launch with
+    /// no network never ran its probe.
+    pub(crate) known: bool,
 }
 
 impl AppState {
@@ -601,7 +635,12 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Arc<AppState> {
         read_index: Mutex::new(Store::open_in_memory().expect("reader")),
         readers_live: AtomicBool::new(false),
         blobs: BlobStore::open(&dir.join("blobs")).expect("blobs"),
-        seeding: AtomicBool::new(false),
+        seeding: Mutex::new(HashMap::new()),
+        seeding_marks: std::sync::atomic::AtomicU64::new(0),
+        signin: Mutex::new(HashMap::new()),
+        signin_changed: tokio::sync::watch::channel(0).0,
+        held: Mutex::new(HashMap::new()),
+        turns: Mutex::new(HashMap::new()),
         demo: AtomicBool::new(false),
         seeded: AtomicUsize::new(0),
         status_count: AtomicUsize::new(0),
@@ -618,6 +657,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Arc<AppState> {
         folder_sync_inflight: Mutex::new(HashSet::new()),
         folder_synced_at: Mutex::new(HashMap::new()),
         pending_notify: Mutex::new(Vec::new()),
+        pending_elsewhere: Mutex::new(Vec::new()),
         pending_alerts: Mutex::new(Vec::new()),
         last_sync_ms: std::sync::atomic::AtomicI64::new(0),
         extraction_gen: std::sync::atomic::AtomicI64::new(0),
@@ -748,6 +788,7 @@ mod worker_switch_tests {
                 has_move: true,
                 has_uidplus: true,
                 is_gmail: true,
+                ..Default::default()
             },
         );
         assert!(all.get(&1).copied().unwrap_or_default().is_gmail);
@@ -768,6 +809,7 @@ mod worker_switch_tests {
                 has_move: true,
                 has_uidplus: true,
                 is_gmail: false,
+                ..Default::default()
             },
         );
         assert!(!state.surveyed(1), "capabilities are not a stored survey");

@@ -188,6 +188,13 @@ pub struct Outgoing {
     pub from_name: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
+    /// Blind copies: on the envelope, and in no header that travels.
+    ///
+    /// The wire copy names nobody here, which is what makes the copy blind.
+    /// The copy the sender keeps, in Sent and in Drafts, does name them
+    /// (`sender_copy`), so the person can still see whom they copied. That is
+    /// how Thunderbird and Apple Mail keep it.
+    pub bcc: Vec<String>,
     pub subject: String,
     pub body_text: String,
     /// The rich-text half, when there is one.
@@ -617,6 +624,7 @@ impl Outgoing {
         let message_id = bare_id(message_id);
         let to = parse_recipients(&self.to);
         let cc = parse_recipients(&self.cc);
+        let blind_only = to.is_empty() && cc.is_empty() && !parse_recipients(&self.bcc).is_empty();
         let in_reply_to = self.in_reply_to.as_deref().map(bare_id);
         let references: Vec<String> = self
             .references
@@ -721,6 +729,16 @@ impl Outgoing {
         // recipient but one after Sent-folder ingest.
         if !to.is_empty() {
             b = b.to(address_list(&to));
+        } else if blind_only {
+            // Nobody to name, only blind copies. RFC 5322 lets To go unwritten,
+            // but a message with no To at all is a spam signal, so it is the
+            // empty group every client reads as "not shown", written as
+            // Thunderbird writes it. Raw, because mail-builder quotes a group's
+            // name and this spelling is the one filters know.
+            b = b.header(
+                "To",
+                mail_builder::headers::raw::Raw::new("undisclosed-recipients: ;"),
+            );
         }
         if !cc.is_empty() {
             b = b.cc(address_list(&cc));
@@ -746,15 +764,54 @@ impl Outgoing {
     pub fn unsendable(&self) -> Vec<String> {
         let mut all: Vec<String> = self.to.clone();
         all.extend(self.cc.iter().cloned());
+        all.extend(self.bcc.iter().cloned());
         unsendable_recipients(&all)
     }
 
+    /// Blind copies included: they are on the envelope and nowhere else.
     pub fn recipients(&self) -> Vec<String> {
         self.to
             .iter()
             .chain(self.cc.iter())
+            .chain(self.bcc.iter())
             .filter_map(|raw| parse_recipient(raw).map(|r| r.address))
             .collect()
+    }
+
+    /// The copy the sender keeps: the wire bytes with a Bcc header naming the
+    /// blind copies, for Sent and for the server's Drafts.
+    ///
+    /// Added to the bytes that went out rather than rendered again, so the
+    /// two copies agree on everything but that one header: the same
+    /// Message-ID, Date, boundaries and body. A second rendering would stamp
+    /// its own Date and its own boundaries. With no blind copies the copy is
+    /// the wire copy, byte for byte.
+    ///
+    /// The header goes at the end of the message's own header block, before
+    /// the blank line that ends it. mail-builder folds every long value
+    /// onto continuation lines, so the first blank line is that one.
+    pub fn sender_copy(&self, wire: &[u8]) -> Vec<u8> {
+        use mail_builder::headers::Header as _;
+        let bcc = parse_recipients(&self.bcc);
+        if bcc.is_empty() {
+            return wire.to_vec();
+        }
+        let Some(end) = wire.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return wire.to_vec();
+        };
+        let mut line = b"Bcc: ".to_vec();
+        if address_list(&bcc)
+            .write_header(&mut line, "Bcc: ".len())
+            .is_err()
+        {
+            return wire.to_vec();
+        }
+        let at = end + 2;
+        let mut out = Vec::with_capacity(wire.len() + line.len());
+        out.extend_from_slice(&wire[..at]);
+        out.extend_from_slice(&line);
+        out.extend_from_slice(&wire[at..]);
+        out
     }
 
     /// The address the envelope says the mail is from, if it can be sent as
@@ -1346,15 +1403,6 @@ pub async fn send_tls_with(
     raw: &[u8],
     mut stage: impl FnMut(&'static str),
 ) -> SendResult {
-    macro_rules! fail_before {
-        ($stage:expr, $e:expr) => {
-            return SendResult::FailedBeforeCommit {
-                stage: $stage,
-                detail: $e.to_string(),
-            }
-        };
-    }
-
     // Connect, upgrade if the port needs it, greet, EHLO — and sign in with a
     // mechanism this server named rather than the one mechanism this used to
     // know.
@@ -1371,10 +1419,38 @@ pub async fn send_tls_with(
     if let Err(e) = authenticate(&mut reader, &mut tx, cfg, &auth).await {
         return e.into_send_result();
     }
+    transmit(&mut reader, &mut tx, msg, raw, &mut stage).await
+}
+
+/// The envelope and the message, on a connection already signed in to.
+///
+/// Apart from the TLS `send_tls_with` opens it on, so the part that decides
+/// who receives the message, and what they receive, can be checked against a
+/// scripted server: the shipping stream is TLS, and a loopback socket cannot
+/// present a certificate this client would accept.
+async fn transmit<R, W>(
+    reader: &mut R,
+    tx: &mut W,
+    msg: &Outgoing,
+    raw: &[u8],
+    stage: &mut impl FnMut(&'static str),
+) -> SendResult
+where
+    R: AsyncBufReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    macro_rules! fail_before {
+        ($stage:expr, $e:expr) => {
+            return SendResult::FailedBeforeCommit {
+                stage: $stage,
+                detail: $e.to_string(),
+            }
+        };
+    }
 
     macro_rules! expect {
         ($stage:expr, $want:expr) => {{
-            let reply = match tokio::time::timeout(reply_timeout(), read_reply(&mut reader)).await {
+            let reply = match tokio::time::timeout(reply_timeout(), read_reply(reader)).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => fail_before!($stage, e),
                 Err(_) => fail_before!($stage, "timed out waiting for the server"),
@@ -1460,7 +1536,7 @@ pub async fn send_tls_with(
         }
     }
     stage("confirm");
-    let acknowledged = match tokio::time::timeout(commit_timeout(), read_reply(&mut reader)).await {
+    let acknowledged = match tokio::time::timeout(commit_timeout(), read_reply(reader)).await {
         Ok(r) => r,
         // The message went and the answer never came. Exactly the case the
         // outcome exists for: retrying could duplicate it, so somebody has to
@@ -1664,6 +1740,96 @@ mod tests {
         assert!(!ehlo_offers(OUTLOOK_EHLO, "STARTTLS"));
         // The greeting text is not a capability list, whatever it contains.
         assert!(!ehlo_offers("220 starttls.example ESMTP", "STARTTLS"));
+    }
+
+    /// What a scripted submission server heard: every command, and the
+    /// message as it arrived after DATA.
+    async fn transmit_to_script(msg: &Outgoing, raw: &[u8]) -> (SendResult, Vec<String>, String) {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let heard = tokio::spawn(async move {
+            let (rx, mut tx) = tokio::io::split(server);
+            let mut reader = BufReader::new(rx);
+            let mut commands = Vec::new();
+            let mut data = String::new();
+            let mut in_data = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                if in_data {
+                    if line == ".\r\n" {
+                        in_data = false;
+                        let _ = tx.write_all(b"250 2.0.0 queued\r\n").await;
+                    } else {
+                        data.push_str(&line);
+                    }
+                    continue;
+                }
+                commands.push(line.trim_end().to_string());
+                let upper = line.to_ascii_uppercase();
+                let reply: &[u8] = if upper.starts_with("DATA") {
+                    in_data = true;
+                    b"354 go ahead\r\n"
+                } else if upper.starts_with("QUIT") {
+                    let _ = tx.write_all(b"221 bye\r\n").await;
+                    break;
+                } else {
+                    b"250 ok\r\n"
+                };
+                if tx.write_all(reply).await.is_err() {
+                    break;
+                }
+            }
+            (commands, data)
+        });
+        let (rx, mut tx) = tokio::io::split(client);
+        let mut reader = BufReader::new(rx);
+        let result = transmit(&mut reader, &mut tx, msg, raw, &mut |_| {}).await;
+        let (commands, data) = heard.await.unwrap();
+        (result, commands, data)
+    }
+
+    /// A blind copy is on the envelope and nowhere in what the server is
+    /// handed: no Bcc header, and not the address anywhere in the message.
+    #[tokio::test]
+    async fn a_blind_copy_is_on_the_envelope_and_nowhere_in_the_message() {
+        let msg = Outgoing {
+            from_addr: "sam@example.com".into(),
+            from_name: "Sam Ortiz".into(),
+            to: vec!["Dana Wu <dana@example.com>".into()],
+            cc: vec![],
+            bcc: vec!["Priya Nair <priya@example.net>".into()],
+            subject: "Numbers".into(),
+            body_text: "In.".into(),
+            body_html: None,
+            in_reply_to: None,
+            references: vec![],
+            attachments: vec![],
+        };
+        let (_, raw) = msg.render("example.com");
+        let (result, commands, data) = transmit_to_script(&msg, &raw).await;
+        assert!(matches!(result, SendResult::Committed { .. }), "{result:?}");
+        assert_eq!(
+            commands,
+            vec![
+                "MAIL FROM:<sam@example.com>",
+                "RCPT TO:<dana@example.com>",
+                "RCPT TO:<priya@example.net>",
+                "DATA",
+                "QUIT",
+            ]
+        );
+        let headers = data.split("\r\n\r\n").next().unwrap_or_default();
+        assert!(
+            !headers
+                .lines()
+                .any(|l| l.to_ascii_lowercase().starts_with("bcc:")),
+            "{headers}"
+        );
+        assert!(!data.contains("priya@example.net"), "{data}");
+        assert!(!data.contains("Priya Nair"), "{data}");
+        assert!(data.contains("dana@example.com"), "{data}");
     }
 
     /// Drives `authenticate` against a scripted peer and reports what the

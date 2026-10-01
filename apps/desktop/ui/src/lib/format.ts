@@ -86,6 +86,12 @@ export function fullTime(ms: number): string {
   return full.format(new Date(ms));
 }
 
+/** Names joined the way the language joins a list: "Sam and Dana",
+ *  "Sam und Dana", "Sam、Dana". */
+export function nameList(names: string[]): string {
+  return new Intl.ListFormat(locale, { type: 'conjunction', style: 'long' }).format(names);
+}
+
 export function count(n: number): string {
   return new Intl.NumberFormat(locale).format(n);
 }

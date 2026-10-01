@@ -107,23 +107,10 @@ fn thread_detail_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadDetailRow> {
     ))
 }
 
-/// The wire Message-ID behind a stored dedupe key, if the key is one.
-///
-/// The key is the header when the message had one, and stands in for it
-/// otherwise: a blob hash for a message with no Message-ID, and a `::copy-N`
-/// suffix on a second server copy of the same message. A reply must name
-/// only the real thing — an invented id threads with nothing, and a
-/// suffixed one threads with nothing either.
+/// The wire Message-ID behind a stored dedupe key, if the key is one; see
+/// [`super::wire_message_id`].
 fn wire_msgid(key: Option<String>) -> Option<String> {
-    let key = key?;
-    if key.is_empty() || key.starts_with("blake3:") {
-        return None;
-    }
-    let bare = match key.find("::copy-") {
-        Some(at) => &key[..at],
-        None => key.as_str(),
-    };
-    (!bare.is_empty()).then(|| bare.to_string())
+    super::wire_message_id(&key?).map(str::to_string)
 }
 
 /// Display name and addr_norm, in header order, split by role.
@@ -131,6 +118,7 @@ fn wire_msgid(key: Option<String>) -> Option<String> {
 struct MessageAddrs {
     to: Vec<(String, String)>,
     cc: Vec<(String, String)>,
+    bcc: Vec<(String, String)>,
 }
 
 fn sql_in_marks(n: usize) -> String {
@@ -1562,6 +1550,8 @@ impl Store {
                     entry.to.push((display, addr));
                 } else if role == "cc" {
                     entry.cc.push((display, addr));
+                } else if role == "bcc" {
+                    entry.bcc.push((display, addr));
                 }
             }
         }
@@ -1653,6 +1643,7 @@ impl Store {
             let buckets = addrs.get(&id).cloned().unwrap_or_default();
             let to: Vec<String> = buckets.to.iter().map(|(d, _)| d.clone()).collect();
             let cc: Vec<String> = buckets.cc.iter().map(|(d, _)| d.clone()).collect();
+            let bcc: Vec<String> = buckets.bcc.iter().map(|(d, _)| d.clone()).collect();
             let recipients: Vec<String> = to.iter().chain(cc.iter()).cloned().collect();
             let recipient_addrs: Vec<String> = buckets
                 .to
@@ -1674,6 +1665,7 @@ impl Store {
                 invite_response,
                 to,
                 cc,
+                bcc,
                 recipients,
                 recipient_addrs,
                 attachments,

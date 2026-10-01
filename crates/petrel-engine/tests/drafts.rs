@@ -390,6 +390,7 @@ mod the_whole_message {
             in_reply_to: Some("<parent@example.com>".into()),
             references: vec!["<root@example.com>".into(), "<parent@example.com>".into()],
             attachments: vec!["/tmp/board-pack.pdf".into()],
+            bcc: "board@example.org".into(),
         };
         let id = store
             .save_draft_full(

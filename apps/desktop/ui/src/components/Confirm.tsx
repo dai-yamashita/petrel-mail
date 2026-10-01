@@ -14,6 +14,15 @@ type Props = {
   confirmLabel: string;
   onConfirm: () => void;
   onClose: () => void;
+  /** A safe thing to do first, on the footer's far side from the verb:
+   *  "Export first…" before an account's local mail is deleted. */
+  extra?: { label: string; onClick: () => void; disabled?: boolean } | null;
+  /** What that safe thing came to, said under the detail. */
+  note?: string | null;
+  /** The verb held back while the safe thing runs: removing an account
+   *  while its export is still being written would take the export's
+   *  source away. */
+  confirmDisabled?: boolean;
 };
 
 /**
@@ -29,7 +38,17 @@ type Props = {
  * or click. For the same reason the destructive button is never the one Enter
  * finds by default.
  */
-export function Confirm({ open, title, detail, confirmLabel, onConfirm, onClose }: Props) {
+export function Confirm({
+  open,
+  title,
+  detail,
+  confirmLabel,
+  onConfirm,
+  onClose,
+  extra,
+  note,
+  confirmDisabled,
+}: Props) {
   const cancel = useRef<HTMLButtonElement>(null);
 
   // Ariakit keeps the dialog mounted and hidden, so this has to run on each
@@ -43,6 +62,10 @@ export function Confirm({ open, title, detail, confirmLabel, onConfirm, onClose 
     <Dialog
       open={open}
       onClose={onClose}
+      // Ariakit puts focus on the first thing in the dialog that takes it,
+      // which since "Export first…" is that button, not Cancel; the effect
+      // above then raced it. Named here, Cancel is where focus lands.
+      initialFocus={cancel}
       className="confirm-backdrop"
       {...clickAway(onClose)}
       backdrop={<div className="palette-scrim" onClick={onClose} />}
@@ -54,11 +77,41 @@ export function Confirm({ open, title, detail, confirmLabel, onConfirm, onClose 
       <div className="confirm" role="alertdialog" aria-label={title}>
         <div className="confirm-title">{title}</div>
         {detail && <p className="confirm-detail">{detail}</p>}
+        {/* Mounted with the dialog, and never hidden: empty until there is
+            something to say, when it takes no room (confirm.css). A polite
+            region that appears along with its text is not reliably announced,
+            WebKit least of all, and `hidden` kept this one out of the
+            accessibility tree until its text came. */}
+        <p className="confirm-detail confirm-note" role="status" aria-live="polite">
+          {note || null}
+        </p>
         <div className="confirm-foot">
+          {extra && (
+            <>
+              {/* Held back with aria-disabled, not disabled: the button that
+                  starts the export is the one with focus, and a disabled
+                  button lets it fall to the page for as long as the export
+                  runs. */}
+              <button
+                type="button"
+                className="reply"
+                onClick={extra.disabled ? undefined : extra.onClick}
+                aria-disabled={extra.disabled || undefined}
+              >
+                {extra.label}
+              </button>
+              <span className="spacer" />
+            </>
+          )}
           <DialogDismiss ref={cancel} className="reply">
             {t('cancel')}
           </DialogDismiss>
-          <button type="button" className="reply danger" onClick={onConfirm}>
+          <button
+            type="button"
+            className="reply danger"
+            onClick={confirmDisabled ? undefined : onConfirm}
+            aria-disabled={confirmDisabled || undefined}
+          >
             {confirmLabel}
           </button>
         </div>
