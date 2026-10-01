@@ -76,7 +76,7 @@ pub fn attachment_is_executable(filename: String) -> bool {
 /// Office opens the document in Protected View and SmartScreen has something
 /// to check; without it a document that arrived by mail is indistinguishable
 /// from one the person wrote themselves. macOS has the same idea as the
-/// quarantine attribute, which `open_attachment` sets below.
+/// quarantine attribute, which `mark_as_downloaded` writes beside this.
 ///
 /// Best effort on both: a file the OS will not let us mark is still written,
 /// because failing the save would be the worse outcome.
@@ -95,6 +95,41 @@ fn mark_of_the_web(path: &std::path::Path) {
     }
     #[cfg(not(windows))]
     let _ = path;
+}
+
+/// Marks a file Petrel wrote from mail as downloaded, so the OS treats it as
+/// one: the Mark of the Web on Windows, the quarantine attribute on macOS,
+/// which is what makes Gatekeeper check it when it is opened. Every file
+/// written for the person to open — an attachment saved or opened, a message
+/// saved as .eml — goes through here. Only Open used to quarantine on macOS,
+/// so a file saved and opened later from Finder skipped the check, and a zip
+/// saved that way passed nothing on to what Archive Utility unpacked from it
+/// (docs/25 #89).
+///
+/// Best effort: a file the OS will not mark is still written.
+pub(crate) fn mark_as_downloaded(path: &std::path::Path) {
+    mark_of_the_web(path);
+    #[cfg(target_os = "macos")]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // By absolute path, so nothing earlier on PATH stands in for it.
+        let _ = std::process::Command::new("/usr/bin/xattr")
+            .arg("-w")
+            .arg("com.apple.quarantine")
+            .arg(quarantine_value(now))
+            .arg(path)
+            .status();
+    }
+}
+
+/// The `com.apple.quarantine` value for a file written from mail. Only the Mac
+/// writes one; the test that reads it runs everywhere.
+#[cfg(any(target_os = "macos", test))]
+fn quarantine_value(now_secs: u64) -> String {
+    format!("0083;{now_secs:08x};Petrel;")
 }
 
 /// Writes an attachment to a path the person chose in the save panel.
@@ -118,7 +153,7 @@ pub fn save_attachment(
         .unwrap_or_else(|| "attachment".into());
     // The name, not the path: this string reaches the window and the log.
     std::fs::write(&target, bytes).map_err(|e| format!("could not write {name}: {e}"))?;
-    mark_of_the_web(&target);
+    mark_as_downloaded(&target);
     Ok(())
 }
 
@@ -156,19 +191,9 @@ pub fn open_attachment(
     crate::diag::create_private_dir(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(&name);
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
-    mark_of_the_web(&path);
-    #[cfg(target_os = "macos")]
-    {
-        // The quarantine attribute is what makes Gatekeeper treat this as a
-        // download. Best effort: a file the OS cannot mark is still opened,
-        // since the UI's own warning has already been shown.
-        let _ = std::process::Command::new("xattr")
-            .arg("-w")
-            .arg("com.apple.quarantine")
-            .arg("0083;00000000;Petrel;")
-            .arg(&path)
-            .status();
-    }
+    // Best effort: a file the OS cannot mark is still opened, since the UI's
+    // own warning has already been shown.
+    mark_as_downloaded(&path);
     // One opener for all three platforms, and pointedly not a shell.
     //
     // The Windows branch used to be `cmd /C start "" <path>`, which hands an
@@ -257,6 +282,36 @@ pub fn attachment_url(message_id: i64, part: usize, state: State<Arc<AppState>>)
 #[cfg(test)]
 mod tests {
     use super::{is_executable_attachment, safe_filename};
+
+    #[test]
+    fn the_quarantine_value_names_petrel_and_when() {
+        assert_eq!(
+            super::quarantine_value(0x6500_0000),
+            "0083;65000000;Petrel;"
+        );
+    }
+
+    /// docs/25 #89: only Open marked its copy as downloaded. A file saved to
+    /// disk and opened later from Finder skipped Gatekeeper's check, and a
+    /// zip saved that way passed nothing on to what it unpacked.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_written_from_mail_is_marked_as_downloaded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("report.zip");
+        std::fs::write(&path, b"PK").expect("write");
+        super::mark_as_downloaded(&path);
+        let out = std::process::Command::new("/usr/bin/xattr")
+            .arg("-p")
+            .arg("com.apple.quarantine")
+            .arg(&path)
+            .output()
+            .expect("xattr");
+        let value = String::from_utf8_lossy(&out.stdout);
+        assert!(value.starts_with("0083;"), "{value:?}");
+        assert!(value.trim_end().ends_with(";Petrel;"), "{value:?}");
+        assert_ne!(&value[5..13], "00000000", "a real time: {value:?}");
+    }
 
     /// The bypass this closes: the warning read the
     /// extension of the raw MIME name, and the file opened was the trimmed

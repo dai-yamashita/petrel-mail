@@ -10,10 +10,16 @@
  * rather than shown greyed: a sheet that lists dead keys teaches keystrokes
  * that fail, which is worse than a shorter sheet.
  */
-import { key, type KeyName } from './keys';
+import { isMac, key, type KeyName } from './keys';
 import type { StringId } from './strings';
 
-export type Chord = { key: string; shift?: boolean; meta?: boolean; then?: string };
+export type Chord = {
+  key: string;
+  shift?: boolean;
+  meta?: boolean;
+  alt?: boolean;
+  then?: string;
+};
 
 export type Binding = {
   id: string;
@@ -50,6 +56,11 @@ export const BINDINGS: Binding[] = [
     chords: [{ key: 'c' }], available: true },
   { id: 'reply', group: 'write', label: 'sc-reply', display: ['R', 'A', 'F'],
     chords: [{ key: 'r' }], available: true },
+  // ⌥⌘B on the Mac, Ctrl+Shift+B elsewhere: see `isBccKey`, which the
+  // composer listens with, and `key('bcc')`, which Help shows.
+  { id: 'bcc', group: 'write', label: 'sc-bcc', display: 'bcc',
+    chords: [isMac ? { key: 'b', meta: true, alt: true } : { key: 'b', meta: true, shift: true }],
+    available: true },
   { id: 'send', group: 'write', label: 'sc-send', display: 'send',
     chords: [{ key: 'Enter', meta: true }], available: true },
   { id: 'send-later', group: 'write', label: 'sc-send-later', display: 'sendLater',

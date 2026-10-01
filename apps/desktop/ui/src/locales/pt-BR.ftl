@@ -57,6 +57,7 @@ reader-forward = Encaminhar
 reader-failed = Não foi possível abrir esta conversa
 reader-to = para { $who }
 reader-cc = Cc { $who }
+reader-bcc = Cco { $who }
 reader-collapse = Recolher a mensagem de { $who }
 msg-reply = Responder a esta mensagem
 msg-reply-all = Responder a todos nesta mensagem
@@ -130,6 +131,17 @@ onb-inbox-ready = A caixa de entrada está pronta
 onb-start = Começar a ler
 onb-failed = Não foi possível entrar: { $error }
 onb-add-failed = Não foi possível salvar a conta: { $error }
+signin-title = Entrar em { $email }
+signin-help = Digite a senha desta conta. O Petrel confere com o seu provedor antes de salvar qualquer coisa.
+signin-address = Endereço
+signin-checking = Conferindo com o seu provedor…
+signin-done = Você entrou em { $email }. Buscando suas mensagens…
+signin-first = Entre de novo primeiro: o Petrel só alcança o servidor desta conta com uma senha que funcione.
+signin-outbox-waiting = Esperando você entrar de novo. Nada é enviado até a conta ter uma senha que funcione.
+signin-outbox-scheduled = Sai às { $when }, quando você entrar de novo. Você ainda pode mudar.
+signin-outbox-check-waits = O Petrel pode conferir quando você entrar de novo.
+signin-sending-waiting = Ainda não enviada: “{ $subject }” espera você entrar de novo
+signin-again = Entrar de novo…
 att-preview = Pré-visualizar
 att-open = Abrir
 att-save = Salvar { $name }
@@ -185,6 +197,10 @@ empty-loading = Carregando suas mensagens…
 empty-syncing = Buscando suas mensagens. { $count } até agora…
 sync-failed-title = Não foi possível acessar suas mensagens
 sync-failed-body = Mostrando o que o Petrel já tinha. Nada se perdeu. Detalhes em sync.log.
+signin-needed = É preciso entrar
+signin-refused = O servidor recusou a senha de { $email }.
+signin-missing = O Petrel não tem a senha de { $email }.
+signin-empty-title = Entre para buscar suas mensagens
 compose-undo = Desfazer envio
 compose-undo-help = Depois de enviar, o Petrel segura a mensagem por este tempo e mostra um botão Desfazer.
 compose-undo-off-label = Desligado
@@ -202,6 +218,8 @@ compose-reply = Responder
 compose-from = De
 compose-to = Para
 compose-cc = Cc
+compose-bcc = Cco
+compose-bcc-hint = Cópia oculta, invisível para os outros destinatários ({ $key })
 compose-subject = Assunto
 compose-body = Mensagem
 compose-send = Enviar
@@ -212,7 +230,7 @@ compose-attach-failed = Não foi possível anexar isso: { $error }
 compose-missing-attachment = Isto fala de um anexo e não tem nenhum. Aperte Enviar de novo para enviar mesmo assim.
 compose-no-recipient = Adicione alguém para enviar.
 compose-bad-recipient = Não é um endereço: { $addr }
-compose-sending = Envio em { $count } s
+compose-sending = Envio em { $count } s: { $subject }
 compose-send-now = Enviar agora
 compose-sent = Enviada
 compose-saved = Salva em Rascunhos
@@ -262,6 +280,16 @@ notify-many = { $count ->
     [one] { $count } mensagem nova
    *[other] { $count } mensagens novas
 }
+notify-from-people = { $count ->
+    [one] De { $count } pessoa
+   *[other] De { $count } pessoas
+}
+notify-one-in = Nova mensagem de { $who } em { $account }
+notify-many-in = { $count ->
+    [one] { $count } mensagem nova em { $account }
+   *[other] { $count } mensagens novas em { $account }
+}
+notify-subject-in = { $subject } ({ $account })
 status-synced = Sincronizado agora
 status-synced-min = Sincronizado há { $min } min
 status-synced-hr = Sincronizado há { $hr } h
@@ -316,6 +344,7 @@ identity-signature-placeholder = Adicionada ao final das mensagens que você esc
 identity-signature-replies = Usar esta assinatura também nas respostas
 identity-signature-replies-help = Desligado significa só mensagens novas. Assinatura repetida ao longo de uma conversa longa é do que as pessoas reclamam.
 identity-save-failed = Não foi possível salvar: { $error }
+identity-no-account = Não foi possível salvar: a conta não está mais aqui.
 privacy-remote = Conteúdo remoto
 privacy-remote-help = Imagens e outros arquivos que uma mensagem carrega da internet. Carregá-los avisa ao remetente que você abriu a mensagem.
 privacy-remote-block = Bloquear
@@ -430,10 +459,19 @@ account-switch-failed = Não foi possível trocar de conta: { $error }
 account-switch-draft-failed = Não foi possível salvar o rascunho aberto, então a conta não foi trocada: { $error }
 view-switch-draft-failed = Não foi possível salvar o rascunho aberto, então a caixa não foi aberta: { $error }
 accounts-add = Adicionar conta
+accounts-signin = Entrada
+accounts-signin-help = Mudou a senha ou criou uma nova senha de app? Digite aqui.
+accounts-needs-signin = Precisa entrar
 accounts-remove = Remover conta
 accounts-remove-help = Remove esta conta, o e-mail e a senha. Nada muda no servidor.
 accounts-remove-confirm = Remover { $email }?
-accounts-remove-body = As mensagens são apagadas deste computador e a senha do cofre de senhas do sistema. O e-mail em si continua no servidor, intacto.
+accounts-remove-body = As mensagens e a senha são apagadas deste computador. O que está no servidor continua lá, mas o que só existe aqui some de vez: e-mails em pastas locais ou importadas, e-mails que o servidor já apagou e rascunhos e mensagens esperando envio. "Exportar antes" guarda os e-mails; rascunhos e mensagens na fila não entram, então envie ou copie esses antes.
+accounts-remove-export = Exportar antes…
+accounts-remove-exporting = Exportando…
+accounts-remove-exported = { $count ->
+    [one] { $count } mensagem exportada de { $account }. Rascunhos e mensagens na fila não entram.
+   *[other] { $count } mensagens exportadas de { $account }. Rascunhos e mensagens na fila não entram.
+}
 accounts-none = Nenhuma conta ainda.
 accounts-failed = Não foi possível ler suas contas
 accounts-synced = sincronizada { $when }
@@ -674,6 +712,7 @@ folder-created = “{ $name }” criada
 folder-deleted = “{ $name }” excluída
 folder-failed = Falha ao alterar a pasta: { $error }
 folder-server-pending = Ainda não foi possível criar “{ $name }” no servidor: { $error }. Ela fica guardada aqui, e a próxima sincronização tentará de novo.
+folder-made-here-signin = “{ $name }” criada aqui. Ela vai para o servidor quando você entrar de novo.
 folder-name-taken = Já existe uma pasta chamada “{ $name }” ali.
 folder-bin-refuses = E-mails movidos para a Lixeira desta conta não seriam excluídos. Exclua “{ $name }” pelo menu dela.
 tag-new = Nova etiqueta
@@ -789,6 +828,7 @@ status-demo = Mensagens de demonstração · sem conta
 sc-account = Trocar a conta ativa
 sc-archive = Arquivar
 sc-back = Voltar para a lista
+sc-bcc = Adicionar Cco
 sc-compose = Escrever
 sc-find-in-message = Buscar nesta conversa
 sc-goto = Ir para Entrada · Com estrela · Enviados · Rascunhos · Todos os e-mails

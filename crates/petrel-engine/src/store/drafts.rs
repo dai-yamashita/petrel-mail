@@ -15,13 +15,18 @@ impl Store {
         let Some(msgid) = msgid else {
             return Ok(None);
         };
+        // Either suffix a second row under the draft's Message-ID can carry:
+        // `::copy-N` for a second copy the reconcile met, `::b-…` for one keyed
+        // by its content. Matched as exact prefixes rather than with LIKE, in
+        // which a `_` or `%` in the Message-ID itself is a wildcard.
         Ok(self
             .conn
             .query_row(
                 "SELECT m.id, p.uid FROM messages m
                  JOIN placements p ON p.message_id = m.id
                  JOIN folders f ON f.id = p.folder_id AND f.role = 'drafts'
-                 WHERE m.message_id_hdr LIKE ?1 || '::copy-%'
+                 WHERE ((m.message_id_hdr >= ?1 || '::copy-' AND m.message_id_hdr < ?1 || '::copy.')
+                     OR (m.message_id_hdr >= ?1 || '::b-' AND m.message_id_hdr < ?1 || '::b.'))
                    AND m.deleted_at_ms IS NULL
                  ORDER BY p.uid DESC LIMIT 1",
                 params![msgid],
@@ -33,6 +38,11 @@ impl Store {
     /// Makes the server's revision the draft: its words and subject land in
     /// the draft columns, its UID becomes the recorded one, and the next
     /// composer open shows what was chosen.
+    ///
+    /// The search entry and the snippet move with the words, in the same unit
+    /// of writes, as a save writes them. Before, the draft kept answering
+    /// searches for the words it no longer had until it was next saved
+    /// (docs/24 #33, docs/25 review).
     pub fn adopt_server_revision(
         &self,
         draft_id: i64,
@@ -41,13 +51,40 @@ impl Store {
         html: &str,
         uid: Option<u32>,
     ) -> Result<()> {
-        self.conn.execute(
+        let snippet: String = body.chars().take(200).collect();
+        let unit = self.atomic()?;
+        let n = self.conn.execute(
             "UPDATE messages SET subject = ?2, draft_body = ?3, draft_html = ?4,
-                    draft_server_uid = ?5
+                    draft_server_uid = ?5, snippet = ?6
              WHERE id = ?1",
-            params![draft_id, subject, body, html, uid.map(|u| u as i64)],
+            params![
+                draft_id,
+                subject,
+                body,
+                html,
+                uid.map(|u| u as i64),
+                snippet
+            ],
         )?;
-        Ok(())
+        // Sent or discarded between the command's check and this write: no
+        // row, so no index entry either. Written anyway, it was an entry
+        // search returned for a message that is not there (docs/25 review),
+        // which `save_draft_full` refuses for the same reason.
+        if n == 0 {
+            return Err(StoreError::Rejected("that draft no longer exists".into()));
+        }
+        self.conn.execute(
+            "INSERT INTO fts_content(message_id, subject, body_text, addrs, attachment_names)
+             SELECT ?1, ?2, ?3,
+                    coalesce((SELECT group_concat(a.addr_norm, ' ') FROM message_addresses a
+                               WHERE a.message_id = ?1 AND a.role IN ('to', 'cc')), ''),
+                    ''
+             ON CONFLICT(message_id) DO UPDATE SET
+                subject = excluded.subject, body_text = excluded.body_text,
+                addrs = excluded.addrs",
+            params![draft_id, subject, body],
+        )?;
+        unit.done()
     }
 
     /// Removes the second-copy row a resolved conflict leaves behind. The
@@ -64,7 +101,9 @@ impl Store {
     }
 
     /// The Message-ID header a stored message carries, for a reply that
-    /// must thread into its conversation at the other end.
+    /// must thread into its conversation at the other end: the wire id, never
+    /// the store's own suffixes or the stand-in for a message that had none
+    /// (`wire_message_id`).
     pub fn msgid_header_of(&self, message_id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -74,7 +113,8 @@ impl Store {
                 |r| r.get::<_, Option<String>>(0),
             )
             .optional()?
-            .flatten())
+            .flatten()
+            .and_then(|key| super::wire_message_id(&key).map(str::to_string)))
     }
 
     /// Records what the reader answered to an invitation.
@@ -258,6 +298,9 @@ impl Store {
             None => account_id,
         };
 
+        // The row, its index entry, its recipients and its folder land
+        // together or not at all (docs/25 #92).
+        let unit = self.atomic()?;
         let id = match draft_id {
             Some(id) => {
                 let n = self.conn.execute(
@@ -339,6 +382,7 @@ impl Store {
                 .execute("DELETE FROM placements WHERE message_id = ?1", params![id])?;
             self.place_message(id, folder)?;
         }
+        unit.done()?;
         Ok(id)
     }
 
@@ -715,12 +759,13 @@ impl Store {
 
     /// Removes a draft once it has been sent or discarded.
     pub fn delete_draft(&self, id: i64) -> Result<()> {
+        let unit = self.atomic()?;
         // The index row goes with it, or a sent draft's words keep matching.
         self.conn
             .execute("DELETE FROM fts_content WHERE message_id = ?1", params![id])?;
         self.conn
             .execute("DELETE FROM messages WHERE id = ?1", params![id])?;
-        Ok(())
+        unit.done()
     }
 
     /// Every file a draft still lists, in any account: saved drafts, and

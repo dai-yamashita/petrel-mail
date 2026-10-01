@@ -137,6 +137,11 @@ fn outbox_state(store: &petrel_engine::store::Store, id: i64) -> Result<Option<S
 /// more and resolve it if the evidence is now there. Never sends.
 #[tauri::command]
 pub async fn outbox_check(id: i64, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    check_in_sent(state.inner(), id).await
+}
+
+/// `outbox_check`, for any state.
+async fn check_in_sent(state: &Arc<AppState>, id: i64) -> Result<String, String> {
     use petrel_engine::outbox::{AttemptOutcome, SendState, reconcile};
     let (account, message_id) = {
         let store = state.store()?;
@@ -160,13 +165,18 @@ pub async fn outbox_check(id: i64, state: State<'_, Arc<AppState>>) -> Result<St
     let Some(mid) = message_id else {
         return Ok("Indeterminate".into());
     };
-    let cfg = imap_config(&state, account).ok_or("no account is configured")?;
-    let evidence = sent_folder_evidence(&state, &cfg, account, &mid).await;
+    // Signed out, Sent cannot be looked in: asking was one more sign-in with
+    // the refused password, and the answer "cannot reach the server" besides.
+    if state.signin(account).is_some() {
+        return Err(crate::signin::SIGN_IN_FIRST.into());
+    }
+    let cfg = imap_config(state, account).ok_or("no account is configured")?;
+    let evidence = sent_folder_evidence(state, &cfg, account, &mid).await;
     let next = reconcile(AttemptOutcome::UnknownAfterTransmit, evidence);
     let store = state.store()?;
     match next {
         SendState::Sent => {
-            drop_server_draft_using(state.inner(), &store, id);
+            drop_server_draft_using(state, &store, id);
             let _ = store.delete_draft(id);
         }
         SendState::RetryQueued => {
@@ -176,6 +186,58 @@ pub async fn outbox_check(id: i64, state: State<'_, Arc<AppState>>) -> Result<St
         _ => {}
     }
     Ok(format!("{next:?}"))
+}
+
+#[cfg(test)]
+mod signed_out_tests {
+    use super::check_in_sent;
+    use crate::scripted_imap::{Srv, serve};
+    use crate::signin::test_support::{servers_at, unkeyed_account};
+    use crate::signin::{SIGN_IN_FIRST, SignIn};
+    use crate::state::test_state;
+    use petrel_engine::outbox::SendState;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// The second UI review's finding 8. Check again, on a message whose
+    /// outcome is unknown, signed in to look in Sent whatever the account's
+    /// state: with the password refused, one more refused sign-in, and "still
+    /// cannot reach the server" for an answer.
+    #[test]
+    fn check_again_asks_nothing_of_a_signed_out_server() {
+        let _turn = crate::config::cache_turn();
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let account = unkeyed_account(&state);
+        let srv = Srv::new("UIDPLUS", &[("INBOX", ""), ("Sent", "\\Sent")], &[]);
+        tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            servers_at(&state, account, port);
+            crate::config::remember_password(account, "revoked");
+            let id = {
+                let store = state.store.lock().unwrap();
+                let id = store
+                    .save_draft(account, None, "dana@example.com", "Board pack", "words", "")
+                    .unwrap();
+                store.schedule_send(id, Some(1_000)).unwrap();
+                store
+                    .set_send_state(
+                        id,
+                        SendState::NeedsAttention,
+                        Some("connection closed after DATA"),
+                        None,
+                        Some("<board@example.com>"),
+                    )
+                    .unwrap();
+                id
+            };
+            state.set_signin(account, SignIn::Refused);
+            let result = check_in_sent(&state, id).await;
+            crate::config::forget_password(account);
+            assert_eq!(result, Err(SIGN_IN_FIRST.to_string()));
+            assert_eq!(srv.conns.load(Ordering::SeqCst), 0, "asked the server");
+        });
+    }
 }
 
 #[cfg(test)]

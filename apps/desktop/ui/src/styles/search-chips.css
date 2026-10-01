@@ -44,10 +44,11 @@
    Amber rather than the caption grey below, and above the rows rather than
    under them, because it is about what you are reading now and the quiet
    version at the foot of the list went unread. */
-/* Hidden rather than absent, so the live region exists before it has anything
-   to say — `[hidden]` collapses it to nothing either way. */
-.list-notice[hidden] {
-  display: none;
+/* Present rather than hidden, so the live region is in the accessibility tree
+   before it has anything to say; empty, it collapses to nothing. */
+.list-notice:empty {
+  padding-block: 0;
+  border-block-end: 0;
 }
 
 /* The triangle keeps its size when the words wrap. In German at a narrow window

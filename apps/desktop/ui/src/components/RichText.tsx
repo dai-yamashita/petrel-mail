@@ -19,6 +19,7 @@ import { EMBED_CAP, asDataUrl, pastedImages } from '../lib/paste-image';
 import { Icon } from './Icon';
 import { t, type StringId } from '../lib/strings';
 import { Tip } from './Tip';
+import { nextTool, typedIntoBody } from '../lib/toolbar';
 
 /** The typefaces on offer.
  *
@@ -124,6 +125,18 @@ export function plainTextOf(html: string): string {
   return plainTextFromDoc(generateJSON(html, composerExtensions()) as DocNode);
 }
 
+/** What the composer around the editor may ask of it. */
+export type RichTextHandle = {
+  /** Focus with the caret at the top of the body, where a message is
+   *  written: Tab from Subject arrives here. */
+  focusStart: () => void;
+  /** Focus where the caret already was. */
+  focus: () => void;
+};
+
+/** The toolbar's controls, in order: the two pickers, then the buttons. */
+const TOOL_COUNT = 11;
+
 type Props = {
   /** The body as HTML. Read on mount and when the draft is swapped, not on
    *  every keystroke — the editor owns its own content while it is open. */
@@ -135,6 +148,8 @@ type Props = {
   autoFocus?: boolean;
   /** Something worth saying that is not worth a dialog — a refused paste. */
   onNotice?: (text: string) => void;
+  /** Filled in once the editor exists. */
+  handle?: { current: RichTextHandle | null };
 };
 
 /**
@@ -152,7 +167,7 @@ type Props = {
  * `**bold**`, `- ` for a list, `> ` for a quote. Someone who types markdown out
  * of habit gets what they meant rather than the punctuation.
  */
-export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Props) {
+export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice, handle }: Props) {
   // The link card: its own text and address, so a link can be labelled rather
   // than only wrapped around whatever happened to be selected.
   const [link, setLink] = useState<
@@ -168,6 +183,10 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
   // listener. A ref rather than a dependency: the listener would otherwise be
   // torn down and rebuilt on every keystroke in the address field.
   const openHref = useRef<string>('');
+  // The toolbar's one tab stop: the control focus last rested on, so Shift+Tab
+  // back from the body returns to it.
+  const [tool, setTool] = useState(0);
+  const tools = useRef<HTMLDivElement>(null);
 
   const editor = useEditor({
     extensions: composerExtensions(),
@@ -246,6 +265,32 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
     return () => cancelAnimationFrame(h);
   }, [autoFocus, editor]);
 
+  useEffect(() => {
+    if (!handle) return;
+    handle.current = editor
+      ? {
+          // The caret first, as a transaction of its own, as the autofocus
+          // above does it; then the view itself, at once. The editor's focus
+          // command waits a frame, and a typist does not: the first letter
+          // after Tab went into Subject.
+          focusStart: () => {
+            if (editor.isDestroyed) return;
+            editor.commands.command(({ tr }) => {
+              tr.setSelection(Selection.atStart(tr.doc));
+              return true;
+            });
+            editor.view.focus();
+          },
+          focus: () => {
+            if (!editor.isDestroyed) editor.view.focus();
+          },
+        }
+      : null;
+    return () => {
+      handle.current = null;
+    };
+  }, [editor, handle]);
+
   // Whether the card is up, not the card itself: focus belongs on the first
   // field when it opens, and must not be yanked back there on every keystroke.
   const linkOpen = link !== null;
@@ -275,6 +320,13 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
   }, [linkOpen]);
 
   if (!editor) return <div className="rich-shell" />;
+
+  /** A character typed on one of the toolbar's closed menus, written where
+   *  the caret was in the message, which takes focus back with it, so the
+   *  rest of the sentence follows by itself. As text, never as markup. */
+  const typeIntoBody = (text: string) => {
+    editor.chain().focus().insertContent({ type: 'text', text }).run();
+  };
 
   /** Follows the caret in and out of links, opening and closing the menu. */
   const caretMoved = (ed: Editor) => {
@@ -354,11 +406,31 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
 
   return (
     <div className="rich-shell" ref={shell} onKeyDown={onKeyDown}>
-      <div className="rich-tools" role="toolbar" aria-label={t('compose-formatting')}>
+      <div
+        className="rich-tools"
+        role="toolbar"
+        aria-label={t('compose-formatting')}
+        ref={tools}
+        onKeyDown={(e) => {
+          // The controls only: a picker's open list is rendered elsewhere but
+          // its keys bubble here through React, and they are its own.
+          const at = (e.target as HTMLElement).closest?.('[data-tool]');
+          if (!at || !tools.current?.contains(at)) return;
+          const next = nextTool(tool, e.key, TOOL_COUNT);
+          if (next === null) return;
+          e.preventDefault();
+          setTool(next);
+          tools.current.querySelector<HTMLElement>(`[data-tool="${next}"]`)?.focus();
+        }}
+      >
         {/* Web-safe stacks only. A typeface the recipient does not have is not
             a choice, it is a fallback nobody picked — so the list is the four
             that resolve everywhere rather than the twenty that look richer. */}
         <Picker
+          tool={0}
+          current={tool}
+          onFocusTool={setTool}
+          onType={typeIntoBody}
           label={t('format-font')}
           value={currentFont(editor)}
           options={FONTS.map((f) => ({
@@ -375,6 +447,10 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
           }
         />
         <Picker
+          tool={1}
+          current={tool}
+          onFocusTool={setTool}
+          onType={typeIntoBody}
           label={t('format-size')}
           narrow
           value={currentSize(editor)}
@@ -393,19 +469,23 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
           }
         />
         <span className="rich-sep" aria-hidden="true" />
-        <Mark editor={editor} name="bold" icon={Bold} label={t('format-bold')} keys="⌘B" />
-        <Mark editor={editor} name="italic" icon={Italic} label={t('format-italic')} keys="⌘I" />
+        <Mark tool={2} current={tool} onFocusTool={setTool} editor={editor} name="bold" icon={Bold} label={t('format-bold')} keys="⌘B" />
+        <Mark tool={3} current={tool} onFocusTool={setTool} editor={editor} name="italic" icon={Italic} label={t('format-italic')} keys="⌘I" />
         <Mark
+          tool={4}
+          current={tool} onFocusTool={setTool}
           editor={editor}
           name="underline"
           icon={Underline}
           label={t('format-underline')}
           keys="⌘U"
         />
-        <Mark editor={editor} name="strike" icon={Strikethrough} label={t('format-strike')} />
-        <Mark editor={editor} name="code" icon={Code} label={t('format-code')} />
+        <Mark tool={5} current={tool} onFocusTool={setTool} editor={editor} name="strike" icon={Strikethrough} label={t('format-strike')} />
+        <Mark tool={6} current={tool} onFocusTool={setTool} editor={editor} name="code" icon={Code} label={t('format-code')} />
         <span className="rich-sep" aria-hidden="true" />
         <Node
+          tool={7}
+          current={tool} onFocusTool={setTool}
           editor={editor}
           name="bulletList"
           icon={List}
@@ -413,6 +493,8 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
           run={() => editor.chain().focus().toggleBulletList().run()}
         />
         <Node
+          tool={8}
+          current={tool} onFocusTool={setTool}
           editor={editor}
           name="orderedList"
           icon={ListOrdered}
@@ -420,6 +502,8 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
           run={() => editor.chain().focus().toggleOrderedList().run()}
         />
         <Node
+          tool={9}
+          current={tool} onFocusTool={setTool}
           editor={editor}
           name="blockquote"
           icon={Quote}
@@ -427,6 +511,8 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice }: Pro
           run={() => editor.chain().focus().toggleBlockquote().run()}
         />
         <Node
+          tool={10}
+          current={tool} onFocusTool={setTool}
           editor={editor}
           name="link"
           icon={Link2}
@@ -596,15 +682,33 @@ function linkUnderCaret(
  * the desktop app actually runs — so the preview could not have been verified
  * where it matters. This renders its own list and can be seen to work.
  */
+/** A control's place in the toolbar's single tab stop. */
+type Roving = {
+  tool: number;
+  current: number;
+  onFocusTool: (tool: number) => void;
+};
+
+function rove({ tool, current, onFocusTool }: Roving) {
+  return {
+    'data-tool': tool,
+    tabIndex: tool === current ? 0 : -1,
+    onFocus: () => onFocusTool(tool),
+  };
+}
+
 function Picker({
-  label, value, options, onPick, narrow,
+  label, value, options, onPick, onType, narrow, ...roving
 }: {
   label: string;
   value: string;
   options: { value: string; label: string; style?: React.CSSProperties }[];
   onPick: (value: string) => void;
+  /** A character typed on the closed menu, which belongs in the message:
+   *  see `typedIntoBody`. */
+  onType: (text: string) => void;
   narrow?: boolean;
-}) {
+} & Roving) {
   const current = options.find((o) => o.value === value) ?? options[0];
   return (
     <SelectProvider
@@ -613,7 +717,26 @@ function Picker({
       placement="bottom-start"
     >
       <Tip label={label} placement="top">
-        <Select className={narrow ? 'rich-select narrow' : 'rich-select'} aria-label={label}>
+        <Select
+          className={narrow ? 'rich-select narrow' : 'rich-select'}
+          aria-label={label}
+          {...rove(roving)}
+          // In the capture phase, which is where the menu's own type-to-select
+          // reads the key, and which it skips once the key is cancelled.
+          onKeyDownCapture={(e) => {
+            const open = e.currentTarget.getAttribute('aria-expanded') === 'true';
+            const key = {
+              key: e.key,
+              metaKey: e.metaKey,
+              ctrlKey: e.ctrlKey,
+              altKey: e.altKey,
+              isComposing: e.nativeEvent.isComposing,
+            };
+            if (!typedIntoBody(key, open)) return;
+            e.preventDefault();
+            onType(e.key);
+          }}
+        >
           <span className="clip">{current?.label}</span>
           <ChevronDown size={12} aria-hidden="true" />
         </Select>
@@ -631,16 +754,29 @@ function Picker({
   );
 }
 
+/** Enter and Space on a toolbar button, as a click would be. Handled on the
+ *  key itself rather than left to the click the browser synthesises: the
+ *  command moves focus into the editor, and an Enter that arrived there
+ *  afterwards would start a new paragraph. The buttons answered the mouse
+ *  only, so the toolbar announced itself to the keyboard and then did
+ *  nothing. */
+function pressed(e: React.KeyboardEvent, run: () => void) {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  e.preventDefault();
+  run();
+}
+
 /** A character-level format: bold, italic and the rest. */
 function Mark({
-  editor, name, icon, label, keys,
+  editor, name, icon, label, keys, ...roving
 }: {
   editor: Editor;
   name: string;
   icon: LucideIcon;
   label: string;
   keys?: string;
-}) {
+} & Roving) {
+  const run = () => editor.chain().focus().toggleMark(name).run();
   return (
     <Tip label={label} keys={keys ? [keys] : undefined} placement="top">
       <button
@@ -648,12 +784,14 @@ function Mark({
         className={editor.isActive(name) ? 'rich-btn on' : 'rich-btn'}
         aria-label={label}
         aria-pressed={editor.isActive(name)}
+        {...rove(roving)}
         // Mouse down, not click: a click would take focus out of the editor
         // first, collapsing the selection the button is meant to act on.
         onMouseDown={(e) => {
           e.preventDefault();
-          editor.chain().focus().toggleMark(name).run();
+          run();
         }}
+        onKeyDown={(e) => pressed(e, run)}
       >
         <Icon icon={icon} size={14} />
       </button>
@@ -663,14 +801,14 @@ function Mark({
 
 /** A block-level format, or the link control. */
 function Node({
-  editor, name, icon, label, run,
+  editor, name, icon, label, run, ...roving
 }: {
   editor: Editor;
   name: string;
   icon: LucideIcon;
   label: string;
   run: () => void;
-}) {
+} & Roving) {
   return (
     <Tip label={label} placement="top">
       <button
@@ -678,10 +816,12 @@ function Node({
         className={editor.isActive(name) ? 'rich-btn on' : 'rich-btn'}
         aria-label={label}
         aria-pressed={editor.isActive(name)}
+        {...rove(roving)}
         onMouseDown={(e) => {
           e.preventDefault();
           run();
         }}
+        onKeyDown={(e) => pressed(e, run)}
       >
         <Icon icon={icon} size={14} />
       </button>

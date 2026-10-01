@@ -194,6 +194,13 @@
   font-size: 11.5px;
 }
 
+/* The way out, when there is one: "Sign in again…" at the banner's end. */
+.sync-error-act {
+  margin-inline-start: auto;
+  padding-block: 3px;
+  font-size: 12px;
+}
+
 /* ------------------------------------------- the same picker, as a field */
 
 /* The trigger. Deliberately the same shape as the `.select` it replaced, so

@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type ActionKind, type Folder, type OutboxRow, type Status } from './lib/api';
+import {
+  api,
+  type ActionKind,
+  type Folder,
+  type OutboxRow,
+  type SignIn,
+  type Status,
+  type Thread,
+} from './lib/api';
 import {
   chips,
   folderScopeName,
@@ -13,9 +21,10 @@ import { MAX_CLAUSES, MAX_VALUE_CHARS, cutShort } from './lib/search-limits';
 import { canSave, savedState, suggestName } from './lib/saved-search';
 import { readSections, sectionOf, visibleSections } from './lib/rail-sections';
 import { arrangementFor, countFor, countModes, visibleMailboxes } from './lib/mailboxes';
-import { count as fmtCount, fileSize } from './lib/format';
+import { count as fmtCount, fileSize, nameList } from './lib/format';
 import { t, type StringId } from './lib/strings';
 import { outboxRefusal } from './lib/outbox-refusal';
+import { folderPending, signinRefusal } from './lib/signin-refusal';
 import { Bookmark, Search, SquarePen, TriangleAlert } from 'lucide-react';
 import { SortMenu } from './components/SortMenu';
 import {
@@ -41,9 +50,9 @@ import { TitleBar } from './components/TitleBar';
 import { Palette } from './components/Palette';
 import { Picker, type PickerOption } from './components/Picker';
 import { NameDialog } from './components/NameDialog';
-import { Compose, addresses, type Draft } from './components/Compose';
+import { Compose, type Draft } from './components/Compose';
 import { plainTextOf } from './components/RichText';
-import { firstUnsendable } from './lib/recipients';
+import { firstUnsendable, hasRecipient } from './lib/recipients';
 import { snoozeOptions } from './lib/snooze';
 import { key } from './lib/keys';
 import { promisesMissingAttachment } from './lib/compose-checks';
@@ -82,7 +91,15 @@ import {
   type Attached,
 } from './lib/attachments';
 import { extend, facing, prune, reanchor, rowsOf, tagsOnAll, targets, toggle } from './lib/selection';
-import { arrivalsSince, notifiable, postDesktopNotification, shouldNotify } from './lib/notify';
+import {
+  announceStep,
+  desktopNotice,
+  elsewhereNotices,
+  notifiable,
+  postDesktopNotification,
+  shouldNotify,
+  type Announced,
+} from './lib/notify';
 import { Help } from './components/Help';
 import { Settings } from './components/Settings';
 import { RAIL_COLLAPSED, clampList, clampRail, useSettings } from './lib/settings';
@@ -90,13 +107,15 @@ import { useMessageLinks, type HomographRisk } from './lib/links';
 import { RowMenu } from './components/RowMenu';
 import { Toast } from './components/Toast';
 import { MessageList } from './components/MessageList';
-import { renumbered, useThreadWindow } from './lib/useThreadWindow';
+import { firstPageCall, renumbered, useThreadWindow } from './lib/useThreadWindow';
 import { listsPerMessage } from './lib/leaves-view';
 import { LIST_PAGE } from './lib/list-page';
 import { Reader } from './components/Reader';
 import { Outbox } from './components/Outbox';
 import { Onboarding } from './components/Onboarding';
+import { SignInAgain } from './components/SignInAgain';
 import { syncState } from './lib/sync-status';
+import { statusFor } from './lib/status';
 import { Dialog } from '@ariakit/react';
 import { PaneResize } from './components/PaneResize';
 
@@ -107,7 +126,9 @@ import { PaneResize } from './components/PaneResize';
  *  and alerts are drained on read, so a non-empty list must always land. */
 function statusNeedsRender(prev: Status | null, next: Status): boolean {
   if (!prev) return true;
+  if (prev.account !== next.account) return true;
   if ((next.notify?.length ?? 0) > 0) return true;
+  if ((next.elsewhere?.length ?? 0) > 0) return true;
   if ((next.alerts?.length ?? 0) > 0) return true;
   return (
     prev.configured !== next.configured ||
@@ -118,6 +139,8 @@ function statusNeedsRender(prev: Status | null, next: Status): boolean {
     prev.source !== next.source ||
     prev.retention !== next.retention ||
     prev.sync_error !== next.sync_error ||
+    prev.signin !== next.signin ||
+    JSON.stringify(prev.signins ?? []) !== JSON.stringify(next.signins ?? []) ||
     prev.last_sync_ms !== next.last_sync_ms ||
     prev.extraction_gen !== next.extraction_gen ||
     prev.mail_gen !== next.mail_gen
@@ -503,7 +526,7 @@ export function App() {
         // just rewritten them.
         .then(() => refreshSearches())
         .then(() => api.folders().then(setFolders))
-        .catch((e) => say(t('folder-failed', { error: String(e) })));
+        .catch((e) => say(signinRefusal(e) ?? t('folder-failed', { error: String(e) })));
     },
     // locale: as above.
     [refreshSearches, setFolders, locale, later],
@@ -514,11 +537,15 @@ export function App() {
     [],
   );
   const extractionGenRef = useRef<number | null>(null);
+  // Loads the window again without touching the account epoch: see the
+  // seeding-end reload below.
+  const [listReload, setListReload] = useState(0);
   const { items, setItems, loading, error, loadMore, replaceEpoch } = useThreadWindow({
     query,
     view,
     sort: activeSort,
     accountEpoch,
+    reload: listReload,
     messageCount: status?.count,
     mailGen: status?.mail_gen,
     fetchers: listFetchers,
@@ -607,9 +634,19 @@ export function App() {
     subject: string;
     left: number;
     say: (text: string) => void;
+    /** The account it goes from, so the bar can say when that account
+     *  cannot sign in and the message is waiting rather than going. */
+    account?: number | null;
   } | null>(null);
   const outgoingRef = useRef(outgoing);
   outgoingRef.current = outgoing;
+  // Held, not going: the account the message goes from cannot sign in, and
+  // the send worker keeps it until it can, as Thunderbird keeps unsent mail.
+  // The bar stops counting then, and Z is no longer its: a notice that
+  // stays up for hours must not take the key every triage toast offers.
+  const outgoingHeld =
+    outgoing?.account != null &&
+    (status?.signins ?? []).some((s) => s.account === outgoing.account);
 
   // The number on the Dock icon: unread in the inbox, added up across
   // accounts. Not the current view's unread, which is what the rail and the
@@ -631,11 +668,21 @@ export function App() {
   // The view's true size; items.length is only the loaded window.
   const [viewTotal, setViewTotal] = useState<number | null>(null);
 
+  // Asks for status now rather than at the next poll. An account just added,
+  // or signed in again, starts its first pass at once, and a small mailbox's
+  // can begin and end inside one five-second gap between polls: the window
+  // then never saw it run, never re-read the folders it stored, and said
+  // "Inbox is clear" while mail arrived.
+  const pollStatusNow = useRef<() => void>(() => {});
   useEffect(() => {
     let live = true;
     let handle: ReturnType<typeof setTimeout>;
-    const tick = () =>
+    let asking = false;
+    let again = false;
+    const tick = () => {
+      asking = true;
       api.status().then((s) => {
+        asking = false;
         if (!live) return;
         setStatus((prev) => (statusNeedsRender(prev, s) ? s : prev));
         if (extractionGenRef.current === null) {
@@ -648,14 +695,42 @@ export function App() {
         // engine polls the server every couple of minutes; if the window stops
         // listening once seeding ends, mail arrives into the store and nothing
         // on screen ever changes.
-        handle = setTimeout(tick, s.seeding ? 400 : 5000);
+        if (again) {
+          again = false;
+          tick();
+        } else {
+          handle = setTimeout(tick, s.seeding ? 400 : 5000);
+        }
+      }).catch(() => {
+        // A status that fails is asked again, rather than ending the polls
+        // for the rest of the session.
+        asking = false;
+        if (live) handle = setTimeout(tick, 5000);
       });
+    };
+    // One chain of polls, whoever asks: a request in flight is followed by
+    // another rather than joined by a second chain.
+    pollStatusNow.current = () => {
+      if (!live) return;
+      if (asking) {
+        again = true;
+        return;
+      }
+      clearTimeout(handle);
+      tick();
+    };
     tick();
     return () => {
       live = false;
       clearTimeout(handle);
     };
   }, []);
+  // Whenever the account on screen changes, however it changed — a switch,
+  // a removal, a first account added — rather than a poll later: until then
+  // the status is the previous account's, and is read as nobody's.
+  useEffect(() => {
+    if (activeAccount?.id !== undefined) pollStatusNow.current();
+  }, [activeAccount?.id]);
 
   // Seeding ending over an empty list is a reason to look again.
   //
@@ -669,7 +744,11 @@ export function App() {
   const wasSeeding = useRef(false);
   useEffect(() => {
     const seeding = status?.seeding ?? false;
-    if (wasSeeding.current && !seeding && items.length === 0) setAccountEpoch((n) => n + 1);
+    // A reload of the list, not an account change. Bumping the account
+    // epoch here also reset the new-mail announcer, and when the pass that
+    // ended had just brought mail into an empty inbox, the reloaded inbox
+    // was taken as the mailbox as it was, and the mail was never announced.
+    if (wasSeeding.current && !seeding && items.length === 0) setListReload((n) => n + 1);
     wasSeeding.current = seeding;
     // Read at the moment seeding ends; `items` changing is not the trigger.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -857,8 +936,9 @@ export function App() {
   const [riskyLink, setRiskyLink] = useState<{ risk: HomographRisk; open: () => void } | null>(
     null,
   );
-  // The Trash, waiting on "yes, permanently".
-  const [emptyingTrash, setEmptyingTrash] = useState(false);
+  // The Trash, waiting on "yes, permanently": the account it was asked for,
+  // which is the one emptied whatever the rail shows by the time of the yes.
+  const [emptyingTrash, setEmptyingTrash] = useState<number | null>(null);
   const askDelete = (ids?: number[]) => {
     const list = ids ?? targets(selected, activeId);
     if (list.length > 0) setPendingDelete(list);
@@ -968,7 +1048,10 @@ export function App() {
       // open is a new one when the message was deleted while it waited.
       .then((open) => {
         setTriageEpoch((n) => n + 1);
-        return resumeDraft(open ?? o.id);
+        // Under the message's own account, whichever is on screen: pulled
+        // back after a switch, it opened under the other one, From line and
+        // all, and its next send was counted down as that account's.
+        return resumeDraft(open ?? o.id, o.account);
       })
       .then(() => setToast(t('compose-cancelled')))
       .catch((e) => {
@@ -1105,8 +1188,10 @@ export function App() {
     },
     undo: () => {
       // A pending send outranks the last triage action: it is the thing with a
-      // deadline, and it is what the countdown just told you Z would do.
-      if (outgoing) {
+      // deadline, and it is what the countdown just told you Z would do. Held
+      // for sign-in it has no deadline, and Z undoes the last thing done; the
+      // bar's own Undo still pulls it back.
+      if (outgoing && !outgoingHeld) {
         cancelPendingSend();
         return;
       }
@@ -1501,8 +1586,9 @@ export function App() {
     }
   };
 
-  /** Reopens a saved draft in the composer. */
-  const resumeDraft = useCallback(async (id: number) => {
+  /** Reopens a saved draft in the composer: under `account` when it is
+   *  another account's message, else the one on screen. */
+  const resumeDraft = useCallback(async (id: number, account?: number | null) => {
     // The draft was asked for under one account. If the window has moved to
     // another while the load was in flight, opening it now would put the
     // old account's message in a composer that saves to the new one.
@@ -1510,7 +1596,7 @@ export function App() {
     try {
       const d = await api.loadDraft(id);
       if (accountEpochRef.current !== epoch) return;
-      openComposer(draftFromRecord(d));
+      openComposer({ ...draftFromRecord(d), account: account ?? null });
       // Asked as the draft opens, not at save time: the person is about to
       // continue from one of two versions, and should choose before typing
       // into the wrong one. The data layer kept both; that is what makes
@@ -1657,6 +1743,10 @@ export function App() {
     }
     try {
       await api.setActiveAccount(id);
+      // The window's own picture of which account is on screen moves with
+      // the switch, in the same render, rather than when the account list
+      // is next read: the status is judged against it (see `statusFor`).
+      setAccounts((all) => all.map((a) => ({ ...a, active: a.id === id })));
       setActiveId(null);
       // The pane-off reader too: left open, it filled the window with the
       // other account's first conversation, and read it.
@@ -1675,6 +1765,7 @@ export function App() {
   /** The parts of a draft that are not its text, as the store keeps them. */
   const envelopeOf = (d: Draft) => ({
     cc: d.cc,
+    bcc: d.bcc ?? '',
     inReplyTo: d.inReplyTo ?? null,
     references: d.references ?? [],
     attachments: (d.attachments ?? []).map((a) => a.path),
@@ -1795,7 +1886,7 @@ export function App() {
         say(
           nameIsTaken(e)
             ? t('folder-name-taken', { name: leaf })
-            : t('folder-failed', { error: String(e) }),
+            : (signinRefusal(e) ?? t('folder-failed', { error: String(e) })),
         );
       // Dropping a folder on Trash re-nests it under the trash folder — the
       // Thunderbird semantics: trash is a holding pen, and dragging back out
@@ -1978,65 +2069,106 @@ export function App() {
   // this reaches zero the toast goes away and the send is the outbox's affair
   // — which is exactly the point, because a toast that also sends is a send
   // that is lost the moment the window closes.
+  // An account that cannot sign in holds its mail (`outgoingHeld`): the bar
+  // stays, says so in place of the count, and does not say "Sent" for a
+  // message that has not gone. The clock keeps the message's own time
+  // underneath, so signed in again inside the window the count shown is the
+  // one the outbox keeps; after it, the message goes at once.
   useEffect(() => {
     if (!outgoing) return;
+    // Its account was removed while it was held, and the message with it.
+    if (outgoing.account != null && !accounts.some((a) => a.id === outgoing.account)) {
+      setOutgoing(null);
+      return;
+    }
     if (outgoing.left <= 0) {
+      if (outgoingHeld) return;
       setOutgoing(null);
       outgoing.say(t('compose-sent'));
       return;
     }
     const h = setTimeout(() => setOutgoing((o) => (o ? { ...o, left: o.left - 1 } : null)), 1000);
     return () => clearTimeout(h);
-  }, [outgoing]);
+  }, [outgoing, outgoingHeld, accounts]);
 
   // Announce mail that arrived while the window was open.
   //
   // Keyed on ids rather than a count: a count that goes up and down as things
   // are archived would announce the same message twice, and comparing counts
   // cannot tell "two arrived" from "one arrived and one left".
-  const announced = useRef<Set<number> | null>(null);
-  // The newest date announced so far. Rows older than this are the past —
-  // a page scrolled into the window, not mail arriving.
-  const newestAnnounced = useRef(0);
+  //
+  // Read from the inbox's newest page, by date, asked for here — not from the
+  // list on screen. That list may be another mailbox, a search, another
+  // order or a later page, and each of those read as the inbox brought mail
+  // that was there all along in as new: the Inbox sorted by sender gave its
+  // newest conversation a notification when it was re-sorted by date, or
+  // when a scroll paged it in. Read this way, mail is also announced as it
+  // arrives while another mailbox is on screen, as other clients do.
+  const [inboxHead, setInboxHead] = useState<{ rows: Thread[]; epoch: number } | null>(null);
+  useEffect(() => {
+    let live = true;
+    const epoch = accountEpoch;
+    api
+      .threads(...firstPageCall('inbox', DEFAULT_SORT))
+      .then((rows) => live && setInboxHead({ rows, epoch }))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+    // Whatever might have moved it: an account, arrivals, mail moved by a
+    // sync, a first pass ending. The status may be another account's for a
+    // moment; it is only a cue to look, and the look is of the inbox on screen.
+  }, [accountEpoch, status?.count, status?.mail_gen, status?.seeding]);
+  const announced = useRef<Announced>(null);
+  // Set as an account is added here, and taken up by the next account change:
+  // that account holds nothing yet, so its first sync is not news. Its id
+  // cannot be checked against the status, which goes on describing the
+  // previous account until the next poll.
+  const addedAccount = useRef(false);
+  const heldNothing = useRef(false);
   // Another account is another mailbox: its first list is what it already
   // held, so it seeds silently like a first launch.
   useEffect(() => {
     announced.current = null;
-    newestAnnounced.current = 0;
+    heldNothing.current = addedAccount.current;
+    addedAccount.current = false;
   }, [accountEpoch]);
+  // The inbox's newest page, read for the account on screen now.
+  const headLoaded = inboxHead !== null && inboxHead.epoch === accountEpoch;
+  // The status of the account on screen, or none while the one held is
+  // still another account's: see `statusFor`.
+  const statusHere = statusFor(status, activeAccount?.id);
+  const statusKnown = statusHere != null;
+  const accountEmpty = (statusHere?.count ?? 0) === 0;
+  const seedingHere = statusHere?.seeding ?? false;
   useEffect(() => {
-    if (view !== 'inbox' || query) return;
-    // The first list is the mailbox as it already was, not an arrival. Seeding
-    // it silently is what stops a first launch from announcing 200 messages.
-    if (announced.current === null) {
-      if (items.length > 0 || !status?.seeding) {
-        announced.current = new Set(items.map((m) => m.id));
-        newestAnnounced.current = items.reduce((n, m) => Math.max(n, m.date_ms), 0);
-      }
-      return;
-    }
-    const fresh = arrivalsSince(items, announced.current, newestAnnounced.current);
-    items.forEach((m) => announced.current!.add(m.id));
-    newestAnnounced.current = items.reduce((n, m) => Math.max(n, m.date_ms), newestAnnounced.current);
-    if (fresh.length === 0) return;
+    const step = announceStep(announced.current, {
+      items: inboxHead?.rows ?? [],
+      loaded: headLoaded,
+      statusKnown,
+      seeding: seedingHere,
+      heldNothing: heldNothing.current || accountEmpty,
+    });
+    announced.current = step.next;
+    if (step.fresh.length === 0) return;
 
-    const worth = notifiable(settings, fresh, Date.now());
+    const worth = notifiable(settings, step.fresh, Date.now());
     if (worth.length === 0) return;
 
     const top = worth[0];
     const who = top.from_display || top.from_addr;
-    notify(
-      worth.length === 1
-        ? t('notify-one', { who })
-        : t('notify-many', { count: fmtCount(worth.length) }),
-    );
+    const many = t('notify-many', { count: fmtCount(worth.length) });
+    notify(worth.length === 1 ? t('notify-one', { who }) : many);
     if (settings.notifyDesktop === 'on') {
-      void postDesktopNotification(
-        who,
-        worth.length === 1 ? top.subject || t('no-subject') : t('notify-many', { count: fmtCount(worth.length) }),
-      );
+      const notice = desktopNotice(worth, {
+        noSubject: t('no-subject'),
+        many,
+        fromPeople: (n) => t('notify-from-people', { count: n }),
+        list: nameList,
+      });
+      void postDesktopNotification(notice.title, notice.body);
     }
-  }, [items, view, query, settings, status?.seeding, notify]);
+  }, [inboxHead, settings, headLoaded, statusKnown, seedingHere, accountEmpty, notify]);
 
   // What a rule asked to announce. These never reach the inbox list the
   // effect above watches — the rule filed them — so their word rides the
@@ -2047,19 +2179,60 @@ export function App() {
     const fresh = status?.notify ?? [];
     if (fresh.length === 0) return;
     if (!shouldNotify(settings, Date.now())) return;
-    const [who, subject] = fresh[0];
-    notify(
-      fresh.length === 1
-        ? t('notify-one', { who })
-        : t('notify-many', { count: fmtCount(fresh.length) }),
-    );
+    const [who] = fresh[0];
+    const many = t('notify-many', { count: fmtCount(fresh.length) });
+    notify(fresh.length === 1 ? t('notify-one', { who }) : many);
     if (settings.notifyDesktop === 'on') {
-      void postDesktopNotification(
-        who,
-        fresh.length === 1
-          ? subject || t('no-subject')
-          : t('notify-many', { count: fmtCount(fresh.length) }),
+      // The same rule as mail arriving in the inbox: see `desktopNotice`.
+      const notice = desktopNotice(
+        fresh.map(([from_display, subject]) => ({ from_display, from_addr: '', subject })),
+        {
+          noSubject: t('no-subject'),
+          many,
+          fromPeople: (n) => t('notify-from-people', { count: n }),
+          list: nameList,
+        },
       );
+      void postDesktopNotification(notice.title, notice.body);
+    }
+  }, [status, settings, notify]);
+
+  // New mail in accounts that are not on screen. The effects above watch the
+  // inbox of the account shown, so mail could sit unannounced in a second
+  // account all day, where other clients say every account's. The engine
+  // hands these over unread and still in that inbox, drained as it hands
+  // them, so each is said once, named by its account.
+  const accountsRef = useRef(accounts);
+  accountsRef.current = accounts;
+  useEffect(() => {
+    const groups = elsewhereNotices(settings, status?.elsewhere ?? [], Date.now());
+    for (const { account, arrivals } of groups) {
+      const email = accountsRef.current.find((a) => a.id === account)?.email;
+      if (!email) continue;
+      const top = arrivals[0];
+      const many = t('notify-many-in', { count: fmtCount(arrivals.length), account: email });
+      notify(arrivals.length === 1 ? t('notify-one-in', { who: top.who, account: email }) : many);
+      if (settings.notifyDesktop === 'on') {
+        const notice =
+          arrivals.length === 1
+            ? {
+                title: top.who,
+                body: t('notify-subject-in', {
+                  subject: top.subject || t('no-subject'),
+                  account: email,
+                }),
+              }
+            : desktopNotice(
+                arrivals.map((a) => ({ from_display: a.who, from_addr: '', subject: a.subject })),
+                {
+                  noSubject: t('no-subject'),
+                  many,
+                  fromPeople: (n) => t('notify-from-people', { count: n }),
+                  list: nameList,
+                },
+              );
+        void postDesktopNotification(notice.title, notice.body);
+      }
     }
   }, [status, settings, notify]);
 
@@ -2474,18 +2647,56 @@ export function App() {
   // stays up until the person chooses "Start reading", so the first sync is
   // watched rather than happening behind a mailbox that looks broken.
   const [onboarded, setOnboarded] = useState(false);
+  // The first run's account is stored: its first sync is watched on step 3
+  // until "Start reading", rather than swept away by the mailbox the moment
+  // the account exists.
+  const [firstRunAdded, setFirstRunAdded] = useState(false);
   // Adding another account, from the switcher or from Settings. The same
   // three steps as a first run, in a dialog over the app.
   const [addingAccount, setAddingAccount] = useState(false);
+  // Signing the account on screen in again, from the banner or the empty
+  // Inbox. Settings → Accounts opens its own, over Settings.
+  const [signingIn, setSigningIn] = useState<{ id: number; email: string } | null>(null);
+  // Where "Signed in" is said: an answer that comes back seconds later, so
+  // it takes its mark when the dialog opens (see `later`).
+  const signInSay = useRef<(text: string) => void>(() => {});
   // Demo mode has a mailbox to show; onboarding is for a genuine first run.
-  if (status && !status.configured && !status.demo && !onboarded) {
+  if (status && !onboarded && ((!status.configured && !status.demo) || firstRunAdded)) {
     return (
       <div className="app-frame">
         <TitleBar synced="" />
-        <Onboarding onDone={() => setOnboarded(true)} />
+        {/* The account's identity, folders and saved searches are read
+            again for it the moment it exists, and once more when its first
+            pass has stored them: the window used to keep the placeholder
+            row's for the whole first session. */}
+        <Onboarding
+          onDone={() => setOnboarded(true)}
+          onAdded={() => {
+            setFirstRunAdded(true);
+            addedAccount.current = true;
+            setAccountEpoch((n) => n + 1);
+            pollStatusNow.current();
+          }}
+        />
       </div>
     );
   }
+
+  // Which account needs signing in, if any: the one on screen first.
+  const needsSignIn = ((): { id: number; email: string; why: SignIn } | null => {
+    if (statusHere?.signin && activeAccount) {
+      return { id: activeAccount.id, email: activeAccount.email, why: statusHere.signin };
+    }
+    for (const s of status?.signins ?? []) {
+      const a = accounts.find((x) => x.id === s.account);
+      if (a) return { id: a.id, email: a.email, why: s.signin };
+    }
+    return null;
+  })();
+  const signInAccount = (id: number, email: string) => {
+    signInSay.current = later();
+    setSigningIn({ id, email });
+  };
 
   return (
     <SearchTerms.Provider value={searchTerms}>
@@ -2500,14 +2711,38 @@ export function App() {
           return t('titlebar-sync');
         })()}
       />
-      {status?.sync_error && (
-        // Loud on purpose. A sync that fails silently is indistinguishable from
-        // an account with no mail in it, and that ambiguity cost real time.
+      {needsSignIn ? (
+        // A password refused, or none to offer: say which, for which account,
+        // and give the way to fix it right here. The banner used to state the
+        // refusal and offer nothing; Remove account was the only way out. The
+        // account on screen first, and failing that any other: one that
+        // needed signing in while another was on screen got the old banner,
+        // naming a host rather than an account, with nothing to press.
         <div className="sync-error" role="alert">
-          <strong>{t('sync-failed-title')}</strong>
-          <span>{status.sync_error}</span>
-          <span className="sync-error-note">{t('sync-failed-body')}</span>
+          <strong>{t('signin-needed')}</strong>
+          <span>
+            {t(needsSignIn.why === 'missing' ? 'signin-missing' : 'signin-refused', {
+              email: needsSignIn.email,
+            })}
+          </span>
+          <button
+            type="button"
+            className="reply sync-error-act"
+            onClick={() => signInAccount(needsSignIn.id, needsSignIn.email)}
+          >
+            {t('signin-again')}
+          </button>
         </div>
+      ) : (
+        status?.sync_error && (
+          // Loud on purpose. A sync that fails silently is indistinguishable from
+          // an account with no mail in it, and that ambiguity cost real time.
+          <div className="sync-error" role="alert">
+            <strong>{t('sync-failed-title')}</strong>
+            <span>{status.sync_error}</span>
+            <span className="sync-error-note">{t('sync-failed-body')}</span>
+          </div>
+        )
       )}
       <div
         className="shell"
@@ -2543,9 +2778,11 @@ export function App() {
               // here: it used to say so for a folder the server never got.
               // Not waited on: the rail can show the row while the server is
               // still being asked.
+              // Signed out, it is made here only, and the person is told
+              // when it goes to the server rather than that it has.
               void api.pushFolder(id).then(
                 () => say(t('folder-created', { name })),
-                (e) => say(t('folder-server-pending', { name, error: String(e) })),
+                (e) => say(folderPending(name, e)),
               );
               return id;
             })
@@ -2576,7 +2813,7 @@ export function App() {
               );
               setAccountEpoch((n) => n + 1);
             })
-            .catch((e) => say(t('folder-failed', { error: String(e) })));
+            .catch((e) => say(signinRefusal(e) ?? t('folder-failed', { error: String(e) })));
         }}
         // This one asks, and asks with the number in it: "move everything" is
         // a different decision at four messages and at ten thousand.
@@ -2588,7 +2825,7 @@ export function App() {
             )
             .catch((e) => setToast(t('folder-failed', { error: String(e) })));
         }}
-        onEmptyTrash={() => setEmptyingTrash(true)}
+        onEmptyTrash={() => setEmptyingTrash(activeAccount?.id ?? null)}
         onDragFolder={startFolder}
         folderDragPath={
           drag?.payload.kind === 'folder'
@@ -2755,7 +2992,10 @@ export function App() {
         onSubmit={(name) => void saveSearch(name)}
       />
 
-      <div className="list-pane" ref={listRef}>
+      {/* Focusable at -1, as the rail and the reader are: a click on the
+          header's text puts focus here, in the list, rather than on the page,
+          where single keys are refused while a message is being written. */}
+      <div className="list-pane" ref={listRef} tabIndex={-1}>
         <div className="list-head">
           <div className="search-box">
             <Search size={14} strokeWidth={1.8} aria-hidden="true" style={{ color: 'var(--ink3)', flexShrink: 0 }} />
@@ -2978,9 +3218,10 @@ export function App() {
             grey of a caption, people simply did not see it. */}
         {/* Mounted whether or not there is anything to say, because a polite
             region that appears along with its text is not reliably announced —
-            WebKit least of all, and WebKit is what ships. The row collapses to
-            nothing when empty. */}
-        <div className="list-notice" role="status" aria-live="polite" hidden={!searchCut}>
+            WebKit least of all, and WebKit is what ships. Not `hidden` either,
+            which takes it out of the accessibility tree all the same: empty,
+            it collapses to nothing (search-chips.css). */}
+        <div className="list-notice" role="status" aria-live="polite">
           {hasQuery && searchCut && (
             <>
               <TriangleAlert size={13} strokeWidth={1.8} aria-hidden="true" />
@@ -3003,6 +3244,10 @@ export function App() {
           // message in one of five states, and the row's job is to say which
           // in plain words and offer only the actions that state allows.
           <Outbox
+            signin={status?.signin ?? null}
+            onSignIn={
+              activeAccount ? () => signInAccount(activeAccount.id, activeAccount.email) : undefined
+            }
             onDiscard={(row) => setDiscarding(row)}
             onEdit={(id, open) => {
               // Pulled back from the Outbox: the bar counting down for the same
@@ -3018,6 +3263,29 @@ export function App() {
           // convincing possible way to report a working sync as a broken one.
           <div className="empty">
             <p>{status?.seeding ? t('empty-syncing', { count: fmtCount(status.count) }) : t('empty-loading')}</p>
+          </div>
+        ) : items.length === 0 &&
+          view === 'inbox' &&
+          !query.trim() &&
+          statusHere?.signin &&
+          activeAccount ? (
+          // Not "Inbox is clear": nothing has been fetched, and nothing will
+          // be until the account has a password that works. The Inbox only:
+          // a search of what is held, or an empty Trash, is answered as ever.
+          <div className="empty">
+            <h2>{t('signin-empty-title')}</h2>
+            <p>
+              {t(statusHere.signin === 'missing' ? 'signin-missing' : 'signin-refused', {
+                email: activeAccount.email,
+              })}
+            </p>
+            <button
+              type="button"
+              className="reply primary"
+              onClick={() => signInAccount(activeAccount.id, activeAccount.email)}
+            >
+              {t('signin-again')}
+            </button>
           </div>
         ) : items.length === 0 ? (
           <div className="empty">
@@ -3082,7 +3350,7 @@ export function App() {
       )}
 
       {opensComposer(view) && settings.layout !== 'off' && !draft && (
-        <section className="reader" aria-label={t('drafts-none-title')}>
+        <section className="reader" aria-label={t('drafts-none-title')} tabIndex={-1}>
           <div className="empty">
             <h2>{t('drafts-none-title')}</h2>
             <p>{t('drafts-none-body')}</p>
@@ -3186,13 +3454,29 @@ export function App() {
                 // You just walked three screens to add it: show it. Adding
                 // an account and then leaving the old one on screen read as
                 // the add having failed, while the new mail synced unseen.
-                if (added != null) void switchAccount(added.id, added.email);
-                else setAccountEpoch((n) => n + 1);
+                if (added != null) {
+                  addedAccount.current = true;
+                  void switchAccount(added.id, added.email);
+                } else setAccountEpoch((n) => n + 1);
               }}
             />
           </div>
         </Dialog>
       )}
+
+      <SignInAgain
+        account={signingIn}
+        onClose={() => setSigningIn(null)}
+        onSignedIn={(email) => {
+          setSigningIn(null);
+          signInSay.current(t('signin-done', { email }));
+          api.accounts().then(setAccounts).catch(() => {});
+          // Now, not at the next poll: the banner that sent the person here
+          // should not stand for five more seconds over a fixed account, and
+          // the fresh first pass is to be watched from its start.
+          pollStatusNow.current();
+        }}
+      />
 
       <DragPreview drag={drag} />
 
@@ -3201,7 +3485,11 @@ export function App() {
           key={composeGen}
           pane={opensComposer(view) && settings.layout !== 'off'}
           draft={draft}
-          account={activeAccount?.email ?? ''}
+          account={
+            (draft.account != null ? accounts.find((a) => a.id === draft.account)?.email : null) ??
+            activeAccount?.email ??
+            ''
+          }
           onChange={setDraft}
           onClose={() => {
             // Keeping it, not discarding it. Losing what someone wrote because
@@ -3225,7 +3513,20 @@ export function App() {
           onAttach={() => void attach()}
           onDropFiles={(files) => void dropAttachments(files)}
           onSaveDraft={(d) => void saveDraft(d)}
-          onSendLater={() => setPicker('send-later')}
+          onSendLater={(d) => {
+            // The checks Send makes, before a time is asked for: a message
+            // scheduled with nobody to send to failed later, in the Outbox.
+            if (!hasRecipient(d)) {
+              setToast(t('compose-no-recipient'));
+              return;
+            }
+            const bad = firstUnsendable(d);
+            if (bad != null) {
+              setToast(t('compose-bad-recipient', { addr: bad }));
+              return;
+            }
+            setPicker('send-later');
+          }}
           onNotice={setToast}
           onPopOut={(d) => {
             // Saved first: the new window is given an id, and that id is also
@@ -3237,7 +3538,8 @@ export function App() {
               .catch((e) => setToast(t('compose-popout-failed', { error: String(e) })));
           }}
           onSend={(d) => {
-            if (addresses(d.to).length === 0) {
+            // To, Cc or Bcc: a message to blind copies alone can go.
+            if (!hasRecipient(d)) {
               setToast(t('compose-no-recipient'));
               return;
             }
@@ -3267,6 +3569,10 @@ export function App() {
             // ambiguous-outcome rule protects every send, not only the
             // scheduled ones.
             const wait = Number(settings.undoSendSeconds) || 0;
+            // The send is the last thing done, so Z no longer undoes what came
+            // before it: the bar has Z while it counts, and once a hold stops
+            // it, Z must not reach back past the send to an older archive.
+            forgetUndo.current();
             // "Sent" comes at the end of the countdown, which is time enough
             // to have archived something since.
             const say = later();
@@ -3279,7 +3585,15 @@ export function App() {
                 return api.scheduleSend(id, Date.now() + wait * 1000).then(() => id);
               })
               .then((id) => {
-                setOutgoing({ id, subject: d.subject, left: wait, say });
+                // The message's own account: one pulled back from another
+                // account's bar carries it, and the hold is that account's.
+                setOutgoing({
+                  id,
+                  subject: d.subject,
+                  left: wait,
+                  say,
+                  account: d.account ?? activeAccount?.id ?? null,
+                });
                 // From Drafts to the Outbox. The message count does not move,
                 // so without this neither number did until a sync happened by.
                 setTriageEpoch((n) => n + 1);
@@ -3320,6 +3634,10 @@ export function App() {
             const d = draftRef.current;
             setPicker(null);
             if (!d) return;
+            if (!hasRecipient(d)) {
+              setToast(t('compose-no-recipient'));
+              return;
+            }
             const bad = firstUnsendable(d);
             if (bad != null) {
               setToast(t('compose-bad-recipient', { addr: bad }));
@@ -3385,9 +3703,7 @@ export function App() {
                 // id, and the drain makes the folder itself if it gets there
                 // first. Only a failure has anything to say — and by then the
                 // move below has its own Undo, which the failure leaves be.
-                void api
-                  .pushFolder(id)
-                  .catch((e) => say(t('folder-server-pending', { name, error: String(e) })));
+                void api.pushFolder(id).catch((e) => say(folderPending(name, e)));
                 // Into the new folder goes what the picker was for, not only
                 // the highlighted row.
                 return triage.runMany('move', pickerIds, id).then(() => api.folders().then(setFolders));
@@ -3491,15 +3807,49 @@ export function App() {
         // Its own bar, not the toast: this one is a control with a deadline,
         // and burying it in the same channel as "Archived" invites missing it.
         <div className="sending" role="status">
-          <span className="sending-count mono">{outgoing.left}s</span>
-          <span className="clip">
-            {t('compose-sending', { count: outgoing.left })}: {outgoing.subject || t('no-subject')}
-          </span>
-          {/* The same path as Z, so the button and the key cannot drift. */}
+          {outgoingHeld ? (
+            // Held, not going: the account cannot sign in, and the outbox
+            // waits for a password that works. Counting down to "Sent" here
+            // said the opposite.
+            <>
+              <span className="clip">
+                {t('signin-sending-waiting', { subject: outgoing.subject || t('no-subject') })}
+              </span>
+              {(() => {
+                const a = accounts.find((x) => x.id === outgoing.account);
+                return a ? (
+                  <button type="button" className="reply" onClick={() => signInAccount(a.id, a.email)}>
+                    {t('signin-again')}
+                  </button>
+                ) : null;
+              })()}
+            </>
+          ) : (
+            <>
+              <span className="sending-count mono">{outgoing.left}s</span>
+              <span className="clip">
+                {t('compose-sending', {
+                  count: outgoing.left,
+                  subject: outgoing.subject || t('no-subject'),
+                })}
+              </span>
+            </>
+          )}
+          {/* The same path as Z, so the button and the key cannot drift.
+              Held, the key is the last action's again and the button only
+              says Undo; it still pulls the message back. */}
           <button type="button" className="reply" onClick={cancelPendingSend}>
-            {t('undo')} <span className="kbd">Z</span>
+            {t('undo')}
+            {!outgoingHeld && (
+              <>
+                {' '}
+                <span className="kbd">Z</span>
+              </>
+            )}
           </button>
-          {/* Tells the outbox, not only the counter: zeroing the clock here
+          {!outgoingHeld && (
+            <>
+            {/* Tells the outbox, not only the counter: zeroing the clock here
               would end the toast while the message sat waiting out its
               window in the store. */}
           <button
@@ -3526,6 +3876,8 @@ export function App() {
           >
             {t('compose-send-now')}
           </button>
+            </>
+          )}
         </div>
       )}
 
@@ -3630,14 +3982,16 @@ export function App() {
         onSettleDraftConflict={(take) => void settleDraftConflict(take)}
         riskyLink={riskyLink}
         onDismissRiskyLink={() => setRiskyLink(null)}
-        emptyingTrash={emptyingTrash}
-        onCancelEmptyTrash={() => setEmptyingTrash(false)}
+        emptyingTrash={emptyingTrash !== null}
+        onCancelEmptyTrash={() => setEmptyingTrash(null)}
         onEmptyTrash={() => {
-          setEmptyingTrash(false);
+          const account = emptyingTrash;
+          setEmptyingTrash(null);
+          if (account === null) return;
           // One expunge after another on the server: the count can take a while.
           const say = later();
           void api
-            .emptyTrash()
+            .emptyTrash(account)
             .then((r) => {
               const [gone, kept] = r.split('/');
               setAccountEpoch((n) => n + 1);
@@ -3649,7 +4003,7 @@ export function App() {
                     : t('trash-emptied', { count: gone }),
               );
             })
-            .catch((e) => say(t('trash-empty-failed', { error: String(e) })));
+            .catch((e) => say(signinRefusal(e) ?? t('trash-empty-failed', { error: String(e) })));
         }}
         view={view}
         setView={setView}

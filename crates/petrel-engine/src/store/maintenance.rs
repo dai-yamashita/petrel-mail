@@ -672,6 +672,7 @@ impl Store {
     /// Demo-path only: empties the mailbox. Callers must have established that
     /// the store holds nothing real.
     pub fn delete_all_messages(&self) -> Result<usize> {
+        let unit = self.atomic()?;
         let n = self.conn.execute("DELETE FROM messages", [])?;
         self.conn.execute("DELETE FROM fts_content", [])?;
         self.conn.execute("DELETE FROM fts_cjk", [])?;
@@ -679,6 +680,7 @@ impl Store {
             "INSERT INTO fts_messages(fts_messages) VALUES('rebuild')",
             [],
         )?;
+        unit.done()?;
         Ok(n)
     }
 
@@ -1020,7 +1022,7 @@ impl Store {
                           SELECT 1 FROM placements p
                           JOIN folders f ON f.id = p.folder_id
                           WHERE p.message_id = m.id AND f.role = 'sent')
-                        AND ma.role IN ('to', 'cc')
+                        AND ma.role IN ('to', 'cc', 'bcc')
                         THEN 1 ELSE 0 END) AS written,
                     count(*) AS seen,
                     max(m.date_ms) AS last_ms
@@ -1099,7 +1101,7 @@ impl Store {
                WHERE m.account_id = ?1
                  AND m.deleted_at_ms IS NULL
                  AND f.role = 'sent'
-                 AND ma.role IN ('to', 'cc')
+                 AND ma.role IN ('to', 'cc', 'bcc')
                  AND ma.addr_norm = ?2)",
             params![account_id, addr.trim().to_lowercase()],
             |r| r.get::<_, i64>(0),

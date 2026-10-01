@@ -12,13 +12,20 @@ import { t } from '../../lib/strings';
  */
 export function Identities({ onMessage }: { onMessage: (text: string) => void }) {
   const [identity, setIdentity] = useState<Identity | null>(null);
+  // The account this pane opened on. Every save goes to it: one read from
+  // the rail at the keystroke wrote this account's name and signature over
+  // another's after a switch.
+  const [accountId, setAccountId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let live = true;
-    api
-      .identity()
-      .then((i) => live && setIdentity(i))
+    Promise.all([api.identity(), api.accounts()])
+      .then(([i, accounts]) => {
+        if (!live) return;
+        setAccountId(accounts.find((a) => a.active)?.id ?? null);
+        setIdentity(i);
+      })
       .catch((e) => live && setError(String(e)));
     return () => {
       live = false;
@@ -29,8 +36,12 @@ export function Identities({ onMessage }: { onMessage: (text: string) => void })
   // this window applies as you touch it, and one pane that does not is a trap.
   const save = (next: Identity) => {
     setIdentity(next);
+    if (accountId === null) {
+      onMessage(t('identity-no-account'));
+      return;
+    }
     api
-      .setIdentity(next.display_name, next.signature, next.signature_on_reply)
+      .setIdentity(accountId, next.display_name, next.signature, next.signature_on_reply)
       .catch((e) => onMessage(t('identity-save-failed', { error: String(e) })));
   };
 

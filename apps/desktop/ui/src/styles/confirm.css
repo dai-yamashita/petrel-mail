@@ -47,7 +47,31 @@
   color: var(--danger);
 }
 
-.reply.danger:hover {
+.reply.danger:hover:not([aria-disabled='true']) {
   background: color-mix(in oklab, var(--danger) 8%, var(--surface));
   border-color: var(--danger);
+}
+
+/* What the footer's safe action came to: "Exported 1,204 messages…". */
+.confirm-note {
+  color: var(--ink);
+}
+
+.confirm-foot .spacer {
+  flex: 1;
+}
+
+/* Empty, the note takes no room and stays in the accessibility tree, so its
+   text is announced when it comes: `hidden` took it out until then. */
+.confirm-note:empty {
+  margin-block: 0;
+}
+
+/* Held back while the export runs, and still focusable (Confirm.tsx). A quiet
+   fill with real ink, as the naming dialog's held button, not opacity. */
+.confirm-foot .reply[aria-disabled='true'] {
+  border-color: var(--hair);
+  background: var(--hair2);
+  color: var(--ink3);
+  cursor: default;
 }

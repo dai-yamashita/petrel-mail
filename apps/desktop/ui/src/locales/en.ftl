@@ -56,6 +56,7 @@ reader-forward = Forward
 reader-failed = Could not open this conversation
 reader-to = to { $who }
 reader-cc = cc { $who }
+reader-bcc = bcc { $who }
 reader-collapse = Collapse message from { $who }
 msg-reply = Reply to this message
 msg-reply-all = Reply all to this message
@@ -129,6 +130,17 @@ onb-inbox-ready = Inbox is ready
 onb-start = Start reading
 onb-failed = Could not sign in: { $error }
 onb-add-failed = Could not save the account: { $error }
+signin-title = Sign in to { $email }
+signin-help = Enter the password for this account. Petrel checks it with your provider before it saves anything.
+signin-address = Address
+signin-checking = Checking with your provider…
+signin-done = Signed in to { $email }. Fetching your mail…
+signin-first = Sign in again first: Petrel can’t reach this account’s server until it has a password that works.
+signin-outbox-waiting = Waiting for you to sign in again. Nothing is sent until the account has a password that works.
+signin-outbox-scheduled = Going at { $when }, once you sign in again. Still yours to change.
+signin-outbox-check-waits = Petrel can check once you sign in again.
+signin-sending-waiting = Not sent yet: “{ $subject }” waits for you to sign in again
+signin-again = Sign in again…
 att-preview = Preview
 att-open = Open
 att-save = Save { $name }
@@ -184,6 +196,10 @@ empty-loading = Loading your mail…
 empty-syncing = Fetching your mail. { $count } so far…
 sync-failed-title = Could not reach your mail
 sync-failed-body = Showing what Petrel already had. Nothing is lost. Details in sync.log.
+signin-needed = Sign-in needed
+signin-refused = The server refused the password for { $email }.
+signin-missing = Petrel doesn’t have the password for { $email }.
+signin-empty-title = Sign in to fetch your mail
 compose-undo = Undo send
 compose-undo-help = After you press Send, Petrel holds the message for this long and shows an Undo button.
 compose-undo-off-label = Off
@@ -201,6 +217,8 @@ compose-reply = Reply
 compose-from = From
 compose-to = To
 compose-cc = Cc
+compose-bcc = Bcc
+compose-bcc-hint = Blind copy, hidden from the other recipients ({ $key })
 compose-subject = Subject
 compose-body = Message
 compose-send = Send
@@ -211,7 +229,7 @@ compose-attach-failed = Could not attach that: { $error }
 compose-missing-attachment = This mentions an attachment and has none. Send again to send anyway.
 compose-no-recipient = Add someone to send to.
 compose-bad-recipient = Not an address: { $addr }
-compose-sending = Sending in { $count }s
+compose-sending = Sending in { $count }s: { $subject }
 compose-send-now = Send now
 compose-sent = Sent
 compose-saved = Saved to Drafts
@@ -262,6 +280,16 @@ notify-many = { $count ->
     [one] { $count } new message
    *[other] { $count } new messages
 }
+notify-from-people = { $count ->
+    [one] From { $count } person
+   *[other] From { $count } people
+}
+notify-one-in = New message from { $who } in { $account }
+notify-many-in = { $count ->
+    [one] { $count } new message in { $account }
+   *[other] { $count } new messages in { $account }
+}
+notify-subject-in = { $subject } ({ $account })
 status-synced = Synced just now
 status-synced-min = Synced { $min }m ago
 status-synced-hr = Synced { $hr }h ago
@@ -318,6 +346,7 @@ identity-signature-placeholder = Added to the bottom of messages you write.
 identity-signature-replies = Use this signature on replies too
 identity-signature-replies-help = Off means new messages only. A signature repeated down a long thread is the thing people complain about.
 identity-save-failed = Could not save that: { $error }
+identity-no-account = Could not save that: the account is no longer here.
 privacy-remote = Remote content
 privacy-remote-help = Images and other files a message loads from the internet. Fetching them tells the sender you opened their message.
 privacy-remote-block = Block
@@ -432,10 +461,19 @@ account-switch-failed = Could not switch accounts: { $error }
 account-switch-draft-failed = Could not save the open draft, so the account was not switched: { $error }
 view-switch-draft-failed = Could not save the open draft, so the mailbox was not opened: { $error }
 accounts-add = Add account
+accounts-signin = Signing in
+accounts-signin-help = Changed your password, or made a new app password? Enter it here.
+accounts-needs-signin = Needs sign-in
 accounts-remove = Remove account
 accounts-remove-help = Removes this account, mail, and password. Nothing on the server changes.
 accounts-remove-confirm = Remove { $email }?
-accounts-remove-body = Its messages are deleted from this computer and its password from your system’s password store. The mail itself stays on the server, untouched.
+accounts-remove-body = Its messages and its password are deleted from this computer. Mail on the server stays there, but what exists only here is gone for good: mail in local or imported folders, mail the server has already deleted, and drafts and messages waiting to send. Export first saves the mail; drafts and messages waiting to send are not in it, so send or copy those first.
+accounts-remove-export = Export first…
+accounts-remove-exporting = Exporting…
+accounts-remove-exported = { $count ->
+    [one] Exported { $count } message from { $account }. Drafts and messages waiting to send are not in it.
+   *[other] Exported { $count } messages from { $account }. Drafts and messages waiting to send are not in it.
+}
 accounts-none = No accounts yet.
 accounts-failed = Could not read your accounts
 accounts-synced = synced { $when }
@@ -686,6 +724,7 @@ folder-created = Created “{ $name }”
 folder-deleted = Deleted “{ $name }”
 folder-failed = Folder change failed: { $error }
 folder-server-pending = Couldn’t create “{ $name }” on the server yet: { $error }. It is kept here, and the next sync tries again.
+folder-made-here-signin = Made “{ $name }” here. It goes to the server once you sign in again.
 folder-name-taken = A folder called “{ $name }” is already there.
 folder-bin-refuses = Mail moved to this account’s Trash would not be deleted. Delete “{ $name }” from its menu instead.
 tag-new = New tag
@@ -799,6 +838,7 @@ menubar-fullscreen = Toggle Full Screen
 sc-account = Switch active account
 sc-archive = Archive
 sc-back = Back to the list
+sc-bcc = Add Bcc
 sc-compose = Compose
 sc-find-in-message = Find in this conversation
 sc-goto = Go to Inbox · Starred · Sent · Drafts · All Mail

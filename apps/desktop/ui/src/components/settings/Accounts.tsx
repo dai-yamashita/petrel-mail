@@ -3,6 +3,7 @@ import { api, type Account } from '../../lib/api';
 import { count as fmtCount, listTime } from '../../lib/format';
 import { t } from '../../lib/strings';
 import { Confirm } from '../Confirm';
+import { SignInAgain } from '../SignInAgain';
 
 const COLORS = ['#0E7C86', '#9A6B1F', '#6B7F87', '#3B6EA5', '#6B5CA5', '#5E7C4A'];
 const ROLES = ['archive', 'sent', 'drafts', 'spam', 'trash'] as const;
@@ -10,12 +11,23 @@ const ROLES = ['archive', 'sent', 'drafts', 'spam', 'trash'] as const;
 export function Accounts({
   onAddAccount,
   onAccountRemoved,
+  onMessage,
 }: {
   onAddAccount: () => void;
   onAccountRemoved: (wasActive: boolean) => void;
+  onMessage?: (text: string) => void;
 }) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [removing, setRemoving] = useState<Account | null>(null);
+  const [signingIn, setSigningIn] = useState<Account | null>(null);
+  // What "Export first…" in the remove confirmation came to, said in it —
+  // and only in the confirmation of the account it was for. Kept as one
+  // string, a slow export cancelled out of one account's dialog said its
+  // result in the next account's.
+  const [exported, setExported] = useState<{ account: number; text: string } | null>(null);
+  // Whose export is being written. Remove waits for it: the export reads the
+  // account's mail, which the removal deletes.
+  const [exporting, setExporting] = useState<number | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -34,6 +46,31 @@ export function Accounts({
   }, []);
 
   const account = accounts.find((a) => a.id === selected) ?? null;
+
+  /** The account's mail, to a file the person picks, before it goes: what
+   *  exists only on this computer is not on the server to come back.
+   *
+   *  Mail only. The export writes what Petrel holds a stored copy of, and a
+   *  draft or a message waiting to send has none; the confirmation says so
+   *  before the button is pressed, and the result says so again. */
+  const exportFirst = async (a: Account) => {
+    setExporting(a.id);
+    try {
+      const path = await api.pickSavePath(`petrel-${a.email}.mbox`, 'mbox');
+      if (!path) return;
+      const [written] = (await api.exportMbox(a.id, 'all', path)).split('/');
+      setExported({
+        account: a.id,
+        // A number, so the sentence takes its plural ("1 messages" was the
+        // raw text in every language) and its grouping.
+        text: t('accounts-remove-exported', { count: Number(written), account: a.email }),
+      });
+    } catch (e) {
+      setExported({ account: a.id, text: t('storage-export-failed', { error: String(e) }) });
+    } finally {
+      setExporting(null);
+    }
+  };
 
   if (error) {
     return (
@@ -72,8 +109,14 @@ export function Accounts({
               <span className="account-main">
                 <span className="account-email clip">{a.email}</span>
                 <span className="tiny">
-                  {a.display_name || a.kind}
-                  {a.newest_ms ? ` · ${t('accounts-synced', { when: listTime(a.newest_ms) })}` : ''}
+                  {a.signin ? (
+                    <span className="account-signin">{t('accounts-needs-signin')}</span>
+                  ) : (
+                    <>
+                      {a.display_name || a.kind}
+                      {a.newest_ms ? ` · ${t('accounts-synced', { when: listTime(a.newest_ms) })}` : ''}
+                    </>
+                  )}
                 </span>
               </span>
               <span className="mono tiny">
@@ -93,6 +136,25 @@ export function Accounts({
               {t('accounts-storage', { count: account.message_count })}
             </p>
             <div className="box">
+              {/* For every account, not only one that has failed: a password
+                  changed on purpose is entered here before the server starts
+                  refusing the old one. */}
+              <div className="row2">
+                <div className="t">
+                  <b>{t('accounts-signin')}</b>
+                  <span className={account.signin ? 'account-signin' : undefined}>
+                    {account.signin
+                      ? t(account.signin === 'missing' ? 'signin-missing' : 'signin-refused', {
+                          email: account.email,
+                        })
+                      : t('accounts-signin-help')}
+                  </span>
+                </div>
+                <button type="button" className="reply" onClick={() => setSigningIn(account)}>
+                  {t('signin-again')}
+                </button>
+              </div>
+
               <div className="row2">
                 <div className="t">
                   <b>{t('accounts-colour')}</b>
@@ -194,15 +256,46 @@ export function Accounts({
         </>
       )}
 
+      <SignInAgain
+        account={signingIn}
+        onClose={() => setSigningIn(null)}
+        onSignedIn={(email) => {
+          setSigningIn(null);
+          onMessage?.(t('signin-done', { email }));
+          void load();
+        }}
+      />
+
       <Confirm
         open={removing !== null}
         title={t('accounts-remove-confirm', { email: removing?.email ?? '' })}
         detail={t('accounts-remove-body')}
         confirmLabel={t('accounts-remove')}
-        onClose={() => setRemoving(null)}
+        note={exported && exported.account === removing?.id ? exported.text : null}
+        confirmDisabled={exporting !== null && exporting === removing?.id}
+        extra={
+          removing
+            ? {
+                label:
+                  exporting === removing.id
+                    ? t('accounts-remove-exporting')
+                    : t('accounts-remove-export'),
+                disabled: exporting !== null,
+                onClick: () => void exportFirst(removing),
+              }
+            : null
+        }
+        onClose={() => {
+          // This account's result goes with its dialog; another account's,
+          // still on its way, stays for that account.
+          const closing = removing?.id;
+          setRemoving(null);
+          setExported((e) => (e && e.account === closing ? null : e));
+        }}
         onConfirm={() => {
           const a = removing;
           setRemoving(null);
+          setExported((e) => (e && e.account === a?.id ? null : e));
           if (!a) return;
           void api
             .removeAccount(a.id)

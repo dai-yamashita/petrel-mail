@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Clock, Paperclip, WifiOff } from 'lucide-react';
-import { api, type OutboxRow } from '../lib/api';
+import { api, type OutboxRow, type SignIn } from '../lib/api';
 import { Icon } from './Icon';
 import { t } from '../lib/strings';
 import { outboxRefusal } from '../lib/outbox-refusal';
+import { signinRefusal } from '../lib/signin-refusal';
 
 /**
  * Every message Petrel is holding, and why.
@@ -45,6 +46,8 @@ function reason(error: string | null): string {
 function Row({
   row,
   now,
+  signin,
+  onSignIn,
   onChange,
   onDiscard,
   onEdit,
@@ -52,6 +55,9 @@ function Row({
 }: {
   row: OutboxRow;
   now: number;
+  /** Set while the account cannot sign in: nothing goes until it can. */
+  signin?: SignIn | null;
+  onSignIn?: () => void;
   onChange: () => void;
   onDiscard: (row: OutboxRow) => void;
   /** `open` is the draft to resume: a new one when the message was deleted
@@ -94,6 +100,18 @@ function Row({
   const unknown = row.state === 'NeedsAttention';
   const noSuchUser = rejected && /^5[0-9]{2}.*(no such user|unknown user|user unknown|does not exist)/i.test(row.error ?? '');
 
+  // Signed out, a message that would go waits for the password instead, and
+  // says so: the send worker holds it, as Thunderbird holds unsent mail until
+  // you sign in. "Sending in 0s" over a message going nowhere said otherwise.
+  const held = !!signin && (pending || waiting);
+  // A message scheduled for later keeps its time while held: "Waiting for you
+  // to sign in again" alone lost "Going at Tue 09:00".
+  const scheduled = pending && row.send_after_ms - now >= 60_000;
+  // Nor can Sent be looked in for one whose outcome is unknown: Check again
+  // was a sign-in with the refused password, answered "cannot reach the
+  // server". The row says why, and offers the sign-in instead.
+  const checkWaits = unknown && !!signin;
+
   const tone = unknown ? 'amber' : rejected ? 'red' : waiting ? 'muted' : 'normal';
 
   return (
@@ -122,12 +140,17 @@ function Row({
 
       <p className="outbox-why">
         {row.state === 'Transmitting' && t('outbox-transmitting')}
+        {held &&
+          (scheduled
+            ? t('signin-outbox-scheduled', { when: at(row.send_after_ms) })
+            : t('signin-outbox-waiting'))}
         {pending &&
+          !held &&
           (row.send_after_ms - now < 60_000
             ? t('outbox-sending-in', { when: until(row.send_after_ms, now) })
             : t('outbox-scheduled-for', { when: at(row.send_after_ms) }))}
-        {waiting && offline && t('outbox-offline')}
-        {waiting && !offline && t('outbox-retrying', { when: until(row.next_ms ?? now, now) })}
+        {waiting && !held && offline && t('outbox-offline')}
+        {waiting && !held && !offline && t('outbox-retrying', { when: until(row.next_ms ?? now, now) })}
         {rejected &&
           t(noSuchUser ? 'outbox-rejected-user' : 'outbox-rejected', { reason: reason(row.error) })}
         {unknown && (
@@ -135,23 +158,44 @@ function Row({
             {t('outbox-unknown-1')}
             <br />
             {t('outbox-unknown-2')}
+            {checkWaits && (
+              <>
+                <br />
+                {t('signin-outbox-check-waits')}
+              </>
+            )}
           </>
         )}
         {checking && <span className="outbox-checked"> {checking}</span>}
       </p>
 
       <div className="outbox-acts">
+        {held && onSignIn && (
+          <button type="button" className="reply primary" onClick={onSignIn}>
+            {t('signin-again')}
+          </button>
+        )}
         {pending && (
           <>
+            {/* Z is the bar's only while it counts; held, it is the last
+                action's again (docs/24 #9), and the key is not offered. */}
             <button type="button" className="reply" onClick={edit}>
-              {t('outbox-undo')} <span className="kbd">Z</span>
+              {t('outbox-undo')}
+              {!held && (
+                <>
+                  {' '}
+                  <span className="kbd">Z</span>
+                </>
+              )}
             </button>
-            <button type="button" className="reply primary" onClick={() => act(api.outboxSendNow(row.id))}>
-              {t('outbox-send-now')}
-            </button>
+            {!held && (
+              <button type="button" className="reply primary" onClick={() => act(api.outboxSendNow(row.id))}>
+                {t('outbox-send-now')}
+              </button>
+            )}
           </>
         )}
-        {waiting && !offline && (
+        {waiting && !held && !offline && (
           <button type="button" className="reply primary" onClick={() => act(api.outboxSendNow(row.id))}>
             {t('outbox-try-now')}
           </button>
@@ -166,29 +210,36 @@ function Row({
             </button>
           </>
         )}
+        {checkWaits && onSignIn && (
+          <button type="button" className="reply primary" onClick={onSignIn}>
+            {t('signin-again')}
+          </button>
+        )}
         {unknown && (
           <>
-            <button
-              type="button"
-              className="reply primary"
-              onClick={() =>
-                void api
-                  .outboxCheck(row.id)
-                  .then((s) => {
-                    setChecking(
-                      s === 'Sent'
-                        ? t('outbox-checked-sent')
-                        : s === 'RetryQueued'
-                          ? t('outbox-checked-absent')
-                          : t('outbox-checked-unknown'),
-                    );
-                    onChange();
-                  })
-                  .catch((e) => setChecking(String(e)))
-              }
-            >
-              {t('outbox-check-again')}
-            </button>
+            {!checkWaits && (
+              <button
+                type="button"
+                className="reply primary"
+                onClick={() =>
+                  void api
+                    .outboxCheck(row.id)
+                    .then((s) => {
+                      setChecking(
+                        s === 'Sent'
+                          ? t('outbox-checked-sent')
+                          : s === 'RetryQueued'
+                            ? t('outbox-checked-absent')
+                            : t('outbox-checked-unknown'),
+                      );
+                      onChange();
+                    })
+                    .catch((e) => setChecking(signinRefusal(e) ?? String(e)))
+                }
+              >
+                {t('outbox-check-again')}
+              </button>
+            )}
             <button type="button" className="reply" onClick={() => act(api.outboxSendNow(row.id))}>
               {t('outbox-send-anyway')}
             </button>
@@ -203,11 +254,16 @@ function Row({
 }
 
 export function Outbox({
+  signin,
+  onSignIn,
   onDiscard,
   onCountChange,
   onEdit,
   onRefused,
 }: {
+  /** Why the account cannot sign in, if it cannot: its unsent mail waits. */
+  signin?: SignIn | null;
+  onSignIn?: () => void;
   onDiscard: (row: OutboxRow) => void;
   /** Told how many need a person, so the rail can turn amber. */
   onCountChange?: (total: number, needsAttention: number) => void;
@@ -256,6 +312,8 @@ export function Outbox({
           key={r.id}
           row={r}
           now={now}
+          signin={signin}
+          onSignIn={onSignIn}
           onChange={() => setTick((n) => n + 1)}
           onDiscard={onDiscard}
           onEdit={onEdit}

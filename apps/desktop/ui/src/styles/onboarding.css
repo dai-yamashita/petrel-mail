@@ -210,3 +210,29 @@
 .onboarding-dialog .onboarding {
   background: transparent;
 }
+
+/* Signing in again: the onboarding card's fields, in a dialog that can sit
+   over Settings. It scrolls in place when the server settings are open in a
+   small window, rather than running off the screen. */
+.signin-card {
+  max-block-size: calc(100vh - 48px);
+  overflow-y: auto;
+}
+
+.signin-disclose {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-block-start: 10px;
+}
+
+.signin-servers {
+  margin-block-start: 4px;
+}
+
+/* Hidden rather than absent, so the live region exists before it has
+   anything to say (SignInAgain). The class's own display would otherwise win
+   over the attribute. */
+.onb-test[hidden] {
+  display: none;
+}

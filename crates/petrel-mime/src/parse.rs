@@ -5,6 +5,8 @@
 //! to parse would mean refusing to show the user mail that already sits in
 //! their mailbox — the parser's job is to salvage, not to judge.
 
+use std::collections::{HashMap, HashSet};
+
 use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders};
 
 use crate::encoded_word::merge_adjacent_encoded_words;
@@ -86,19 +88,19 @@ fn quoted_pictures_within(
     let Some(msg) = MessageParser::default().parse(raw) else {
         return out;
     };
+    // Named exactly as `resolve_cids` resolves them, `="cid:ID"` with the id
+    // serialized as the sanitizer writes an attribute value, and read from
+    // one walk of the body. A `contains` per part cost a walk of the body
+    // per part (docs/25 #87), and a bare `cid:{id}` counted part `1` as
+    // shown when the body named `cid:10`, so a forward neither embedded nor
+    // attached it (docs/24 #39).
+    let named = crate::sanitize::cids_named(html);
     let mut spent = 0usize;
     for (part, att) in msg.attachments().enumerate() {
         let Some(cid) = att.content_id() else {
             continue;
         };
-        // Referenced as the sanitizer serializes an attribute value, which is
-        // also the form `resolve_cids` looks for.
-        let escaped = cid
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;");
-        if !html.contains(&format!("cid:{escaped}")) {
+        if !named.contains(crate::sanitize::cid_in_attribute(cid).as_str()) {
             continue;
         }
         let mime = att
@@ -157,18 +159,32 @@ pub fn data_url(mime: &str, bytes: &[u8]) -> String {
 }
 
 fn embed_pictures(html: &str, pictures: &[QuotedPicture]) -> String {
-    let parts: Vec<Attachment> = pictures
-        .iter()
-        .map(|p| Attachment {
-            filename: None,
-            content_type: Some(p.mime.clone()),
-            size: p.bytes.len(),
-            content_id: Some(p.cid.clone()),
-            is_inline: true,
-        })
-        .collect();
-    let resolved = crate::sanitize::resolve_cids(html, &parts, |i| {
-        data_url(&pictures[i].mime, &pictures[i].bytes)
+    embed_pictures_within(html, pictures, QUOTE_PICTURES_BUDGET)
+}
+
+/// Writes each picture in at every place the body shows it, while `repeats`
+/// lasts. A picture's first appearance is already paid for: `quoted_pictures`
+/// admitted it within the budget. Every later one is a second copy of its
+/// bytes, and those are counted, because nothing else bounded them — one
+/// 8 MB picture named a thousand times made an 11 GB quote. A mention past
+/// the allowance is left out, as a cid the reply cannot carry is.
+fn embed_pictures_within(html: &str, pictures: &[QuotedPicture], repeats: usize) -> String {
+    let mut urls: HashMap<String, String> = HashMap::new();
+    for p in pictures {
+        urls.entry(crate::sanitize::cid_in_attribute(&p.cid))
+            .or_insert_with(|| data_url(&p.mime, &p.bytes));
+    }
+    let mut written: HashSet<&str> = HashSet::new();
+    let mut spent = 0usize;
+    let resolved = crate::sanitize::rewrite_cids(html, |id| {
+        let (id, url) = urls.get_key_value(id)?;
+        if !written.insert(id.as_str()) {
+            if spent + url.len() > repeats {
+                return None;
+            }
+            spent += url.len();
+        }
+        Some(url.as_str())
     });
     // Double-quoted only, for `resolve_cids`' reason: a single-quoted form is
     // never an attribute of sanitized HTML, only text inside one.
@@ -406,6 +422,10 @@ pub struct ParsedMessage {
     pub from_display: Option<String>,
     pub to: Vec<(Option<String>, String)>,
     pub cc: Vec<(Option<String>, String)>,
+    /// Blind copies, where a Bcc header survived: the sender's own copy of
+    /// what they sent, a draft, or a delivery that left the blind copy's
+    /// name on it. Never part of a reply's recipients.
+    pub bcc: Vec<(Option<String>, String)>,
     /// Where the author asks replies to go, when that is not the From address.
     ///
     /// RFC 5322 §3.6.2. A list that rewrites it sends your answer to the list;
@@ -461,6 +481,9 @@ impl ParsedMessage {
         }
         for (name, addr) in &self.cc {
             out.push(("cc", addr.to_lowercase(), name.clone()));
+        }
+        for (name, addr) in &self.bcc {
+            out.push(("bcc", addr.to_lowercase(), name.clone()));
         }
         out
     }
@@ -719,6 +742,7 @@ pub fn parse_message(raw: &[u8]) -> Option<ParsedMessage> {
         from_display,
         to: addr_lists(msg.all_to()),
         cc: addr_lists(msg.all_cc()),
+        bcc: addr_lists(msg.all_bcc()),
         reply_to: addr_list(msg.reply_to()),
         date_ms: msg.date().map(|d| d.to_timestamp() * 1000),
         body_text: body_of(&msg, parsed, false).unwrap_or_default(),
@@ -1656,6 +1680,63 @@ Content-ID: <{cid}>\r\n\r\n{PNG}\r\n"
             .map(|p| p.part)
             .collect();
         assert_eq!(fitted, vec![0], "the second would overspend the budget");
+    }
+
+    /// docs/24 #39: a part whose id begins another referenced id counted as
+    /// quoted, because the test was `contains("cid:1")` and the body named
+    /// `cid:10`. The body never embedded it, so a forward neither embedded
+    /// nor attached it. Only the exact reference counts now.
+    #[test]
+    fn a_cid_that_begins_a_referenced_one_is_not_counted_as_quoted() {
+        let raw = message(&format!(
+            "{}{}",
+            picture("1", "image/png"),
+            picture("10", "image/png")
+        ));
+        let pictures = quoted_pictures(r#"<img src="cid:10">"#, &raw);
+        let cids: Vec<&str> = pictures.iter().map(|p| p.cid.as_str()).collect();
+        assert_eq!(cids, vec!["10"]);
+    }
+
+    /// One picture named over and over was written in at every mention: an
+    /// 8 MB picture named a thousand times made an 11 GB quote. The first
+    /// mention is the picture `quoted_pictures` admitted; every later copy
+    /// counts against an allowance, and a mention past it is left out.
+    #[test]
+    fn a_picture_named_many_times_is_written_in_only_while_the_budget_lasts() {
+        let raw = message(&picture("logo@x", "image/png"));
+        let html = r#"<img src="cid:logo@x">"#.repeat(10);
+        let pictures = quoted_pictures(&html, &raw);
+        let one = data_url("image/png", &pictures[0].bytes).len();
+        let out = embed_pictures_within(&html, &pictures, 2 * one);
+        assert_eq!(out.matches("data:image/png").count(), 3, "{out}");
+        assert_eq!(out.matches(r#"data-cid="logo@x""#).count(), 7, "{out}");
+    }
+
+    /// docs/25 #87, the quote's half: forty thousand inline parts and a
+    /// megabyte of body took four to five seconds to quote.
+    #[test]
+    fn forty_thousand_inline_parts_quote_in_one_pass() {
+        let mut parts = String::new();
+        for i in 0..40_000 {
+            parts.push_str(&format!(
+                "--b\r\nContent-Type: image/gif\r\nContent-ID: <p{i}>\r\nContent-Disposition: inline\r\n\r\nx\r\n"
+            ));
+        }
+        let raw = message(&parts);
+        let mut html = String::from("<p>hello</p><img src=\"cid:p0\">");
+        while html.len() < 1024 * 1024 {
+            html.push_str("<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>");
+        }
+        let started = std::time::Instant::now();
+        let out = embed_cid_images(&html, &raw);
+        let took = started.elapsed();
+        assert!(
+            out.starts_with("<p>hello</p><img src=\"data:image/gif;base64,"),
+            "{}",
+            &out[..80]
+        );
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
     }
 
     #[test]

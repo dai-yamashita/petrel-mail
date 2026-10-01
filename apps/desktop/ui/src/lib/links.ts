@@ -33,24 +33,134 @@ export type Link =
  * the browser, so the moment to say something is before it goes.
  */
 export type HomographRisk = {
-  /** What the address looks like — the sender's spelling. */
+  /** What the address looks like: the destination's own letters. */
   asTyped: string;
   /** What it actually resolves to, in the ASCII form DNS uses. */
   asPunycode: string;
   reason: 'mixed-script' | 'latin-lookalike';
 };
 
-/** Characters from other alphabets that pass for Latin letters at a glance.
- *  Not the whole of UTS #39 — the ones that carry the attack. */
-const LATIN_LOOKALIKES =
-  /[\u0430\u0435\u043e\u0440\u0441\u0445\u0443\u0456\u0458\u04bb\u0501\u051b\u0561\u03bf\u03b1\u03bd\u03c1\u0261\u1d0f]/u;
+/** Letters of other alphabets that pass for Latin ones at a glance. The
+ *  Cyrillic ones are the set Chromium's IDN spoof checker uses for the same
+ *  question; the Greek and Armenian ones carry the same attack. Not the whole
+ *  of UTS #39, only the letters that do the disguising. */
+const LOOKS_LATIN = new Set([
+  ...'\u0430\u0441\u0501\u0435\u04bb\u0456\u0458\u04cf\u043e\u0440\u051b\u0455\u051d\u0445\u0443\u044a\u044c\u04bd\u043f\u0433\u0475\u0461',
+  ...'\u03bf\u03b1\u03bd\u03c1',
+  ...'\u0561',
+]);
 
-/** The authority exactly as the sender wrote it, before any normalising. */
-function typedHost(raw: string): string | null {
-  const after = raw.slice(raw.indexOf('://') + 3);
-  const host = after.split(/[/?#]/)[0];
-  const noUser = host.includes('@') ? host.slice(host.lastIndexOf('@') + 1) : host;
-  return noUser.replace(/:\d+$/, '') || null;
+/** Letters of the Latin script itself that stand in for plain ASCII ones:
+ *  a script g or a small-capital o in an otherwise ordinary name. */
+const LATIN_STAND_INS = /[\u0261\u1d0f]/u;
+
+/**
+ * What is wrong with one label, if anything.
+ *
+ * Judged a label at a time, as browsers do. A Cyrillic name under `.com` is
+ * not mixing scripts, since its letters are all Cyrillic, and reading the
+ * whole host at once used to question every such domain. Nor is a Cyrillic
+ * letter that happens to look Latin a disguise on its own: the Cyrillic word
+ * for Yandex has several and is plainly Cyrillic. The disguise is a label
+ * whose every letter could pass for Latin, since only then does the whole
+ * word read as a Latin one.
+ */
+function labelRisk(label: string): HomographRisk['reason'] | null {
+  const letters = [...label].filter((c) => /\p{L}/u.test(c));
+  if (letters.length === 0) return null;
+  const latin = letters.some((c) => /\p{Script=Latin}/u.test(c));
+  const other = letters.some((c) =>
+    /[\p{Script=Cyrillic}\p{Script=Greek}\p{Script=Armenian}]/u.test(c),
+  );
+  if (latin && other) return 'mixed-script';
+  if (LATIN_STAND_INS.test(label)) return 'latin-lookalike';
+  if (other && letters.every((c) => LOOKS_LATIN.has(c))) return 'latin-lookalike';
+  return null;
+}
+
+/** RFC 3492's constants, for decoding a punycode label. */
+const PUNY = { base: 36, tMin: 1, tMax: 26, skew: 38, damp: 700, bias: 72, n: 128 } as const;
+const MAX_INT = 0x7fffffff;
+
+function punyDigit(code: number): number {
+  if (code >= 0x30 && code <= 0x39) return code - 22; // 0-9 are 26-35
+  if (code >= 0x41 && code <= 0x5a) return code - 0x41; // A-Z
+  if (code >= 0x61 && code <= 0x7a) return code - 0x61; // a-z
+  return PUNY.base;
+}
+
+function punyAdapt(delta: number, points: number, first: boolean): number {
+  let d = first ? Math.floor(delta / PUNY.damp) : delta >> 1;
+  d += Math.floor(d / points);
+  let k = 0;
+  while (d > ((PUNY.base - PUNY.tMin) * PUNY.tMax) >> 1) {
+    d = Math.floor(d / (PUNY.base - PUNY.tMin));
+    k += PUNY.base;
+  }
+  return k + Math.floor(((PUNY.base - PUNY.tMin + 1) * d) / (d + PUNY.skew));
+}
+
+/** One label's letters, from the part after `xn--`; null when it is not valid
+ *  punycode. The decoding RFC 3492 gives, as browsers and Node do it. */
+function decodeLabel(input: string): string | null {
+  const out: number[] = [];
+  let basic = input.lastIndexOf('-');
+  if (basic < 0) basic = 0;
+  for (let j = 0; j < basic; j += 1) {
+    const code = input.charCodeAt(j);
+    if (code >= 0x80) return null;
+    out.push(code);
+  }
+  let n: number = PUNY.n;
+  let bias: number = PUNY.bias;
+  let i = 0;
+  for (let at = basic > 0 ? basic + 1 : 0; at < input.length; ) {
+    const before = i;
+    let w = 1;
+    for (let k = PUNY.base; ; k += PUNY.base) {
+      if (at >= input.length) return null;
+      const digit = punyDigit(input.charCodeAt(at++));
+      if (digit >= PUNY.base || digit > Math.floor((MAX_INT - i) / w)) return null;
+      i += digit * w;
+      const t = k <= bias ? PUNY.tMin : k >= bias + PUNY.tMax ? PUNY.tMax : k - bias;
+      if (digit < t) break;
+      if (w > Math.floor(MAX_INT / (PUNY.base - t))) return null;
+      w *= PUNY.base - t;
+    }
+    const length = out.length + 1;
+    bias = punyAdapt(i - before, length, before === 0);
+    if (Math.floor(i / length) > MAX_INT - n) return null;
+    n += Math.floor(i / length);
+    i %= length;
+    out.splice(i, 0, n);
+    i += 1;
+  }
+  if (out.length === 0) return null;
+  try {
+    return String.fromCodePoint(...out);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A host's letters, decoded from the ASCII form DNS uses.
+ *
+ * The question a homograph raises is about where a link goes, so it is read
+ * from the destination itself rather than from how the link happened to be
+ * spelled. That matters more than it sounds: the message frame hands over the
+ * anchor's `href`, which the browser has already turned into punycode, so a
+ * check that read the sender's spelling was only ever shown `xn--pple-…` and
+ * never saw the Cyrillic а it exists to catch. A label that will not decode
+ * is left as it is.
+ */
+export function unicodeHost(ascii: string): string {
+  return ascii
+    .split('.')
+    .map((label) =>
+      label.toLowerCase().startsWith('xn--') ? (decodeLabel(label.slice(4)) ?? label) : label,
+    )
+    .join('.');
 }
 
 /**
@@ -74,12 +184,17 @@ export function homographRisk(href: string): HomographRisk | null {
   // No punycode label means no non-ASCII: nothing can be disguised.
   if (!asPunycode.split('.').some((label) => label.startsWith('xn--'))) return null;
 
-  const asTyped = typedHost(href) ?? asPunycode;
-  const hasLatin = /\p{Script=Latin}/u.test(asTyped);
-  const hasOther = /[\p{Script=Cyrillic}\p{Script=Greek}\p{Script=Armenian}]/u.test(asTyped);
-  if (hasLatin && hasOther) return { asTyped, asPunycode, reason: 'mixed-script' };
-  if (LATIN_LOOKALIKES.test(asTyped)) return { asTyped, asPunycode, reason: 'latin-lookalike' };
-  return null;
+  const asTyped = unicodeHost(asPunycode);
+  // The last label is the top-level domain: a registry's fixed list rather
+  // than anything a sender can pick, and a Cyrillic one such as рус is made
+  // only of letters that look Latin. Judging it would question every address
+  // under it. A bare single-label host is judged as it is.
+  const labels = asTyped.split('.');
+  const reasons = (labels.length > 1 ? labels.slice(0, -1) : labels).map(labelRisk);
+  const reason = reasons.includes('mixed-script')
+    ? 'mixed-script'
+    : reasons.find((r) => r !== null);
+  return reason ? { asTyped, asPunycode, reason } : null;
 }
 
 /**

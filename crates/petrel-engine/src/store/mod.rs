@@ -161,6 +161,12 @@ pub enum StoreError {
     /// rolled back rather than leave the store changed.
     #[error("schema step failed: {0}")]
     Migration(String),
+    /// The store was written by a newer Petrel, whose schema this build does
+    /// not know. Refused before anything touches the file.
+    #[error(
+        "this mailbox was made by a newer version of Petrel (schema {found}; this version reads up to {supported})"
+    )]
+    NewerSchema { found: i64, supported: i64 },
 }
 
 /// What a garbage-collection pass destroyed.
@@ -190,6 +196,83 @@ pub struct Store {
     /// one; see `deferred_step`.
     deferred: Option<String>,
 }
+
+/// Writes that stand or fall together: what a function wrote to a message,
+/// its index entry, its recipients and its placements, all of it or none.
+///
+/// Several store calls wrote those as separate statements, each its own
+/// commit, so a failure partway — a full disk, an I/O error — left a draft
+/// with its new subject and none of its recipients, or a message tombstoned
+/// and still indexed (docs/25 #92). AGENTS.md calls index drift the one
+/// unforgivable bug class.
+///
+/// A savepoint rather than a transaction, because some of these run inside a
+/// caller's transaction (`pull_back` saves a draft inside its own) and a
+/// savepoint nests where BEGIN cannot. Dropped without `done`, which is what
+/// an early `?` does, it takes back everything written since it began.
+pub(crate) struct Atomic<'c> {
+    conn: &'c Connection,
+    kept: bool,
+}
+
+impl Atomic<'_> {
+    /// Keeps what was written.
+    pub(crate) fn done(mut self) -> Result<()> {
+        self.conn.execute_batch("RELEASE petrel_atomic")?;
+        self.kept = true;
+        Ok(())
+    }
+}
+
+impl Drop for Atomic<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK TO petrel_atomic; RELEASE petrel_atomic");
+        }
+    }
+}
+
+/// A message's content identity (`petrel_mime::feed_identity`) as a hex
+/// digest, and whether it names blind copies. `None` when it does not parse.
+fn content_identity(raw: &[u8]) -> Option<(String, bool)> {
+    let mut hasher = blake3::Hasher::new();
+    let facts = petrel_mime::feed_identity(raw, &mut |bytes| {
+        hasher.update(bytes);
+    })?;
+    Some((hasher.finalize().to_hex().to_string(), facts.has_bcc))
+}
+
+/// The Message-ID a stored key stands for on the wire, if it stands for one.
+///
+/// The key is the header when the message had one, and stands in for it
+/// otherwise: a blob hash for a message with no Message-ID, a `::copy-N`
+/// suffix on a second server copy of the same message, and a `::b-…` suffix
+/// on a different message that shares its Message-ID with another. A reply
+/// must name only the real thing — an invented id threads with nothing, and
+/// a suffixed one threads with nothing either.
+pub(crate) fn wire_message_id(key: &str) -> Option<&str> {
+    if key.is_empty() || key.starts_with("blake3:") {
+        return None;
+    }
+    let end = [key.find("::copy-"), key.find("::b-")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(key.len());
+    let bare = &key[..end];
+    (!bare.is_empty()).then_some(bare)
+}
+
+/// The SQL that picks out every key a wire Message-ID stands behind: the
+/// plain key, and the keys Petrel suffixes for a second server copy
+/// (`::copy-N`) or a different message under the same id (`::b-…`). Exact
+/// prefix ranges, not LIKE, in which `_` or `%` in a Message-ID is a
+/// wildcard. Binds the Message-ID as `?2`, against the alias `m`.
+const CARRIES_WIRE_ID: &str = "(m.message_id_hdr = ?2
+      OR (m.message_id_hdr >= ?2 || '::b-' AND m.message_id_hdr < ?2 || '::b.')
+      OR (m.message_id_hdr >= ?2 || '::copy-' AND m.message_id_hdr < ?2 || '::copy.'))";
 
 /// Minimal insertable message for the M0 store spike; the MIME pipeline will
 /// replace this with parsed structures.
@@ -313,6 +396,9 @@ pub struct ThreadMessage {
     pub to: Vec<String>,
     /// Cc, display names. Empty when the message copied nobody.
     pub cc: Vec<String>,
+    /// Bcc, display names: on the sender's own copy, where the header was
+    /// kept. Not in `recipients` or `recipient_addrs`, so no reply reaches them.
+    pub bcc: Vec<String>,
     /// Display names, To then Cc — "to Sam Ortiz, Dana Wu". Reply-all still
     /// walks this combined list so original To people are not left off.
     pub recipients: Vec<String>,
@@ -444,6 +530,12 @@ pub struct DraftEnvelope {
     /// Paths on this machine. A draft is local; the file is read when it goes.
     #[serde(default)]
     pub attachments: Vec<String>,
+    /// Blind copies, as the composer's field holds them: comma-separated,
+    /// like To and Cc. Kept here rather than in `message_addresses`, where
+    /// everything that reads To and Cc would have to learn to step around
+    /// them; a draft from before there was a Bcc reads as none.
+    #[serde(default)]
+    pub bcc: String,
 }
 
 /// Who a message is sent as.
@@ -1395,6 +1487,15 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
+    /// Begins writes that stand or fall together; see [`Atomic`].
+    pub(crate) fn atomic(&self) -> Result<Atomic<'_>> {
+        self.conn.execute_batch("SAVEPOINT petrel_atomic")?;
+        Ok(Atomic {
+            conn: &self.conn,
+            kept: false,
+        })
+    }
+
     /// A second connection to a store that is already open.
     ///
     /// WAL lets this connection read while the writer is mid-transaction.
@@ -1435,13 +1536,25 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        // A store a newer Petrel wrote is refused before anything is set on
+        // it. Opened here, the older code would run against tables it does not
+        // understand, and the file would keep the newer version number, so
+        // whatever this build wrote in its own shape would never be migrated
+        // on the way back up (docs/25 #91). Thunderbird refuses a newer
+        // profile for the same reason.
+        let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if ver > SCHEMA_VERSION {
+            return Err(StoreError::NewerSchema {
+                found: ver,
+                supported: SCHEMA_VERSION,
+            });
+        }
         register_functions(&conn)?;
         apply_runtime_pragmas(&conn)?;
         // Migrations apply in order from whatever version the file is at, so a
         // fresh database runs the baseline and then every step, and an existing
         // one runs only what it is missing. Re-running schema.sql over a
         // populated store would fail on "table already exists".
-        let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let mut deferred = None;
         for (n, step) in MIGRATIONS {
             if ver < *n {
@@ -1704,25 +1817,41 @@ impl Store {
             "INSERT OR IGNORE INTO blobs(hash, kind, size) VALUES (?1, 'raw', ?2)",
             params![hash, blob_size as i64],
         )?;
+        // These bytes are already stored, but the file under their hash is
+        // not the size it was written at: damaged, truncated or replaced since
+        // — a disk error, a restore without its blobs. `write` leaves any file
+        // already there alone, so the same bytes fetched again never mended
+        // it; they do now (docs/25 review). Free on the ordinary path: the
+        // size is what `write` just read, and a mismatch is rare enough that
+        // reading the file to be sure costs nothing anyone will notice.
+        let recorded: Option<i64> = tx
+            .query_row(
+                "SELECT size FROM blobs WHERE hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if recorded.is_some_and(|size| size != blob_size as i64) {
+            blobs
+                .repair(raw)
+                .map_err(|e| StoreError::Ingest(format!("blob repair failed: {e}")))?;
+        }
 
         // Message-ID is the dedupe key; without one, fall back to the blob hash
         // so a broken message still can't multiply on every resync.
-        let mut dedupe_key = parsed
+        let bare_key = parsed
             .message_id
             .clone()
             .unwrap_or_else(|| format!("blake3:{hash}"));
-        if let Some(n) = copy_suffix {
-            dedupe_key = format!("{dedupe_key}::copy-{n}");
-        }
 
-        let existing: Option<i64> = tx
-            .query_row(
+        let row_for = |key: &str| -> Option<i64> {
+            tx.query_row(
                 "SELECT id FROM messages WHERE account_id = ?1 AND message_id_hdr = ?2",
-                params![account_id, dedupe_key],
+                params![account_id, key],
                 |r| r.get(0),
             )
-            .ok();
-
+            .ok()
+        };
         // A row the composer owns — a draft being written here, or post
         // waiting in the outbox — is its own authority for what it says. Its
         // pushed copy comes back through ordinary folder sync and lands here
@@ -1735,24 +1864,345 @@ impl Store {
         // by another client arrives as a second copy and is offered as a
         // conflict instead (`draft_conflict`). `Some` holds the row's own
         // subject, which threading reads in place of the copy's.
-        let composer_subject: Option<String> = match existing {
-            Some(id) => tx
-                .query_row(
-                    &format!(
-                        "SELECT coalesce(m.subject, '') FROM messages m
-                          WHERE m.id = ?1 AND NOT ({})",
-                        folders::NOT_DRAFT_OR_OUTBOX
-                    ),
-                    params![id],
-                    |r| r.get(0),
-                )
-                .optional()?,
-            None => None,
+        let composer_subject_of = |id: Option<i64>| -> Result<Option<String>> {
+            Ok(match id {
+                Some(id) => tx
+                    .query_row(
+                        &format!(
+                            "SELECT coalesce(m.subject, '') FROM messages m
+                              WHERE m.id = ?1 AND NOT ({})",
+                            folders::NOT_DRAFT_OR_OUTBOX
+                        ),
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .optional()?,
+                None => None,
+            })
         };
-        let composer_owned = composer_subject.is_some();
+        // The bytes a live row stands on, when they are other than these. A
+        // row with no bytes of its own, or one Petrel had thrown away, has
+        // nothing to keep, and takes what the server holds now.
+        let other_bytes_of = |id: i64| -> Result<Option<String>> {
+            let (stored, live): (Option<String>, bool) = tx.query_row(
+                "SELECT blob_hash, deleted_at_ms IS NULL FROM messages WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(stored.filter(|s| live && *s != hash))
+        };
+        let role_of_arrival = match folder_id {
+            Some(fid) => tx
+                .query_row(
+                    "SELECT coalesce(role, '') FROM folders WHERE id = ?1",
+                    params![fid],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .unwrap_or_default(),
+            None => String::new(),
+        };
 
+        // A Message-ID is no secret: the sender, every co-recipient, anyone the
+        // thread reached and every list archive knows it, and so does everyone
+        // a message of yours was sent to. Two messages under one Message-ID
+        // are told apart by what they say, never by which arrived first (docs/25
+        // #78). Rewriting the stored row let anyone who had seen an invoice
+        // change its bank details in place; keeping whichever came first let a
+        // forgery fetched before the real invoice — the newest mail is fetched
+        // first and older folders backfilled after — stand in for it, and hid
+        // a sender's new message behind its old one.
+        //
+        // So: the same message seen twice (sent to yourself, delivered under an
+        // alias, fetched again with other trace headers) is one row, and the
+        // arrival adds where it is filed. A different message is a row of its
+        // own under a key made from its content, `<id>::b-<identity>`: new
+        // mail, with its own words, flags and conversation, and the key any
+        // later fetch of it, in any folder, finds again.
+        //
+        // The identity is worked out only here, where a live row shares the
+        // Message-ID and holds other bytes; the same bytes are the same message
+        // without asking. See `petrel_mime::feed_identity` for what it reads.
+        let mut arrival_identity: Option<Option<(String, bool)>> = None;
+        let mut arrival = || -> Option<(String, bool)> {
+            arrival_identity
+                .get_or_insert_with(|| content_identity(raw))
+                .clone()
+        };
+        // A stored row's identity, from its own bytes. `Err` when its bytes
+        // cannot be read: then there is nothing to keep, as with no bytes.
+        let stored_identity =
+            |stored_hash: &str| -> std::result::Result<Option<(String, bool)>, ()> {
+                let bytes = blobs.read(stored_hash).map_err(|_| ())?;
+                Ok(content_identity(&bytes))
+            };
+        let content_key = |identity: Option<&(String, bool)>| -> String {
+            let digest = identity.map_or(hash.as_str(), |(d, _)| d.as_str());
+            format!("{bare_key}::b-{}", &digest[..16.min(digest.len())])
+        };
+        // The sender's own copy is the authoritative version of their own
+        // message, and only their own clients write to Sent: arriving there
+        // with blind copies the stored copy lacks, it is what the row shows.
+        let into_sent = role_of_arrival == "sent";
+
+        let mut key = bare_key.clone();
+        // Bytes a row already holds are that row, whatever its key says. A
+        // content key is a digest of what the parser read, so a parser change
+        // moves it, and the next fetch of the same message, looked up by the
+        // new digest, became a second row announced as new mail (docs/25
+        // review). The bytes do not move. Checked before anything compares
+        // identities; a row Petrel had thrown away counts too, so a fetch
+        // after a renumbering brings back the row it was, not another. Not a
+        // row whose copy in this folder is another UID: that is a second copy
+        // on the server, which the paths below keep apart.
+        let same_bytes: Option<(i64, String)> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT m.id, m.message_id_hdr FROM messages m
+                  WHERE m.account_id = ?1 AND m.blob_hash = ?2
+                    AND NOT EXISTS (SELECT 1 FROM placements p
+                                     WHERE p.message_id = m.id AND p.folder_id = ?3
+                                       AND p.uid IS NOT NULL AND p.uid IS NOT ?4)
+                  ORDER BY m.deleted_at_ms IS NOT NULL, m.message_id_hdr = ?5 DESC, m.id",
+            )?;
+            let rows = stmt.query_map(
+                params![account_id, hash, folder_id, uid.map(i64::from), bare_key],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+            )?;
+            let mut found = None;
+            for row in rows {
+                let (id, row_key) = row?;
+                let Some(row_key) = row_key else { continue };
+                let ours = row_key == bare_key
+                    || row_key.strip_prefix(bare_key.as_str()).is_some_and(|rest| {
+                        rest.starts_with("::b-") || rest.starts_with("::copy-")
+                    });
+                if ours {
+                    found = Some((id, row_key));
+                    break;
+                }
+            }
+            found
+        };
+        let found_by_bytes = same_bytes.is_some();
+        if let Some((_, row_key)) = &same_bytes {
+            key = row_key.clone();
+        }
+        // The reconcile's second copy: the bare row holds another UID in this
+        // folder. A different message gets the key the ordinary fetch gives
+        // it, so whichever meets it first, later fetches land on one row; the
+        // same message twice in one folder keeps the UID's key, since one row
+        // cannot hold two numbers in one folder. A composer's row keeps its
+        // second copies as they were: they are how `draft_conflict` sees
+        // another client's revision of a draft.
+        if let Some(n) = copy_suffix
+            && !found_by_bytes
+        {
+            key = format!("{bare_key}::copy-{n}");
+            if let Some(bare_row) = row_for(&bare_key)
+                && composer_subject_of(Some(bare_row))?.is_none()
+                && let Some(stored_hash) = other_bytes_of(bare_row)?
+            {
+                let stored = stored_identity(&stored_hash).ok().flatten();
+                let arriving = arrival();
+                let same = matches!((&stored, &arriving), (Some((s, _)), Some((a, _))) if s == a);
+                if !same {
+                    key = content_key(arriving.as_ref());
+                }
+            }
+        }
+
+        let mut existing = match &same_bytes {
+            Some((id, _)) => Some(*id),
+            None => row_for(&key),
+        };
+        // The row under the bare key is gone or holds nothing, but the message
+        // arriving already has a row of its own: it lands there, rather than
+        // reviving the thrown-away row as a second copy of it.
+        if copy_suffix.is_none() && !found_by_bytes {
+            let empty = match existing {
+                None => true,
+                Some(id) => tx.query_row(
+                    "SELECT deleted_at_ms IS NOT NULL OR blob_hash IS NULL FROM messages WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<_, bool>(0),
+                )?,
+            };
+            let has_content_rows = empty
+                && tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM messages
+                          WHERE account_id = ?1 AND message_id_hdr >= ?2 AND message_id_hdr < ?3
+                            AND deleted_at_ms IS NULL)",
+                    params![
+                        account_id,
+                        format!("{bare_key}::b-"),
+                        format!("{bare_key}::b.")
+                    ],
+                    |r| r.get::<_, bool>(0),
+                )?;
+            if has_content_rows {
+                let own = content_key(arrival().as_ref());
+                if let Some(row) = row_for(&own) {
+                    key = own;
+                    existing = Some(row);
+                }
+            }
+        }
+        let mut composer_subject = composer_subject_of(existing)?;
+
+        // Whether the stored row keeps its content and the arrival adds only
+        // its placement.
+        let mut stored_wins = false;
+        if let Some(id) = existing
+            && composer_subject.is_none()
+            && let Some(stored_hash) = other_bytes_of(id)?
+        {
+            // Drafts are the exception IMAP has: a draft written on another
+            // device is saved again under the same Message-ID, and the newer
+            // copy is the draft. That holds only where the stored row is a
+            // draft itself; anything else filed into Drafts — by a filter
+            // rule, or plus-address delivery — is judged like any arrival.
+            let replaces_a_draft = role_of_arrival == "drafts"
+                && tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM placements p JOIN folders f ON f.id = p.folder_id
+                                     WHERE p.message_id = ?1 AND f.role = 'drafts')
+                         OR (SELECT flags & ?2 FROM messages WHERE id = ?1) != 0",
+                    params![id, flags::DRAFT],
+                    |r| r.get::<_, bool>(0),
+                )?;
+            if !replaces_a_draft {
+                let arriving = arrival();
+                // Bytes that can no longer be read compare with nothing, so
+                // nothing is assumed: the arrival is another message, kept on
+                // a row of its own. Taking it for the same message let any
+                // arrival under the Message-ID replace a message whose file a
+                // disk error or a bad restore had damaged (docs/25 review).
+                // The same bytes never come here: they are the plain path
+                // below, which also mends the file.
+                let stored = stored_identity(&stored_hash).ok().flatten();
+                let same = matches!((&stored, &arriving), (Some((s, _)), Some((a, _))) if s == a);
+                let arrival_bcc = arriving.as_ref().is_some_and(|(_, bcc)| *bcc);
+                // Whether the arrival is the sender's own copy of a message the
+                // row holds without its blind copies: the first copy of it to
+                // reach Sent. Never over a Sent copy the row already has. A
+                // filter rule or a plus-address delivery can put a copy in
+                // Sent too, and one that adds only a Bcc line is the same
+                // message by every field the identity reads (docs/25 review).
+                let adopts_bcc = |row: i64, row_bcc: Option<bool>| -> Result<bool> {
+                    if !(into_sent && arrival_bcc && row_bcc == Some(false)) {
+                        return Ok(false);
+                    }
+                    let in_sent: bool = tx.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM placements p JOIN folders f ON f.id = p.folder_id
+                                         WHERE p.message_id = ?1 AND f.role = 'sent')",
+                        params![row],
+                        |r| r.get(0),
+                    )?;
+                    Ok(!in_sent)
+                };
+                // The same message delivered a second time into a folder where
+                // its row already holds another UID: two messages on the
+                // server, kept as two rows, under the row's key and the UID.
+                // One row cannot hold two numbers in one folder, and folding
+                // them moved its number back and forth — for the plain row
+                // (round one) and for a row under a content key (docs/25
+                // review) alike.
+                let second_delivery = |row: i64, row_key: &str| -> Result<Option<String>> {
+                    let (Some(fid), Some(u)) = (folder_id, uid) else {
+                        return Ok(None);
+                    };
+                    if row_key.contains("::copy-") {
+                        return Ok(None);
+                    }
+                    let held: Option<i64> = tx
+                        .query_row(
+                            "SELECT uid FROM placements WHERE message_id = ?1 AND folder_id = ?2",
+                            params![row, fid],
+                            |r| r.get::<_, Option<i64>>(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    Ok(held
+                        .filter(|h| *h != i64::from(u))
+                        .map(|_| format!("{row_key}::copy-{u}")))
+                };
+                // The row the arrival is the same message as, holding other
+                // bytes: it keeps them, unless this is its second delivery
+                // into the folder, or the first Sent copy with the blind
+                // copies the row lacks.
+                let settle = |row: i64,
+                              row_key: String,
+                              row_bcc: Option<bool>,
+                              key: &mut String,
+                              existing: &mut Option<i64>,
+                              composer_subject: &mut Option<String>|
+                 -> Result<bool> {
+                    match second_delivery(row, &row_key)? {
+                        Some(copy_key) => {
+                            *key = copy_key;
+                            *existing = row_for(key);
+                            *composer_subject = composer_subject_of(*existing)?;
+                            match *existing {
+                                Some(copy) if composer_subject.is_none() => {
+                                    match other_bytes_of(copy)? {
+                                        Some(copy_hash) => {
+                                            let copy_bcc = stored_identity(&copy_hash)
+                                                .ok()
+                                                .flatten()
+                                                .map(|(_, b)| b);
+                                            Ok(!adopts_bcc(copy, copy_bcc)?)
+                                        }
+                                        None => Ok(false),
+                                    }
+                                }
+                                _ => Ok(false),
+                            }
+                        }
+                        None => {
+                            *key = row_key;
+                            Ok(!adopts_bcc(row, row_bcc)?)
+                        }
+                    }
+                };
+                if same {
+                    let row_bcc = stored.as_ref().map(|(_, b)| *b);
+                    let row_key = key.clone();
+                    stored_wins = settle(
+                        id,
+                        row_key,
+                        row_bcc,
+                        &mut key,
+                        &mut existing,
+                        &mut composer_subject,
+                    )?;
+                } else {
+                    key = content_key(arriving.as_ref());
+                    existing = row_for(&key);
+                    composer_subject = composer_subject_of(existing)?;
+                    if let Some(own) = existing
+                        && composer_subject.is_none()
+                        && let Some(own_hash) = other_bytes_of(own)?
+                    {
+                        // The same message as the row its content names,
+                        // fetched as other bytes.
+                        let own_bcc = stored_identity(&own_hash).ok().flatten().map(|(_, b)| b);
+                        let row_key = key.clone();
+                        stored_wins = settle(
+                            own,
+                            row_key,
+                            own_bcc,
+                            &mut key,
+                            &mut existing,
+                            &mut composer_subject,
+                        )?;
+                    }
+                }
+            }
+        }
+        let dedupe_key = key;
+        let composer_owned = composer_subject.is_some();
         let date_ms = parsed.date_ms.unwrap_or(0);
         let id = match existing {
+            Some(id) if stored_wins => id,
             Some(id) if composer_owned => {
                 tx.execute(
                     "UPDATE messages SET blob_hash = ?2, blob_kind = 'raw', size = ?3,
@@ -1826,7 +2276,7 @@ impl Store {
         };
 
         {
-            if !composer_owned {
+            if !composer_owned && !stored_wins {
                 let mut ins_addr = tx.prepare_cached(
                     "INSERT INTO message_addresses(message_id, role, addr_norm, display)
                      VALUES (?1, ?2, ?3, ?4)",
@@ -1836,18 +2286,20 @@ impl Store {
                 }
             }
 
-            let mut ins_att = tx.prepare_cached(
-                "INSERT INTO attachments(message_id, part_id, filename, mime, size)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            for (i, a) in parsed.attachments.iter().enumerate() {
-                ins_att.execute(params![
-                    id,
-                    i as i64,
-                    a.filename,
-                    a.content_type,
-                    a.size as i64
-                ])?;
+            if !stored_wins {
+                let mut ins_att = tx.prepare_cached(
+                    "INSERT INTO attachments(message_id, part_id, filename, mime, size)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for (i, a) in parsed.attachments.iter().enumerate() {
+                    ins_att.execute(params![
+                        id,
+                        i as i64,
+                        a.filename,
+                        a.content_type,
+                        a.size as i64
+                    ])?;
+                }
             }
 
             if let Some(fid) = folder_id {
@@ -1885,20 +2337,28 @@ impl Store {
         // is the part that threads, because that is where the parent is.
         let references =
             &parsed.references[parsed.references.len().saturating_sub(MAX_REFERENCES)..];
-        assign_thread(
-            &tx,
-            account_id,
-            id,
-            parsed.message_id.as_deref(),
-            references,
-            &subject_norm,
-            date_ms,
-        )?;
+        // A message that kept its own words keeps its own conversation too:
+        // the newcomer's References are a stranger's, and could move it into
+        // any thread its sender liked.
+        if !stored_wins {
+            assign_thread(
+                &tx,
+                account_id,
+                id,
+                parsed.message_id.as_deref(),
+                references,
+                &subject_norm,
+                date_ms,
+            )?;
+        }
 
         // Same transaction as the message row: the anti-drift invariant. A
         // row the composer owns keeps the entry its last save wrote, which is
-        // what it says; the copy's text is what it said at the push.
-        if !composer_owned {
+        // what it says; the copy's text is what it said at the push. One that
+        // kept its own words keeps the entry that says them.
+        if stored_wins {
+            // Nothing to write: its entry already says what it says.
+        } else if !composer_owned {
             tx.execute(
                 "INSERT INTO fts_content(message_id, subject, body_text, addrs, attachment_names)
                  VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1932,11 +2392,22 @@ impl Store {
                 params![id],
             )?;
         }
+        // The bytes the row stands on, which for a row that kept its own are
+        // not the newcomer's: those are left to the blob GC.
+        let blob_hash = if stored_wins {
+            tx.query_row(
+                "SELECT blob_hash FROM messages WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?
+        } else {
+            hash
+        };
         tx.commit()?;
 
         Ok(Ingested {
             message_id: id,
-            blob_hash: hash,
+            blob_hash,
             was_new: existing.is_none(),
         })
     }

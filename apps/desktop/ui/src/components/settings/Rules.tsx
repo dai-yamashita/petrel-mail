@@ -6,6 +6,7 @@ import { PickerField } from '../PickerField';
 import { AccountNote } from './AccountNote';
 import { filableFolderRows } from '../../lib/folders';
 import { t } from '../../lib/strings';
+import { folderPending } from '../../lib/signin-refusal';
 import {
   FIELD_LABEL, OP_LABEL, RULE_FIELDS, opForField, opsFor, valueKind,
   type RuleField,
@@ -304,11 +305,7 @@ export function Rules({ onMessage }: { onMessage: (text: string) => void }) {
                     .then((id) => {
                       // To the server in the background; the rule needs only
                       // the id, and the next sync retries if this fails.
-                      void api
-                        .pushFolder(id)
-                        .catch((e) =>
-                          onMessage(t('folder-server-pending', { name, error: String(e) })),
-                        );
+                      void api.pushFolder(id).catch((e) => onMessage(folderPending(name, e)));
                       setEditing((cur) =>
                         cur ? { ...cur, actions: { ...cur.actions, move_to: id } } : cur,
                       );

@@ -171,3 +171,8 @@
 .toast-undo:hover {
   border-color: var(--ink3);
 }
+
+/* An account that needs its password: said in the list, and in its pane. */
+.account-signin {
+  color: var(--danger);
+}

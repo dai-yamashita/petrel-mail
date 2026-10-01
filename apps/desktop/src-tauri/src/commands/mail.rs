@@ -462,6 +462,8 @@ pub fn save_message_eml(
         .unwrap_or_else(|| "message.eml".into());
     // The name, not the path: this string reaches the window and the log.
     std::fs::write(&target, raw).map_err(|e| format!("could not write {name}: {e}"))?;
+    // A stranger's message, opened later in whatever handles .eml.
+    crate::commands::attachments::mark_as_downloaded(&target);
     Ok(())
 }
 

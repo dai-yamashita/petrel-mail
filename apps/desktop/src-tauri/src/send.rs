@@ -98,6 +98,13 @@ pub(crate) fn spawn_send_worker(
             // Not the drain's 900ms: that is for triage bursts, and it is the
             // wait this worker exists to avoid.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // As the drain does: mail that is due waits for a password that
+            // works, rather than asking the server again with one it refused.
+            // It goes the moment signing in works, from the hourly retry or a
+            // password entered in Sign in again.
+            if !crate::signin::wait_for_signin(&state, account, &mut stop).await {
+                break;
+            }
             send_due(Arc::clone(&state), account).await;
         }
         log_sync(&format!("account {account}: send worker stopped"));
@@ -200,6 +207,7 @@ async fn attempt(
     cfg: &petrel_providers::imap::ImapConfig,
     to: Vec<String>,
     cc: Vec<String>,
+    bcc: Vec<String>,
     subject: String,
     body: String,
     html: Option<String>,
@@ -256,6 +264,7 @@ async fn attempt(
         from_name: identity.map(|i| i.display_name).unwrap_or_default(),
         to,
         cc,
+        bcc,
         subject,
         body_text: body,
         body_html: html.filter(|h| !h.trim().is_empty()),
@@ -332,7 +341,14 @@ async fn attempt(
     if let Some(path) = sent_path {
         let filed = match tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            petrel_providers::imap::append_message(cfg, &path, Some("(\\Seen)"), &raw),
+            // The sender's copy: what went out, plus the Bcc header the wire
+            // copy leaves off, so Sent still says who was blind-copied.
+            petrel_providers::imap::append_message(
+                cfg,
+                &path,
+                Some("(\\Seen)"),
+                &msg.sender_copy(&raw),
+            ),
         )
         .await
         {
@@ -540,6 +556,7 @@ pub(crate) async fn send_due(state: Arc<AppState>, account: i64) {
                 .map(|a| a.trim().to_string())
                 .filter(|a| !a.is_empty())
                 .collect();
+        let bcc = crate::sync::drafts::addresses_of(&d.envelope.bcc);
         // The whole message, not only its text: a reply that waited in the
         // undo window still threads into its conversation, and still carries
         // what was attached to it.
@@ -549,6 +566,7 @@ pub(crate) async fn send_due(state: Arc<AppState>, account: i64) {
             &cfg,
             to,
             cc,
+            bcc,
             d.subject,
             d.body,
             // Stored alongside the text, so a message posted hours ago goes

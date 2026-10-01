@@ -39,6 +39,13 @@
     var link = document.createElement('p');
     link.innerHTML = 'A message with <a href="https://example.com/a/very/long/path/that/will/not/fit">a link in it</a>.';
     c.appendChild(link);
+    // ?homograph=1 adds a link to a name spelled with a Cyrillic а, the case
+    // the "this address disguises where it goes" question exists for.
+    if (q.get('homograph')) {
+      var h = document.createElement('p');
+      h.innerHTML = '<a id="hg" href="https://\u0430pple-id.example/login">Sign in to your account</a>';
+      c.appendChild(h);
+    }
     if (q.get('wide')) {
       var t = document.createElement('table');
       t.setAttribute('border', '1');

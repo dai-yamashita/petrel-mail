@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use petrel_providers::imap::{
-    Credential, FolderPass, ImapConfig, PassOutcome, RemovalCheck, Security, Survivors, move_uid,
-    sync_pass,
+    Credential, FolderPass, ImapConfig, PassOutcome, RemovalCheck, Security, Stored, Survivors,
+    move_uid, sync_pass,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -166,8 +166,21 @@ async fn server(state: Arc<Mutex<ServerState>>) -> u16 {
                                         .bytes(),
                                     );
                                 } else {
+                                    // Size and arrival when asked for, as a
+                                    // server gives them; the arrival is a
+                                    // function of the bytes, so a COPY keeps it.
+                                    let mut extra = String::new();
+                                    if upper.contains("RFC822.SIZE") {
+                                        extra.push_str(&format!(" RFC822.SIZE {}", m.raw.len()));
+                                    }
+                                    if upper.contains("INTERNALDATE") {
+                                        let s = m.raw.bytes().map(u32::from).sum::<u32>() % 60;
+                                        extra.push_str(&format!(
+                                            " INTERNALDATE \"01-Oct-2026 09:00:{s:02} +0000\""
+                                        ));
+                                    }
                                     out.extend(format!(
-                                        "* {} FETCH (UID {} FLAGS ({}) BODY[] {{{}}}\r\n{})\r\n",
+                                        "* {} FETCH (UID {} FLAGS ({}){extra} BODY[] {{{}}}\r\n{})\r\n",
                                         i + 1, m.uid, m.flags, m.raw.len(), m.raw
                                     ).bytes());
                                 }
@@ -713,9 +726,20 @@ async fn a_move_without_move_does_not_copy_twice_on_retry() {
     let port = server(Arc::clone(&state)).await;
     let cfg = plain(port);
 
-    let expunged = move_uid(&cfg, "INBOX", 1, "Archive", false, true, Some("a@x"))
-        .await
-        .unwrap();
+    let expunged = move_uid(
+        &cfg,
+        "INBOX",
+        1,
+        "Archive",
+        false,
+        true,
+        Some(Stored {
+            message_id: "a@x",
+            size: None,
+        }),
+    )
+    .await
+    .unwrap();
     assert!(expunged);
     {
         let s = folders(&state);
@@ -731,9 +755,20 @@ async fn a_move_without_move_does_not_copy_twice_on_retry() {
         .unwrap()
         .messages
         .push(msg(1, "a"));
-    let expunged = move_uid(&cfg, "INBOX", 1, "Archive", false, true, Some("a@x"))
-        .await
-        .unwrap();
+    let expunged = move_uid(
+        &cfg,
+        "INBOX",
+        1,
+        "Archive",
+        false,
+        true,
+        Some(Stored {
+            message_id: "a@x",
+            size: None,
+        }),
+    )
+    .await
+    .unwrap();
     assert!(expunged);
     let s = folders(&state);
     assert_eq!(s.folders["Archive"].messages.len(), 1, "not copied twice");

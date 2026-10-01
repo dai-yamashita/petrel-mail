@@ -19,6 +19,7 @@ fn message() -> Outgoing {
         from_name: "Me".into(),
         to: vec!["you@example.com".into()],
         cc: vec![],
+        bcc: vec![],
         subject: "s".into(),
         body_text: "hi".into(),
         body_html: None,

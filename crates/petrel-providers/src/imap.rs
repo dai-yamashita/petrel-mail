@@ -31,6 +31,20 @@ pub enum ImapError {
     Tls(String),
     #[error("protocol: {0}")]
     Protocol(String),
+    /// The server refused the credentials at sign-in (`sign_in`): a
+    /// reason to stop asking until the person enters a new password, which
+    /// no other failure is.
+    #[error("sign-in refused: {0}")]
+    SignInRefused(String),
+}
+
+impl ImapError {
+    /// Whether this is the server refusing the credentials at sign-in, as
+    /// against anything else that can go wrong, a refusal of the moment
+    /// included.
+    pub fn is_sign_in_refused(&self) -> bool {
+        matches!(self, ImapError::SignInRefused(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ImapError>;
@@ -1352,16 +1366,35 @@ pub fn xoauth2_payload(user: &str, token: &str) -> String {
 /// scattered through this file, and adding a second way to authenticate to
 /// twenty-nine places is how one of them gets missed — the one that then fails
 /// only for accounts using the new way, on whichever code path nobody tried.
+///
+/// A NO here is a refused password only when it says so: its code is one of
+/// RFC 5530's about the credentials themselves (`AUTHENTICATIONFAILED`,
+/// `AUTHORIZATIONFAILED`, `EXPIRED`), or it carries no code at all and its
+/// words are a failed sign-in, which is how Exchange, Courier and Zimbra
+/// (`NO LOGIN failed.`) and Cyrus (`NO Login failed: authentication
+/// failure`) put it. That is `ImapError::SignInRefused`. Any other code is
+/// the server saying "not now" — Gmail's `[ALERT] Too many simultaneous
+/// connections` while other clients hold its fifteen slots, `[UNAVAILABLE]`,
+/// `[INUSE]`, `[LIMIT]`, `[SERVERBUG]`, one nobody has seen — and stays an
+/// ordinary error, retried as one. Read as a refusal, one such NO stood an
+/// account down for an hour and told the person their password was wrong.
 async fn sign_in<S>(client: Client<S>, cfg: &ImapConfig) -> Result<Session<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
+    let refused = |e: async_imap::error::Error| -> ImapError {
+        match e {
+            async_imap::error::Error::No(text) if refuses_credentials(&text) => {
+                ImapError::SignInRefused(text)
+            }
+            other => other.into(),
+        }
+    };
     match &cfg.credential {
         Credential::Password(pass) => client
             .login(&cfg.user, pass)
             .await
-            .map_err(|(e, _)| e)
-            .map_err(Into::into),
+            .map_err(|(e, _)| refused(e)),
         Credential::Bearer(token) => client
             .authenticate(
                 "XOAUTH2",
@@ -1371,9 +1404,62 @@ where
                 },
             )
             .await
-            .map_err(|(e, _)| e)
-            .map_err(Into::into),
+            .map_err(|(e, _)| refused(e)),
     }
+}
+
+/// Whether a NO to LOGIN or AUTHENTICATE refuses the credentials; see
+/// `sign_in`. async-imap writes the NO as `code: <parsed code>, info:
+/// <text>`. A code imap-proto parses (ALERT and the rest) is never about the
+/// credentials; one it does not parse stays at the head of the text, in
+/// brackets.
+fn refuses_credentials(no: &str) -> bool {
+    // Gmail turns down an ordinary password, once 2-Step Verification is on,
+    // with an ALERT, and sends somebody to the browser the same way. Both
+    // need the person rather than another try: asked again every cycle, the
+    // first is the refused password over and over, which is what standing an
+    // account down exists to stop. Its other ALERTs pass in time ("Too many
+    // simultaneous connections") and stay "not now".
+    if no.trim_start().starts_with("code: Some(Alert)") {
+        let words = no.to_ascii_uppercase();
+        return words.contains("APPLICATION-SPECIFIC PASSWORD")
+            || words.contains("LOG IN VIA YOUR WEB BROWSER");
+    }
+    if !no.trim_start().starts_with("code: None") {
+        return false;
+    }
+    let info = no
+        .split_once("info: Some(\"")
+        .map(|(_, i)| i.trim_end_matches("\")"))
+        .unwrap_or("");
+    let words = info.trim_start().to_ascii_uppercase();
+    // "Temporary authentication failure", from a server too old to give
+    // it [UNAVAILABLE], is the server's trouble and not the password's.
+    if words.contains("TEMPORAR") {
+        return false;
+    }
+    if let Some(rest) = words.strip_prefix('[') {
+        let code: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        // WEBALERT is Gmail's "Web login required": a browser sign-in first,
+        // then the same password works. Until then every try is refused.
+        return matches!(
+            code.as_str(),
+            "AUTHENTICATIONFAILED" | "AUTHORIZATIONFAILED" | "EXPIRED" | "WEBALERT"
+        );
+    }
+    [
+        "LOGIN FAILED",
+        "AUTHENTICATION FAILED",
+        "AUTHENTICATION FAILURE",
+        "INVALID CREDENTIALS",
+        "INVALID USERNAME OR PASSWORD",
+        "INVALID USER NAME OR PASSWORD",
+    ]
+    .iter()
+    .any(|w| words.contains(w))
 }
 
 /// Runs a FETCH, hands each item's attributes on, and reports how the server
@@ -2793,6 +2879,37 @@ where
     Ok(())
 }
 
+/// MOVE and UIDPLUS as this connection's server answers, where the caller
+/// said it had neither.
+///
+/// The caller's flags come from a probe, and a launch with no network never
+/// ran one. "Not known" used to read as "not there": for the rest of that
+/// session every archive went out as COPY plus `\Deleted` with no expunge,
+/// the flagged copy stayed where it was on the server, and the next
+/// reconcile filed the message back there. Delete forever only flagged.
+/// The connection about to do the work can ask, for one round trip, and
+/// only when the caller said no. A server that will not say keeps the
+/// careful path.
+async fn confirm_move_caps<S>(
+    session: &mut Session<S>,
+    has_move: bool,
+    has_uidplus: bool,
+) -> (bool, bool)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    if has_move && has_uidplus {
+        return (true, true);
+    }
+    match session.capabilities().await {
+        Ok(caps) => {
+            let caps = parse_capabilities(caps.iter().map(|c| capability_token(&format!("{c:?}"))));
+            (has_move || caps.move_, has_uidplus || caps.uidplus)
+        }
+        Err(_) => (has_move, has_uidplus),
+    }
+}
+
 /// Removes one message from the server for good.
 ///
 /// UID EXPUNGE (RFC 4315) when the server has UIDPLUS, because a bare EXPUNGE
@@ -2827,6 +2944,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
     let mut session = sign_in(client, cfg).await?;
+    let (_, server_has_uidplus) = confirm_move_caps(&mut session, true, server_has_uidplus).await;
     session.select(wire_name(folder)).await?;
     {
         let mut updates = session
@@ -2847,12 +2965,6 @@ where
     Ok(expunged)
 }
 
-/// Moves one message, by UID, into another folder.
-///
-/// Prefers UID MOVE (RFC 6851) and falls back to COPY + \Deleted + EXPUNGE for
-/// servers without it. The fallback is not equivalent — an expunge affects the
-/// whole mailbox, not just this message — so the capability is checked rather
-/// than assumed, and the slow path is taken only when there is no choice.
 /// Creates a folder on the server, and subscribes to it. Already-exists is
 /// success: the folder the user asked for is there, which is what they asked
 /// for.
@@ -3011,12 +3123,25 @@ where
     out
 }
 
+/// The message a move is moving, as the store holds it: what a move without
+/// MOVE looks for in the destination before it copies.
+#[derive(Debug, Clone, Copy)]
+pub struct Stored<'a> {
+    /// Its Message-ID, as the store keys it. A key carrying one of the
+    /// store's own suffixes (`::copy-…`, `::b-…`) matches nothing on the
+    /// server, which is the point: such a row is never taken for a copy that
+    /// landed, and a forgery's row can never reach the message it imitates.
+    pub message_id: &'a str,
+    /// Its size as stored: the bytes the server sent, when they are known.
+    pub size: Option<u32>,
+}
+
 /// Moves one message: by MOVE where the server has it, and by COPY, \Deleted
 /// and an expunge where it does not.
 ///
 /// The fallback is where the care is. A retry after a COPY that landed and a
 /// STORE that did not used to COPY again, and the destination gained a second
-/// copy; given the Message-ID, the destination is asked first and a copy
+/// copy; given the stored message, the destination is asked first and a copy
 /// already there is not made twice. The expunge is by UID where UIDPLUS
 /// allows it: a bare EXPUNGE commits every other pending deletion in the
 /// mailbox, other clients' included. Without UIDPLUS the source copy is
@@ -3029,7 +3154,7 @@ pub async fn move_uid(
     to: &str,
     server_has_move: bool,
     server_has_uidplus: bool,
-    message_id: Option<&str>,
+    stored: Option<Stored<'_>>,
 ) -> Result<bool> {
     let client = Client::new(connect(cfg).await?);
     move_uid_session(
@@ -3040,7 +3165,7 @@ pub async fn move_uid(
         to,
         server_has_move,
         server_has_uidplus,
-        message_id,
+        stored,
     )
     .await
 }
@@ -3054,12 +3179,14 @@ async fn move_uid_session<S>(
     to: &str,
     server_has_move: bool,
     server_has_uidplus: bool,
-    message_id: Option<&str>,
+    stored: Option<Stored<'_>>,
 ) -> Result<bool>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
     let mut session = sign_in(client, cfg).await?;
+    let (server_has_move, server_has_uidplus) =
+        confirm_move_caps(&mut session, server_has_move, server_has_uidplus).await;
     if server_has_move {
         session.select(wire_name(from)).await?;
         session.uid_mv(uid.to_string(), wire_name(to)).await?;
@@ -3067,25 +3194,51 @@ where
         return Ok(true);
     }
     // A copy that already landed is not made again.
-    let already_there = match message_id {
-        Some(id) => {
+    //
+    // "Already landed" means this message, and a Message-ID alone does not
+    // say that. A server's header search is a substring match, so the id once
+    // found `<15@host.example>` for `5@host.example`, the COPY was skipped,
+    // and the expunge below took the message off the server with no copy
+    // anywhere. Another message can carry the same id — a forgery of an
+    // invoice, a mailing list's altered copy of your post — and skipping for
+    // it lost the one being moved the same way. So the copy that landed must
+    // be this message on every count the server keeps: the exact id, the
+    // size the store holds, and the size and arrival time of the source, which
+    // a COPY preserves (RFC 3501 §6.4.7) and nobody sending mail can set.
+    //
+    // A refusal (a tagged NO or BAD) cannot say whether the copy landed.
+    // Copying again risks a duplicate in the destination; not copying risks
+    // a message lost. The duplicate is the smaller harm, and so is it for
+    // every fact the server will not give. Anything else fails the move, as
+    // it always did, and the drain asks again.
+    let mut in_source = false;
+    let already_there = match stored {
+        Some(stored) => {
             session.select(wire_name(to)).await?;
-            let query = format!("UID SEARCH HEADER Message-ID {}", quote_imap(id));
-            match search_command(&mut session, query).await {
-                Ok(hits) => !hits.is_empty(),
-                // A refusal (a tagged NO or BAD) cannot say whether the copy
-                // landed. Copying again risks a duplicate in the destination;
-                // not copying risks a move that never happens. The duplicate
-                // is the smaller harm, and it is what happened here before a
-                // refusal was visible. Anything else fails the move, as it
-                // always did, and the drain asks again.
+            match exact_message_id_hits(&mut session, stored.message_id).await {
+                Ok(hits) if hits.is_empty() => false,
+                Ok(hits) => {
+                    session.select(wire_name(from)).await?;
+                    in_source = true;
+                    match source_copy(&mut session, uid).await {
+                        Ok(Some(source)) => hits
+                            .iter()
+                            .any(|hit| is_the_copy(hit, &source, stored.size)),
+                        // The source has gone: there is nothing to copy.
+                        Ok(None) => true,
+                        Err(ImapError::Protocol(_)) => false,
+                        Err(e) => return Err(e),
+                    }
+                }
                 Err(ImapError::Protocol(_)) => false,
                 Err(e) => return Err(e),
             }
         }
         None => false,
     };
-    session.select(wire_name(from)).await?;
+    if !in_source {
+        session.select(wire_name(from)).await?;
+    }
     if !already_there {
         session.uid_copy(uid.to_string(), wire_name(to)).await?;
     }
@@ -3109,40 +3262,233 @@ where
     Ok(expunged)
 }
 
-/// Searches a folder for a Message-ID. This is the evidence-gathering half of
-/// the ambiguous-send rule: after a send whose outcome we could not read, we
-/// ask the server whether it actually has the message rather than guessing.
-/// Returns the matching sequence numbers (empty = provably absent).
-/// Like `find_message_id`, but answers in UIDs — the currency of APPEND,
-/// FETCH and EXPUNGE. `find_message_id` answers in sequence numbers, which
-/// are only good for counting; recording one of those as "the copy to delete
-/// later" deletes whatever message happens to be standing at that position.
+/// Whether a destination message carrying the source's exact Message-ID is
+/// the copy of it a COPY made. Every fact must be known and agree.
+fn is_the_copy(hit: &MessageCopy, source: &MessageCopy, stored: Option<u32>) -> bool {
+    hit.size.is_some()
+        && hit.size == source.size
+        && stored.is_none_or(|size| hit.size == Some(size))
+        && hit.internal_date.is_some()
+        && hit.internal_date == source.internal_date
+}
+
+/// One message in a folder carrying the Message-ID searched for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageCopy {
+    pub uid: u32,
+    /// RFC822.SIZE, where the server said.
+    pub size: Option<u32>,
+    /// INTERNALDATE as the server wrote it, where it said: when this copy
+    /// arrived, which a COPY keeps and a sender cannot choose.
+    pub internal_date: Option<String>,
+}
+
+/// The messages in a folder whose Message-ID is exactly this one, oldest
+/// first; empty means none is there.
+///
+/// `message_id` is the id with or without its angle brackets, or a key the
+/// store made, which matches nothing. The drain heals a lost UID from this,
+/// and only to a single copy whose size is the size it holds. See
+/// `exact_message_id_hits` for what "exactly" takes.
+pub async fn copies_of_message_id(
+    cfg: &ImapConfig,
+    folder: &str,
+    message_id: &str,
+) -> Result<Vec<MessageCopy>> {
+    let client = Client::new(connect(cfg).await?);
+    exact_search_session(client, cfg, folder, message_id).await
+}
+
+/// The UIDs of `copies_of_message_id`: the currency of APPEND, FETCH and
+/// EXPUNGE. The draft push takes the last as the copy it just appended.
 pub async fn uids_for_message_id(
     cfg: &ImapConfig,
     folder: &str,
     message_id: &str,
 ) -> Result<Vec<u32>> {
-    // Quoted properly rather than by deleting quotes: an id is generated by
-    // whoever sent the message, and a backslash in one used to end the string
-    // early and leave the rest being read as IMAP.
-    let query = format!("HEADER Message-ID {}", quote_imap(message_id));
-    let client = Client::new(connect(cfg).await?);
-    uid_search_session(client, cfg, folder, &query).await
+    Ok(copies_of_message_id(cfg, folder, message_id)
+        .await?
+        .into_iter()
+        .map(|copy| copy.uid)
+        .collect())
 }
 
-async fn uid_search_session<S>(
+async fn exact_search_session<S>(
     client: Client<S>,
     cfg: &ImapConfig,
     folder: &str,
-    query: &str,
-) -> Result<Vec<u32>>
+    message_id: &str,
+) -> Result<Vec<MessageCopy>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
     let mut session = sign_in(client, cfg).await?;
     session.select(wire_name(folder)).await?;
-    let found = search_command(&mut session, format!("UID SEARCH {query}")).await?;
+    let found = exact_message_id_hits(&mut session, message_id).await?;
     sign_out(&mut session).await?;
+    Ok(found)
+}
+
+/// A Message-ID without the angle brackets and the spaces around them, as
+/// ingest stores it; `None` when nothing is left.
+fn bare_message_id(id: &str) -> Option<&str> {
+    let id = id.trim();
+    let id = id.strip_prefix('<').unwrap_or(id);
+    let id = id.strip_suffix('>').unwrap_or(id).trim();
+    (!id.is_empty()).then_some(id)
+}
+
+/// The shortest search term worth sending in place of a whole Message-ID.
+/// Shorter, and the search names so much of a folder that fetching every
+/// hit to check it is the cost, not the answer.
+const MIN_SEARCH_TERM: usize = 8;
+
+/// What a SEARCH may carry to find this Message-ID: `<id>` itself where
+/// every character of it can travel in a quoted string, and otherwise the
+/// longest stretch of it that can.
+///
+/// A quoted string holds 7-bit characters and no CR or LF (RFC 3501 §9). An
+/// id with an 8-bit character in it went out as one anyway, and a strict
+/// server answered BAD every time: a move read that as "not copied yet" and
+/// the drain as a search that failed, so a lost UID was never healed. A
+/// stretch of the id still finds it, since the search is a substring match,
+/// and the exact check that follows throws out what else it finds. Kept to
+/// printable ASCII, so nothing a sender wrote into an id can end the
+/// command line early either. `None` when no stretch is long enough to be
+/// worth asking with.
+fn message_id_search_term(bare: &str) -> Option<String> {
+    let whole = format!("<{bare}>");
+    let fits = |c: char| (' '..='~').contains(&c);
+    if whole.chars().all(fits) {
+        return Some(whole);
+    }
+    let longest = whole
+        .split(|c: char| !fits(c))
+        .max_by_key(|stretch| stretch.len())?;
+    (longest.len() >= MIN_SEARCH_TERM).then(|| longest.to_string())
+}
+
+/// How many UIDs one FETCH names when checking search hits. A command line
+/// has a length limit (Dovecot's is 64 KB), and a loose search can name a
+/// whole folder.
+const HIT_CHECK_BATCH: usize = 500;
+
+/// The messages in the selected mailbox whose Message-ID is exactly this
+/// one, oldest first.
+///
+/// IMAP's `SEARCH HEADER` is a substring match (RFC 3501 §6.4.4), and the id
+/// used to go out without its angle brackets: `5@host.example` found
+/// `<15@host.example>` too. A move then skipped the COPY it needed and
+/// expunged the message with no copy anywhere, and the drain healed a lost
+/// UID to whichever hit came last. The brackets narrow the search; this
+/// then fetches each hit's Message-ID and keeps only the exact ones, read
+/// by the parser that keyed the message at ingest. Case counts, as it does
+/// for the store.
+///
+/// An error, never an empty answer, when there is no id to ask about or no
+/// safe way to ask: callers read empty as absent, and Gmail's Sent check
+/// reads absent as "did not go" and sends again.
+async fn exact_message_id_hits<S>(
+    session: &mut Session<S>,
+    message_id: &str,
+) -> Result<Vec<MessageCopy>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    let Some(bare) = bare_message_id(message_id) else {
+        return Err(ImapError::Protocol(
+            "there is no Message-ID to search for".into(),
+        ));
+    };
+    let Some(term) = message_id_search_term(bare) else {
+        return Err(ImapError::Protocol(
+            "this Message-ID has too little plain text to search for".into(),
+        ));
+    };
+    let hits = search_command(
+        session,
+        format!("UID SEARCH HEADER Message-ID {}", quote_imap(&term)),
+    )
+    .await?;
+    let asked: std::collections::HashSet<u32> = hits.iter().copied().collect();
+    let mut exact = Vec::new();
+    for batch in hits.chunks(HIT_CHECK_BATCH) {
+        let set = batch
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        fetch_command(
+            session,
+            format!(
+                "UID FETCH {set} (UID RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+            ),
+            |attrs| {
+                // Only what was asked: an unsolicited FETCH (a flag change
+                // from another session) can arrive in the middle.
+                let Some(uid) = attr_uid(attrs).filter(|u| asked.contains(u)) else {
+                    return;
+                };
+                if fetched_message_id(attrs).as_deref() == Some(bare) {
+                    exact.push(MessageCopy {
+                        uid,
+                        size: attr_size(attrs),
+                        internal_date: attr_internal_date(attrs),
+                    });
+                }
+            },
+        )
+        .await?;
+    }
+    exact.sort_unstable_by_key(|copy| copy.uid);
+    exact.dedup_by_key(|copy| copy.uid);
+    Ok(exact)
+}
+
+/// The Message-ID on a FETCH item, from whichever of its header or its whole
+/// message the server sent, parsed as ingest parses it.
+fn fetched_message_id(attrs: &[AttributeValue<'_>]) -> Option<String> {
+    let bytes = attr_header(attrs).or_else(|| attr_body(attrs))?;
+    petrel_mime::parse_message(bytes)?.message_id
+}
+
+/// RFC822.SIZE, where a FETCH item carries it.
+fn attr_size(attrs: &[AttributeValue<'_>]) -> Option<u32> {
+    attrs.iter().find_map(|a| match a {
+        AttributeValue::Rfc822Size(size) => Some(*size),
+        _ => None,
+    })
+}
+
+/// INTERNALDATE, where a FETCH item carries it, as the server wrote it.
+fn attr_internal_date(attrs: &[AttributeValue<'_>]) -> Option<String> {
+    attrs.iter().find_map(|a| match a {
+        AttributeValue::InternalDate(date) => Some(date.to_string()),
+        _ => None,
+    })
+}
+
+/// The size and arrival time of one message in the selected mailbox;
+/// `None` when it is not there.
+async fn source_copy<S>(session: &mut Session<S>, uid: u32) -> Result<Option<MessageCopy>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    let mut found = None;
+    fetch_command(
+        session,
+        format!("UID FETCH {uid} (UID RFC822.SIZE INTERNALDATE)"),
+        |attrs| {
+            if found.is_none() && attr_uid(attrs) == Some(uid) {
+                found = Some(MessageCopy {
+                    uid,
+                    size: attr_size(attrs),
+                    internal_date: attr_internal_date(attrs),
+                });
+            }
+        },
+    )
+    .await?;
     Ok(found)
 }
 
@@ -3205,30 +3551,17 @@ where
     Ok(found)
 }
 
+/// Whether a folder holds a message with exactly this Message-ID, as the
+/// list of the ones it holds: empty means provably absent.
+///
+/// The evidence-gathering half of the ambiguous-send rule. After a send
+/// whose outcome could not be read, the server is asked whether it has the
+/// message rather than guessed at. The same exact search as
+/// `uids_for_message_id`; it once answered in sequence numbers, which are
+/// only good for counting, and in substrings, which are not good for that
+/// either.
 pub async fn find_message_id(cfg: &ImapConfig, folder: &str, message_id: &str) -> Result<Vec<u32>> {
-    // Message-ID values are generated by us; quote defensively regardless.
-    // Quoted properly rather than by deleting quotes: an id is generated by
-    // whoever sent the message, and a backslash in one used to end the string
-    // early and leave the rest being read as IMAP.
-    let query = format!("HEADER Message-ID {}", quote_imap(message_id));
-    let client = Client::new(connect(cfg).await?);
-    search_session(client, cfg, folder, &query).await
-}
-
-async fn search_session<S>(
-    client: Client<S>,
-    cfg: &ImapConfig,
-    folder: &str,
-    query: &str,
-) -> Result<Vec<u32>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
-{
-    let mut session = sign_in(client, cfg).await?;
-    session.select(wire_name(folder)).await?;
-    let found = search_command(&mut session, format!("SEARCH {query}")).await?;
-    sign_out(&mut session).await?;
-    Ok(found)
+    uids_for_message_id(cfg, folder, message_id).await
 }
 
 /// Connects, authenticates, and reports what the server supports and holds.
@@ -3272,6 +3605,36 @@ pub async fn probe(cfg: &ImapConfig, fetch_limit: u32) -> Result<ProbeReport> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The words async-imap gives a NO, and which of them refuse the
+    /// credentials (`sign_in`). Parsed codes never do; unparsed ones by name;
+    /// no code by the words of a failed sign-in.
+    #[test]
+    fn a_no_at_sign_in_refuses_the_credentials_only_when_it_says_so() {
+        for no in [
+            r#"code: None, info: Some("[AUTHENTICATIONFAILED] Authentication failed.")"#,
+            r#"code: None, info: Some("[AUTHORIZATIONFAILED] IMAP disabled")"#,
+            r#"code: None, info: Some("[EXPIRED] Password expired")"#,
+            r#"code: None, info: Some("LOGIN failed.")"#,
+            r#"code: None, info: Some("Login failed: authentication failure")"#,
+            r#"code: Some(Alert), info: Some("Application-specific password required: https://support.google.com/accounts/answer/185833 (Failure)")"#,
+            r#"code: Some(Alert), info: Some("Please log in via your web browser: https://support.google.com/mail/accounts/answer/78754 (Failure)")"#,
+            r#"code: None, info: Some("[WEBALERT https://accounts.google.com/signin/continue] Web login required.")"#,
+        ] {
+            assert!(super::refuses_credentials(no), "{no}");
+        }
+        for no in [
+            r#"code: Some(Alert), info: Some("Too many simultaneous connections. (Failure)")"#,
+            r#"code: Some(Alert), info: Some("Invalid credentials")"#,
+            r#"code: None, info: Some("[UNAVAILABLE] Temporary authentication failure.")"#,
+            r#"code: None, info: Some("Temporary authentication failure.")"#,
+            r#"code: None, info: Some("[SOMETHINGNEW] Login failed")"#,
+            r#"code: None, info: Some("Server busy, try later")"#,
+            "code: None, info: None",
+        ] {
+            assert!(!super::refuses_credentials(no), "{no}");
+        }
+    }
 
     #[test]
     fn a_folded_message_id_is_read_whole() {
@@ -3625,6 +3988,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
     let mut session = sign_in(client, cfg).await?;
+    let (server_has_move, _) = confirm_move_caps(&mut session, server_has_move, true).await;
     let mailbox = session.select(wire_name(from)).await?;
     let n = mailbox.exists;
     if n == 0 {

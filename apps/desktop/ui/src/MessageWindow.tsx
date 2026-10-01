@@ -3,7 +3,8 @@ import { api, type Thread } from './lib/api';
 import { Reader } from './components/Reader';
 import { Toast } from './components/Toast';
 import { t } from './lib/strings';
-import { useMessageLinks } from './lib/links';
+import { useMessageLinks, type HomographRisk } from './lib/links';
+import { RiskyLinkDialog } from './components/RiskyLinkDialog';
 import { useDropGuard } from './lib/useFileDrop';
 
 /**
@@ -22,6 +23,11 @@ export function MessageWindow({ threadId }: { threadId: number }) {
   const [thread, setThread] = useState<Thread | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [gone, setGone] = useState(false);
+  // A link whose spelling hides where it goes, waiting on the question. The
+  // main window asks it; this one opened the same links without asking.
+  const [riskyLink, setRiskyLink] = useState<{ risk: HomographRisk; open: () => void } | null>(
+    null,
+  );
   useDropGuard();
 
   useEffect(() => {
@@ -55,6 +61,7 @@ export function MessageWindow({ threadId }: { threadId: number }) {
         setToast(String(e));
       }
     }, []),
+    useCallback((risk: HomographRisk, open: () => void) => setRiskyLink({ risk, open }), []),
   );
 
   const close = async () => {
@@ -103,6 +110,7 @@ export function MessageWindow({ threadId }: { threadId: number }) {
         onSnooze={() => setToast(t('popout-in-main-window'))}
       />
       <Toast message={toast} onDone={() => setToast(null)} />
+      <RiskyLinkDialog risky={riskyLink} onDismiss={() => setRiskyLink(null)} />
     </div>
   );
 }

@@ -1,12 +1,15 @@
 //! Keeping the store and the server in step: the sync cycle, the folders it covers, and the workers that run it.
 
 pub(crate) mod backfill;
+#[cfg(test)]
+mod caps_tests;
 pub(crate) mod drafts;
 pub(crate) mod drain;
 pub(crate) mod reindex;
 
-use crate::diag::{friendly_sync_error_for, is_imap_parse_error, log_sync};
+use crate::diag::{friendly_sync_error_for, is_imap_parse_error, is_sign_in_refusal, log_sync};
 use crate::send::{spawn_outbox_clock, spawn_send_worker};
+use crate::signin::{SignIn, say_sync_error, wait_for_signin};
 use crate::state::{AppState, now_ms, stopped, unless_stopped};
 use crate::sync::backfill::spawn_backfill;
 use crate::sync::drain::{drain_actions, spawn_drain_worker};
@@ -28,6 +31,10 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
     // into a store that no longer had it, or into the next account to reuse
     // its id.
     let mut stop = state.stop_signal(account);
+    // This account's first pass, marked before anything is spawned so the
+    // window's next status poll already sees it. Every first pass is one:
+    // at launch, for an account just added, and after a new password.
+    let seeding = state.mark_seeding(account);
     spawn_drain_worker(Arc::clone(&state), account, cfg.clone(), stop.clone());
     spawn_outbox_clock(Arc::clone(&state), account, stop.clone());
     spawn_send_worker(Arc::clone(&state), account, stop.clone());
@@ -41,7 +48,7 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
             // is cleared here: otherwise "fetching your mail" stays on
             // screen for the life of the process over an account that no
             // longer exists.
-            state.seeding.store(false, Ordering::Relaxed);
+            state.end_seeding(account, seeding);
             *state.source.lock().unwrap_or_else(|p| p.into_inner()) = "sync stopped".into();
         };
 
@@ -72,41 +79,22 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
         };
         match probed {
             Ok(report) => {
-                has_move = report.greeting_capabilities.move_;
-                has_idle = report.greeting_capabilities.idle;
-                has_uidplus = report.greeting_capabilities.uidplus;
+                // Signed in: whatever a late writer left behind — a stopped
+                // run's refusal landing after this one began — does not
+                // stand over a password the server has just taken.
+                state.cleared_by(account, &stop);
+                let caps = learned_caps(&report, &cfg);
+                has_move = caps.has_move;
+                has_idle = caps.has_idle;
+                has_uidplus = caps.has_uidplus;
+                looks_like_gmail = caps.is_gmail;
                 log_sync(&format!(
                     "probe ok: {} folder(s), MOVE={has_move}, IDLE={has_idle}, UIDPLUS={has_uidplus}",
                     report.folders.len(),
                 ));
-                let rows: Vec<(String, Option<String>)> = report
-                    .folders
-                    .iter()
-                    // \Noselect containers ([Gmail] itself) are hierarchy,
-                    // not mailboxes: nothing to list, nothing to sync.
-                    .filter(|f| petrel_providers::imap::selectable(f))
-                    .map(|f| {
-                        (
-                            f.name.clone(),
-                            petrel_providers::imap::special_use_role(f).map(|r| r.to_string()),
-                        )
-                    })
-                    .collect();
-                // Gmail is the provider whose folders are labels, and the only
-                // one we can identify from what it advertises before any mail
-                // arrives. Recording it here is what makes archiving keep the
-                // user's other labels instead of clearing them.
-                looks_like_gmail = cfg.host.contains("gmail")
-                    || report.folders.iter().any(|f| f.name.starts_with("[Gmail]"));
+                let rows = survey_rows(&report.folders, looks_like_gmail);
                 let all_mail = all_mail_paths(&report.folders, looks_like_gmail);
-                state.set_caps(
-                    account,
-                    crate::state::ServerCaps {
-                        has_move,
-                        has_uidplus,
-                        is_gmail: looks_like_gmail,
-                    },
-                );
+                state.set_caps(account, caps);
                 let mut stored = false;
                 if let Ok(mut store) = state.store.lock() {
                     let tag_names: Vec<String> = store
@@ -135,8 +123,22 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                 } else {
                     log_sync(&format!("folder discovery FAILED: {e}"));
                 }
-                *state.sync_error.lock().unwrap_or_else(|p| p.into_inner()) =
-                    Some(friendly_sync_error_for(&cfg.host, &raw));
+                // Refused at the door: the account stands down here, before
+                // the drain, the sync or the bin's expiry ask again. They
+                // used to, a sign-in per queued archive, and twenty-two
+                // refused sign-ins at every launch is what gets a home
+                // network banned. The launch's one sign-in is this one.
+                if e.is_sign_in_refused() {
+                    log_sync(&format!(
+                        "account {account}: sign-in refused; standing down"
+                    ));
+                    state.refused_by(account, &stop);
+                }
+                say_sync_error(
+                    &state,
+                    &stop,
+                    Some(friendly_sync_error_for(&cfg.host, &raw)),
+                );
             }
         }
 
@@ -145,89 +147,103 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
         // behind fifteen IMAP actions.
         state.nudge_send(account);
 
-        // Deliver before reading back. Draining first means the server's answer
-        // already includes what the user did, so the fetch below confirms local
-        // state instead of contradicting it — and anything still queued is
-        // protected from being overwritten by the pending checks in the store.
-        // If another drain holds the floor the fetch proceeds without it —
-        // the store's pending checks protect what is queued, and the drain
-        // worker retries until the floor frees.
-        let drained = unless_stopped(
-            &mut stop,
-            drain_actions(
-                Arc::clone(&state),
-                account,
-                cfg.clone(),
-                has_move,
-                has_uidplus,
-                account_is_gmail(&cfg),
-            ),
-        )
-        .await;
-        if drained.is_none() {
-            stand_down();
-            return;
-        }
-        // A message due while the app was closed goes out now, rather than
-        // waiting for whatever next wakes the worker. Notify, do not await:
-        // send_due used to sit behind this drain, and a backlog of triage
-        // made "Send now" look like the outbox had ignored the click.
-        state.nudge_send(account);
-
-        // One connection, one STATUS line per folder, fetch only what moved.
-        // A relaunch over a warm store downloads nothing it already holds.
-        let Some(report) = unless_stopped(
-            &mut stop,
-            run_sync_cycle(&state, account, &cfg, true, Scope::Everything),
-        )
-        .await
-        else {
-            stand_down();
-            return;
-        };
-        let (fresh, failures) = (report.fresh, report.failures);
-        let targets = folders_to_sync(&state, account);
-        if failures > 0 {
-            log_sync(&format!("{failures} folder(s) could not be synced"));
-        }
-        if !targets.is_empty() && failures >= targets.len() {
-            let msg = "no folder could be synced";
-            log_sync(msg);
-            *state.sync_error.lock().unwrap_or_else(|p| p.into_inner()) =
-                Some(friendly_sync_error_for(&cfg.host, msg));
-            *state.source.lock().unwrap_or_else(|p| p.into_inner()) = "sync failed".into();
-        } else {
-            let held = state.seeded.load(Ordering::Relaxed);
-            log_sync(&format!(
-                "first pass done: {fresh} new, {held} held locally"
-            ));
-            *state.source.lock().unwrap_or_else(|p| p.into_inner()) =
-                format!("{} · {held} message(s) held", cfg.user);
-        }
-        // Where Gmail actually keeps each message.
-        //
-        // After the bodies rather than before: this decides filing, and filing
-        // an empty mailbox helps nobody. Over plain IMAP a message is only ever
-        // in the mailbox it was fetched from, so archived — not carrying the
-        // Inbox label — is not something the protocol can express.
-        //
-        // Bounded on the first pass and incremental after it. A full sweep is
-        // seconds at a thousand messages and minutes at a hundred thousand,
-        // but with CONDSTORE every sweep after the first asks only for what
-        // changed, which is usually nothing and costs one round trip.
-        if looks_like_gmail {
-            let swept = unless_stopped(&mut stop, async {
-                run_label_sweep(&state, account, &cfg).await;
-                run_thrid_sweep(&state, account, &cfg).await;
-            })
+        // Everything from here to the end of the first pass asks the server,
+        // and a refused password has nothing to ask it with.
+        if state.signin(account).is_none() {
+            // Deliver before reading back. Draining first means the server's answer
+            // already includes what the user did, so the fetch below confirms local
+            // state instead of contradicting it — and anything still queued is
+            // protected from being overwritten by the pending checks in the store.
+            // If another drain holds the floor the fetch proceeds without it —
+            // the store's pending checks protect what is queued, and the drain
+            // worker retries until the floor frees.
+            let mine = stop.clone();
+            let drained = unless_stopped(
+                &mut stop,
+                drain_actions(
+                    Arc::clone(&state),
+                    account,
+                    cfg.clone(),
+                    has_move,
+                    has_uidplus,
+                    account_is_gmail(&cfg),
+                    &mine,
+                ),
+            )
             .await;
-            if swept.is_none() {
+            if drained.is_none() {
                 stand_down();
                 return;
             }
+            // A message due while the app was closed goes out now, rather than
+            // waiting for whatever next wakes the worker. Notify, do not await:
+            // send_due used to sit behind this drain, and a backlog of triage
+            // made "Send now" look like the outbox had ignored the click.
+            state.nudge_send(account);
+
+            // One connection, one STATUS line per folder, fetch only what moved.
+            // A relaunch over a warm store downloads nothing it already holds.
+            let Some(report) = unless_stopped(
+                &mut stop,
+                run_sync_cycle(&state, account, &cfg, true, Scope::Everything),
+            )
+            .await
+            else {
+                stand_down();
+                return;
+            };
+            let (fresh, failures) = (report.fresh, report.failures);
+            let targets = folders_to_sync(&state, account);
+            if failures > 0 {
+                log_sync(&format!("{failures} folder(s) could not be synced"));
+            }
+            if !targets.is_empty() && failures >= targets.len() {
+                let msg = "no folder could be synced";
+                log_sync(msg);
+                // The server's own reason, where there is one. "no folder could be
+                // synced" told somebody whose password had been revoked nothing,
+                // and replaced the sign-in advice the probe had just put up.
+                let raw = report.last_failure.as_deref().unwrap_or(msg);
+                if is_sign_in_refusal(raw) {
+                    state.refused_by(account, &stop);
+                }
+                say_sync_error(&state, &stop, Some(friendly_sync_error_for(&cfg.host, raw)));
+                *state.source.lock().unwrap_or_else(|p| p.into_inner()) = "sync failed".into();
+            } else {
+                let held = state.seeded.load(Ordering::Relaxed);
+                log_sync(&format!(
+                    "first pass done: {fresh} new, {held} held locally"
+                ));
+                *state.source.lock().unwrap_or_else(|p| p.into_inner()) =
+                    format!("{} · {held} message(s) held", cfg.user);
+            }
+            // Where Gmail actually keeps each message.
+            //
+            // After the bodies rather than before: this decides filing, and filing
+            // an empty mailbox helps nobody. Over plain IMAP a message is only ever
+            // in the mailbox it was fetched from, so archived — not carrying the
+            // Inbox label — is not something the protocol can express.
+            //
+            // Bounded on the first pass and incremental after it. A full sweep is
+            // seconds at a thousand messages and minutes at a hundred thousand,
+            // but with CONDSTORE every sweep after the first asks only for what
+            // changed, which is usually nothing and costs one round trip.
+            if looks_like_gmail && state.signin(account).is_none() {
+                let swept = unless_stopped(&mut stop, async {
+                    run_label_sweep(&state, account, &cfg).await;
+                    run_thrid_sweep(&state, account, &cfg).await;
+                })
+                .await;
+                if swept.is_none() {
+                    stand_down();
+                    return;
+                }
+            }
+        } else {
+            *state.source.lock().unwrap_or_else(|p| p.into_inner()) = "sign-in refused".into();
         }
 
-        state.seeding.store(false, Ordering::Relaxed);
+        state.end_seeding(account, seeding);
 
         // The first pass may have re-listed messages whose move the drain has
         // since delivered; sweep once now rather than waiting out the first
@@ -237,13 +253,24 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
         // with IDLE holding a quiet account open, "the next cycle" can be
         // hours away, and mail would sit in the bin unstamped until then.
         let settled = unless_stopped(&mut stop, async {
-            reconcile_ghost_placements(&state, account, &cfg).await;
-            tend_the_bin(&state, account).await;
+            // A refused password has nothing to reconcile with, and every
+            // ask is one more refused sign-in; nor does the bin's expiry,
+            // which expunges message by message.
+            if state.signin(account).is_none() {
+                reconcile_ghost_placements(&state, account, &cfg).await;
+                tend_the_bin(&state, account).await;
+            }
         })
         .await;
         if settled.is_none() {
             stand_down();
             return;
+        }
+        // What waited for this account to sign in goes now. Not raced
+        // against the switch: it takes the work it does, and a stop part-way
+        // must hand back what it had not done, not drop it.
+        if state.signin(account).is_none() {
+            drafts::push_held(&state, account, &stop).await;
         }
 
         // History fills in behind the present, on its own clock — see
@@ -313,7 +340,11 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
         // running collapse into the single pass that follows it, which is the
         // right answer because a wake carries no detail to lose.
         let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<()>(1);
-        if has_idle {
+        // A launch that never reached the server does not know whether it can
+        // IDLE. The watchers start anyway and wait to hear (`idle_known`):
+        // left out, the account sat on the two-minute poll, each poll a full
+        // sweep, until the app was next relaunched.
+        if has_idle || !state.caps(account).known {
             spawn_open_folder_watch(
                 Arc::clone(&state),
                 account,
@@ -323,7 +354,11 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
             );
             let cfg = cfg.clone();
             let mut stop = stop.clone();
+            let state = Arc::clone(&state);
             tokio::spawn(async move {
+                if !idle_known(&state, account, &mut stop).await {
+                    return;
+                }
                 // Backoff rather than the flat two-minute sleep this used to
                 // take on failure. A refused IDLE is usually a dropped socket
                 // and retrying costs one connection; two minutes of blindness
@@ -331,6 +366,13 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                 let mut backoff = std::time::Duration::from_secs(2);
                 let ceiling_backoff = std::time::Duration::from_secs(120);
                 loop {
+                    // A refused password is not a dropped socket. Retried on
+                    // this backoff it was thirty refused sign-ins an hour, on
+                    // top of the sweep's; it waits now, and the sweep loop
+                    // asks the server once an hour for all of them.
+                    if !wait_for_signin(&state, account, &mut stop).await {
+                        return;
+                    }
                     let armed = std::time::Instant::now();
                     // The account may be removed while IDLE holds the
                     // connection open, for up to twenty minutes: the switch
@@ -342,6 +384,9 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                             let _ = wake_tx.try_send(());
                         }) => w,
                         _ = stopped(&mut stop) => return,
+                        // Stood down meanwhile: the session goes, and the
+                        // watcher waits at the top for a password that works.
+                        _ = crate::signin::until_signed_out(&state, account) => continue,
                     };
                     match watching {
                         Ok(()) => {
@@ -352,6 +397,13 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                             ));
                         }
                         Err(e) => {
+                            if e.is_sign_in_refused() {
+                                log_sync(&format!(
+                                    "account {account}: sign-in refused; standing down"
+                                ));
+                                state.refused_by(account, &stop);
+                                continue;
+                            }
                             log_sync(&format!(
                                 "idle failed after {:.0}s, retrying in {}s: {e}",
                                 armed.elapsed().as_secs_f32(),
@@ -373,31 +425,94 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
 
         let mut swept = std::time::Instant::now();
         let mut reconciled = std::time::Instant::now();
+        // Set when the server takes a refused password again: catch up at
+        // once rather than at the next sweep.
+        let mut resume_now = false;
         loop {
+            if *stop.borrow() {
+                break;
+            }
+            // Signed out, the account stands down: no drain, no sweep, no
+            // fetch. A refused password waits out its hour, or a new password
+            // restarts the account; then one sign-in, not a whole cycle, asks
+            // whether the server takes it yet. Every cycle used to try, two
+            // sign-ins at a time, for as long as the app ran. A missing
+            // password has nothing to try with, and waits for one.
+            if let Some(why) = state.signin(account) {
+                let mut changed = state.signin_changed.subscribe();
+                let wait = match why {
+                    SignIn::Refused => state.refused_wait(account, now_ms()),
+                    SignIn::Missing => Some(crate::signin::REFUSED_RETRY),
+                };
+                if let Some(wait) = wait {
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = changed.changed() => {}
+                        _ = stopped(&mut stop) => break,
+                    }
+                    continue;
+                }
+                // Raced against the switch: a loop stopped by Sign in again
+                // must not hear its old password refused after the new one
+                // was saved, and write that over it.
+                let Some(asked) =
+                    unless_stopped(&mut stop, petrel_providers::imap::login_check(&cfg)).await
+                else {
+                    break;
+                };
+                match asked {
+                    Ok(()) => {
+                        log_sync(&format!("account {account}: sign-in accepted again"));
+                        state.cleared_by(account, &stop);
+                        // The refusal's banner was this account's, and it is
+                        // untrue now, however the folders fare after this.
+                        say_sync_error(&state, &stop, None);
+                        resume_now = true;
+                        // What waited for the account to sign in goes now,
+                        // not after a cycle in which every folder succeeds:
+                        // one folder failing every cycle stranded it.
+                        drafts::push_held(&state, account, &stop).await;
+                    }
+                    Err(e) => {
+                        // Refused again, or no answer at all: another hour.
+                        log_sync(&format!("account {account}: sign-in still failing: {e}"));
+                        state.refused_by(account, &stop);
+                        continue;
+                    }
+                }
+            }
             // Whichever comes first: the server speaking, or the sweep falling
             // due. An account with no IDLE has no watcher, so `wake_rx` never
             // fires and the timer alone drives it — the old poll, unchanged.
             let until_sweep = sweep_every.saturating_sub(swept.elapsed());
             let wait = if has_idle { until_sweep } else { every };
-            if *stop.borrow() {
-                break;
-            }
-            let by_wake = tokio::select! {
-                got = wake_rx.recv() => {
-                    // The watcher only ends if the loop is gone, but a closed
-                    // channel here would otherwise spin.
-                    if got.is_none() {
-                        tokio::time::sleep(wait).await;
-                        false
-                    } else {
-                        true
+            let by_wake = if std::mem::take(&mut resume_now) {
+                false
+            } else {
+                tokio::select! {
+                    got = wake_rx.recv() => {
+                        // The watcher only ends if the loop is gone, but a closed
+                        // channel here would otherwise spin.
+                        if got.is_none() {
+                            tokio::time::sleep(wait).await;
+                            false
+                        } else {
+                            true
+                        }
                     }
+                    _ = tokio::time::sleep(wait) => false,
+                    // The account was removed: stand down rather than run one
+                    // more cycle against a server the app no longer owns.
+                    _ = stopped(&mut stop) => break,
                 }
-                _ = tokio::time::sleep(wait) => false,
-                // The account was removed: stand down rather than run one
-                // more cycle against a server the app no longer owns.
-                _ = stopped(&mut stop) => break,
             };
+            // Looked at again after the wait, not only before it: a watcher
+            // that met a refusal while the loop slept has stood the account
+            // down, and the cycle the timer is about to run would ask the
+            // server with the refused password anyway, the queue first.
+            if state.signin(account).is_some() {
+                continue;
+            }
             let cycle = std::time::Instant::now();
             // A wake still takes the sweep if one has come due meanwhile, so a
             // busy mailbox cannot starve the other folders.
@@ -406,50 +521,88 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                 swept = std::time::Instant::now();
             }
 
-            // Deliver first, so the fetch that follows confirms local state
-            // rather than contradicting it — the same ordering as startup.
-            // Always, on both paths: the person's own changes are the ones
-            // they are watching for, and holding them for a sweep would make
-            // the app feel slower at exactly the moment it must not.
-            let _ = drain_actions(
-                Arc::clone(&state),
-                account,
-                cfg.clone(),
-                has_move,
-                has_uidplus,
-                account_is_gmail(&cfg),
-            )
-            .await;
-            state.nudge_send(account);
-            if sweeping {
-                // Folders were discovered once, at launch. A mailbox made in
-                // webmail — or by a rule on the server — never appeared until
-                // the app was restarted, and mail filed into it was mail
-                // Petrel could not see. The sweep is where "what does the
-                // server have" belongs, and the survey is one LIST.
-                refresh_folders(&state, account, &cfg, looks_like_gmail).await;
-                tend_the_bin(&state, account).await;
-                if reconciled.elapsed() >= reconcile_every {
-                    reconciled = std::time::Instant::now();
-                    reconcile_ghost_placements(&state, account, &cfg).await;
+            // The cycle runs under the account's switch, as the first pass
+            // does, so a loop stopped by Sign in again or a removal goes no
+            // further; and it ends early once a step meets a refusal, rather
+            // than asking again with every step after it.
+            let mine = stop.clone();
+            let Some(ran) = unless_stopped(&mut stop, async {
+                // Deliver first, so the fetch that follows confirms local state
+                // rather than contradicting it — the same ordering as startup.
+                // Always, on both paths: the person's own changes are the ones
+                // they are watching for, and holding them for a sweep would make
+                // the app feel slower at exactly the moment it must not.
+                let _ = drain_actions(
+                    Arc::clone(&state),
+                    account,
+                    cfg.clone(),
+                    has_move,
+                    has_uidplus,
+                    account_is_gmail(&cfg),
+                    &mine,
+                )
+                .await;
+                state.nudge_send(account);
+                if state.signin(account).is_some() {
+                    return None;
                 }
-            }
+                if sweeping {
+                    // Folders were discovered once, at launch. A mailbox made in
+                    // webmail — or by a rule on the server — never appeared until
+                    // the app was restarted, and mail filed into it was mail
+                    // Petrel could not see. The sweep is where "what does the
+                    // server have" belongs, and the survey is one LIST.
+                    //
+                    // It is also where a launch that had no network learns what
+                    // the server can do: the drain moves rather than copies from
+                    // here on, and the waiting IDLE watchers start.
+                    if let Some(caps) = refresh_folders(&state, account, &cfg, &mine).await {
+                        has_move = caps.has_move;
+                        has_uidplus = caps.has_uidplus;
+                        has_idle = caps.has_idle;
+                    }
+                    // The survey is the sweep's first sign-in: refused there,
+                    // the bin's expiry, the reconcile and the sync would each
+                    // have been refused again.
+                    if state.signin(account).is_some() {
+                        return None;
+                    }
+                    tend_the_bin(&state, account).await;
+                    if reconciled.elapsed() >= reconcile_every {
+                        reconciled = std::time::Instant::now();
+                        reconcile_ghost_placements(&state, account, &cfg).await;
+                    }
+                }
 
-            // One connection for the whole account, STATUS-gated per folder:
-            // a quiet cycle costs a line per folder, not a login per folder.
-            let scope = if sweeping {
-                Scope::Everything
-            } else {
-                Scope::Inbox
+                // One connection for the whole account, STATUS-gated per folder:
+                // a quiet cycle costs a line per folder, not a login per folder.
+                let scope = if sweeping {
+                    Scope::Everything
+                } else {
+                    Scope::Inbox
+                };
+                let report = run_sync_cycle(&state, account, &cfg, false, scope).await;
+                // Refused everywhere: the labels would only be refused too.
+                if account_is_gmail(&cfg)
+                    && !refused_everywhere(&report)
+                    && state.signin(account).is_none()
+                {
+                    // One round trip when nothing changed; live labels when it did.
+                    // On both paths: a new message usually arrives with its labels.
+                    run_label_sweep(&state, account, &cfg).await;
+                    run_thrid_sweep(&state, account, &cfg).await;
+                }
+                Some(report)
+            })
+            .await
+            else {
+                break;
             };
-            let report = run_sync_cycle(&state, account, &cfg, false, scope).await;
+            // Stood down part-way: the drain met a refusal.
+            let Some(report) = ran else {
+                continue;
+            };
             let (fresh, failures) = (report.fresh, report.failures);
-            if account_is_gmail(&cfg) {
-                // One round trip when nothing changed; live labels when it did.
-                // On both paths: a new message usually arrives with its labels.
-                run_label_sweep(&state, account, &cfg).await;
-                run_thrid_sweep(&state, account, &cfg).await;
-            }
 
             let trouble: Option<String> = if failures > 0 {
                 Some(format!("{failures} folder(s) failed"))
@@ -468,7 +621,12 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
             // proves nothing, and used to clear the sign-in banner the probe
             // had just raised.
             if trouble.is_none() && report.attempted > 0 {
-                *state.sync_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                say_sync_error(&state, &stop, None);
+                // Signed in after all: a refusal an IDLE reconnect saw a
+                // moment ago does not stand.
+                if state.signin(account) == Some(SignIn::Refused) {
+                    state.cleared_by(account, &stop);
+                }
             } else if report.attempted > 0 && report.failures >= report.attempted {
                 // A pass that failed everywhere is the account failing, not a
                 // folder. A password revoked after launch used to fail every
@@ -478,8 +636,21 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                     .last_failure
                     .clone()
                     .unwrap_or_else(|| "no folder could be synced".into());
-                *state.sync_error.lock().unwrap_or_else(|p| p.into_inner()) =
-                    Some(friendly_sync_error_for(&cfg.host, &raw));
+                if is_sign_in_refusal(&raw) {
+                    state.refused_by(account, &stop);
+                }
+                say_sync_error(
+                    &state,
+                    &stop,
+                    Some(friendly_sync_error_for(&cfg.host, &raw)),
+                );
+            }
+            // Signed in, whatever became of the folders: what waited for the
+            // account to sign in goes now. Only a cycle in which every folder
+            // succeeded used to send it, so one folder failing every time
+            // stranded it for the session.
+            if report.attempted > report.failures && state.signin(account).is_none() {
+                drafts::push_held(&state, account, &stop).await;
             }
             // The two paths are meant to cost very different amounts, and this
             // is where that stops being a claim.
@@ -503,44 +674,53 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
 /// are already Petrel tags stay tags, and \Noselect containers are
 /// hierarchy rather than mailboxes. Failure is silent by design — the
 /// folders already known are still right, and the banner belongs to sync.
+///
+/// The survey is a probe, so it also records what the server can do and
+/// hands that back. A launch with no network never ran its own probe, and
+/// what it never learned used to stay unlearned for the whole session: no
+/// IDLE, no MOVE, and Gmail not recognised as Gmail.
 async fn refresh_folders(
     state: &Arc<AppState>,
     account: i64,
     cfg: &ImapConfig,
-    looks_like_gmail: bool,
-) {
-    let Ok(report) = petrel_providers::imap::probe(cfg, 0).await else {
-        return;
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> Option<crate::state::ServerCaps> {
+    let report = match petrel_providers::imap::probe(cfg, 0).await {
+        Ok(report) => report,
+        Err(e) => {
+            // Silent, but not about a refused password: the sweep stands
+            // down on it rather than asking three more times.
+            if e.is_sign_in_refused() {
+                state.refused_by(account, stop);
+            }
+            return None;
+        }
     };
-    let rows: Vec<(String, Option<String>)> = report
-        .folders
-        .iter()
-        .filter(|f| petrel_providers::imap::selectable(f))
-        .map(|f| {
-            (
-                f.name.clone(),
-                petrel_providers::imap::special_use_role(f).map(|r| r.to_string()),
-            )
-        })
-        .collect();
+    let caps = learned_caps(&report, cfg);
+    let gmail = caps.is_gmail;
+    state.set_caps(account, caps);
+    let rows = survey_rows(&report.folders, gmail);
     // In a block of its own: the guard has to be gone before the await
     // below, and a `drop` does not convince the compiler of that.
     let stored = {
         let Ok(mut store) = state.store.lock() else {
-            return;
+            return Some(caps);
         };
         let tag_names: Vec<String> = store
             .tags_for_account(account)
             .map(|ts| ts.into_iter().map(|t| t.name).collect())
             .unwrap_or_default();
-        let rows = without_tag_labels(rows, &tag_names, looks_like_gmail);
+        let rows = without_tag_labels(rows, &tag_names, gmail);
         match store.sync_folders(account, &rows) {
             Ok(n) if n > 0 => log_sync(&format!("{n} folder(s) stored")),
             Ok(_) => {}
             Err(e) => log_sync(&format!("folder sync failed: {e}")),
         }
+        if gmail {
+            let _ = store.set_account_kind(account, "gmail");
+        }
         store
-            .set_all_mail_folders(account, &all_mail_paths(&report.folders, looks_like_gmail))
+            .set_all_mail_folders(account, &all_mail_paths(&report.folders, gmail))
             .is_ok()
     };
     // What the launch survey did, for a launch that had no network to do it.
@@ -548,6 +728,77 @@ async fn refresh_folders(
         state.mark_surveyed(account);
     }
     create_waiting_folders(state, account, cfg).await;
+    Some(caps)
+}
+
+/// What a probe that answered says the server can do.
+///
+/// Gmail is the provider whose folders are labels, and the only one we can
+/// identify from what it advertises before any mail arrives. Recording it is
+/// what makes archiving keep the user's other labels instead of clearing
+/// them.
+fn learned_caps(
+    report: &petrel_providers::imap::ProbeReport,
+    cfg: &ImapConfig,
+) -> crate::state::ServerCaps {
+    let c = &report.greeting_capabilities;
+    crate::state::ServerCaps {
+        has_move: c.move_,
+        has_uidplus: c.uidplus,
+        has_idle: c.idle,
+        is_gmail: cfg.host.contains("gmail")
+            || report.folders.iter().any(|f| f.name.starts_with("[Gmail]")),
+        known: true,
+    }
+}
+
+/// A survey's folders as the store takes them: path and the role the server
+/// flags.
+///
+/// \Noselect containers ([Gmail] itself) are hierarchy, not mailboxes:
+/// nothing to list, nothing to sync. Outside Gmail a mailbox flagged `\All`
+/// is a view of every message, not the archive — archiving into it is a
+/// move the server cannot make — so it gets no role. On Gmail it is the
+/// archive (`all_mail_paths` says why).
+fn survey_rows(
+    folders: &[petrel_providers::imap::FolderInfo],
+    gmail: bool,
+) -> Vec<(String, Option<String>)> {
+    folders
+        .iter()
+        .filter(|f| petrel_providers::imap::selectable(f))
+        .map(|f| {
+            let role = if !gmail && petrel_providers::imap::is_all_mailbox(f) {
+                None
+            } else {
+                petrel_providers::imap::special_use_role(f).map(|r| r.to_string())
+            };
+            (f.name.clone(), role)
+        })
+        .collect()
+}
+
+/// Waits until this account's server is known to IDLE: false when it is
+/// known not to, or when the account stands down.
+///
+/// The watchers start before a launch that had no network knows anything
+/// (see the spawn), and a survey that gets through later is what tells
+/// them. Two seconds is a wait on an in-memory flag, not on the server.
+async fn idle_known(
+    state: &AppState,
+    account: i64,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    loop {
+        let caps = state.caps(account);
+        if caps.known {
+            return caps.has_idle;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            _ = stopped(stop) => return false,
+        }
+    }
 }
 
 /// The mailboxes a survey found flagged `\All` that are not the archive, by
@@ -653,6 +904,18 @@ struct CycleReport {
     last_failure: Option<String>,
 }
 
+/// Whether a cycle failed everywhere because the server refused the
+/// password at sign-in: the provider's verdict, carried in the failure's
+/// text once the error has lost its type.
+fn refused_everywhere(report: &CycleReport) -> bool {
+    report.attempted > 0
+        && report.failures >= report.attempted
+        && report
+            .last_failure
+            .as_deref()
+            .is_some_and(is_sign_in_refusal)
+}
+
 /// Folders that may be fetched when the person opens them. Inbox has
 /// IDLE. Archive is here for the accounts where it is a folder of its own;
 /// on Gmail it is All Mail, which `folders_to_sync` leaves out, so opening
@@ -719,6 +982,11 @@ pub(crate) fn spawn_view_sync(state: Arc<AppState>, account: i64, view: &str) {
     let Some(scope) = open_sync_scope(view) else {
         return;
     };
+    // Signed out: opening a folder is not a reason for another refused
+    // sign-in, and an account with no password has none to offer.
+    if state.signin(account).is_some() {
+        return;
+    }
     // A mailbox with no folder of its own on this account — Archive on
     // Gmail — has nothing to fetch. Nor, until a survey this session has
     // stored what it found, does Archive: the role can sit on a server's view
@@ -734,6 +1002,7 @@ pub(crate) fn spawn_view_sync(state: Arc<AppState>, account: i64, view: &str) {
     if !claim_folder_sync(&state, &key) {
         return;
     }
+    let stop = state.stop_signal(account);
     tauri::async_runtime::spawn(async move {
         let cfg = {
             let Ok(store) = state.store() else {
@@ -747,6 +1016,11 @@ pub(crate) fn spawn_view_sync(state: Arc<AppState>, account: i64, view: &str) {
             return;
         };
         let report = run_sync_cycle(&state, account, &cfg, false, scope).await;
+        // Refused: the account stands down, so the next folder opened does
+        // not sign in again.
+        if refused_everywhere(&report) {
+            state.refused_by(account, &stop);
+        }
         if report.fresh > 0 {
             log_sync(&format!("account {account} {key}: {} new", report.fresh));
             state
@@ -816,8 +1090,17 @@ fn spawn_open_folder_watch(
                 else {
                     continue;
                 };
+                // Signed out, a wake asks nothing: each new message in the
+                // folder on screen was one more refused sign-in.
+                if state.signin(account).is_some() {
+                    continue;
+                }
                 let cycle = std::time::Instant::now();
-                run_sync_cycle(&state, account, &cfg, false, Scope::FolderId(id)).await;
+                let report =
+                    run_sync_cycle(&state, account, &cfg, false, Scope::FolderId(id)).await;
+                if refused_everywhere(&report) {
+                    state.refused_by(account, &stop);
+                }
                 log_sync(&format!(
                     "account {account} folder {id} wake: {:.1}s",
                     cycle.elapsed().as_secs_f32()
@@ -827,6 +1110,9 @@ fn spawn_open_folder_watch(
     }
     let mut stop = stop;
     tauri::async_runtime::spawn(async move {
+        if !idle_known(&state, account, &mut stop).await {
+            return;
+        }
         let mut open = state.open_view.subscribe();
         let (aim, mut follow) = tokio::sync::watch::channel(None::<String>);
         let mut backoff = std::time::Duration::from_secs(2);
@@ -842,6 +1128,14 @@ fn spawn_open_folder_watch(
                 tokio::select! {
                     changed = open.changed() => if changed.is_err() { return },
                     _ = stopped(&mut stop) => return,
+                }
+                continue;
+            }
+            // Signed out: nothing until the password works. Then aim again,
+            // since the folder on screen may have changed meanwhile.
+            if state.signin(account).is_some() {
+                if !wait_for_signin(&state, account, &mut stop).await {
+                    return;
                 }
                 continue;
             }
@@ -866,11 +1160,19 @@ fn spawn_open_folder_watch(
                             aim.send_replace(watch_target(&state, account, open.borrow_and_update().as_ref()));
                         }
                         _ = stopped(&mut stop) => return,
+                        // Stood down meanwhile: the session goes now, rather
+                        // than at its ceiling, waking the folder's cycle with
+                        // a refused password on every change until then.
+                        _ = crate::signin::until_signed_out(&state, account) => break Ok(()),
                     }
                 }
             };
             match watching {
                 Ok(()) => backoff = std::time::Duration::from_secs(2),
+                Err(e) if e.is_sign_in_refused() => {
+                    log_sync(&format!("account {account}: folder watch sign-in refused"));
+                    state.refused_by(account, &stop);
+                }
                 Err(e) => {
                     log_sync(&format!(
                         "folder watch failed after {:.0}s, retrying in {}s: {e}",
@@ -1178,6 +1480,7 @@ async fn run_sync_cycle(
     }
     if !arrivals.is_empty() {
         apply_rules_to(state, account, &arrivals);
+        announce_elsewhere(state, account, &arrivals);
     }
     if moved {
         note_mail_moved(state);
@@ -1354,6 +1657,12 @@ pub(crate) fn folders_to_sync_from(store: &Store, account: i64) -> Vec<(String, 
         if store.folder_is_local(f.id).unwrap_or(false) {
             continue;
         }
+        // A mailbox flagged `\All` is a view of every message, here as much
+        // as above: it no longer takes the archive role (`settle_roles`),
+        // and synced as a folder it would download the account again.
+        if store.folder_is_all_mail(f.id).unwrap_or(false) {
+            continue;
+        }
         out.push((String::new(), f.path.clone(), f.id));
     }
     out
@@ -1423,6 +1732,45 @@ pub(crate) fn ingest_fenced(
             ));
             None
         }
+    }
+}
+
+/// Queues new mail in an account that is not on screen, for the next status
+/// poll to carry to the window's announcer, as the rules' notices go.
+///
+/// The window watches the inbox of the account it shows, and heard nothing
+/// of the others': mail could sit unannounced in a second account all day,
+/// where other clients say every account's. After the rules have run: only
+/// what is still in the inbox, and still unread. `arrivals` are messages new
+/// to an inbox synced before, so a first sync and the backfill are never said.
+pub(crate) fn announce_elsewhere(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
+    let said: Vec<crate::state::Elsewhere> = {
+        let Ok(store) = state.store.lock() else {
+            return;
+        };
+        if store.active_account().ok().flatten() == Some(account) {
+            return;
+        }
+        arrivals
+            .iter()
+            .filter(|&&id| store.message_in_role(id, "inbox").unwrap_or(false))
+            .filter_map(|&id| store.thread_message(id).ok().flatten())
+            .filter(|m| m.unread)
+            .map(|m| crate::state::Elsewhere {
+                account,
+                who: if m.from_display.is_empty() {
+                    m.from_addr
+                } else {
+                    m.from_display
+                },
+                subject: m.subject,
+            })
+            .collect()
+    };
+    if !said.is_empty()
+        && let Ok(mut pending) = state.pending_elsewhere.lock()
+    {
+        pending.extend(said);
     }
 }
 
@@ -1597,6 +1945,18 @@ fn apply_rules_to(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
     }
 }
 
+/// Where Gmail keeps every message: the folder holding the archive role,
+/// which the survey takes from `\All` — not the English name. Gmail
+/// translates it (`[Gmail]/Alle Nachrichten`), and in some countries the
+/// prefix is `[Google Mail]`; both sweeps asked for `[Gmail]/All Mail` by
+/// name and failed on every cycle there. The All Mail walk already asks
+/// this way (backfill.rs). None when the account has none to sweep.
+fn gmail_all_mail(state: &AppState, account: i64) -> Option<String> {
+    let store = state.store.lock().ok()?;
+    let id = store.folder_for_role(account, "archive").ok().flatten()?;
+    store.folder_path(id).ok().flatten()
+}
+
 /// One incremental Gmail label sweep: where every message lives, which are
 /// starred, and — for labels that are Petrel tags — who carries them. With
 /// CONDSTORE this costs one round trip when nothing changed, which is why it
@@ -1613,7 +1973,10 @@ async fn run_label_sweep(state: &Arc<AppState>, account: i64, cfg: &ImapConfig) 
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5_000);
-    match petrel_providers::imap::sweep_gmail_labels(cfg, "[Gmail]/All Mail", bound, since).await {
+    let Some(all_mail) = gmail_all_mail(state, account) else {
+        return;
+    };
+    match petrel_providers::imap::sweep_gmail_labels(cfg, &all_mail, bound, since).await {
         Ok(sweep) => {
             let filed = state
                 .store
@@ -1714,7 +2077,10 @@ async fn run_thrid_sweep(state: &Arc<AppState>, account: i64, cfg: &ImapConfig) 
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5_000);
-    match petrel_providers::imap::sweep_gmail_thrids(cfg, "[Gmail]/All Mail", bound, since).await {
+    let Some(all_mail) = gmail_all_mail(state, account) else {
+        return;
+    };
+    match petrel_providers::imap::sweep_gmail_thrids(cfg, &all_mail, bound, since).await {
         Ok(sweep) => {
             let (applied, regrouped) = {
                 let Ok(store) = state.store.lock() else {
@@ -2232,6 +2598,97 @@ mod sync_list_tests {
     }
 
     #[test]
+    fn a_server_flagging_several_folders_per_role_is_synced_one_per_role() {
+        // cPanel's Dovecot once Apple Mail and Outlook have both been
+        // pointed at it. The sync asked for the empty Apple folders, first
+        // in the rail, while triage filed into the real ones.
+        let (store, a) = surveyed(&[
+            ("INBOX", Some("inbox")),
+            ("Deleted Messages", Some("trash")),
+            ("Trash", Some("trash")),
+            ("Junk", Some("spam")),
+            ("Spam", Some("spam")),
+            ("Sent Messages", Some("sent")),
+            ("Sent", Some("sent")),
+            ("Sent Items", Some("sent")),
+        ]);
+        let list = folders_to_sync_from(&store, a);
+        for (role, path) in [("trash", "Trash"), ("spam", "Spam"), ("sent", "Sent")] {
+            let synced: Vec<(String, i64)> = list
+                .iter()
+                .filter(|(r, _, _)| r == role)
+                .map(|(_, p, id)| (p.clone(), *id))
+                .collect();
+            let filed = store.folder_for_role(a, role).unwrap().unwrap();
+            assert_eq!(synced, vec![(path.to_string(), filed)], "{role}: {list:?}");
+        }
+        // The others sync too, as folders: their mail is still the person's.
+        for path in ["Deleted Messages", "Junk", "Sent Messages", "Sent Items"] {
+            assert!(
+                list.iter().any(|(r, p, _)| r.is_empty() && p == path),
+                "{path}: {list:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mailbox_flagged_all_is_not_synced_as_a_folder_either() {
+        // Once it stops holding the archive role it is role-less, and the
+        // folder loop must not pick it up instead.
+        let survey = [
+            ("INBOX", Some("inbox")),
+            ("virtual/All", Some("archive")),
+            ("Archive", None),
+        ];
+        let (mut store, a) = surveyed(&survey);
+        store
+            .set_all_mail_folders(a, &["virtual/All".to_string()])
+            .unwrap();
+        let rows: Vec<(String, Option<String>)> = survey
+            .iter()
+            .map(|(p, r)| (p.to_string(), r.map(String::from)))
+            .collect();
+        store.sync_folders(a, &rows).unwrap();
+        let list = listed(&store, a);
+        assert!(list.contains(&pair("archive", "Archive")), "{list:?}");
+        assert!(
+            list.iter().all(|(_, path)| path != "virtual/All"),
+            "{list:?}"
+        );
+    }
+
+    #[test]
+    fn a_survey_gives_all_mail_no_role_outside_gmail() {
+        use super::survey_rows;
+        use petrel_providers::imap::FolderInfo;
+        let folder = |name: &str, attrs: &[&str]| FolderInfo {
+            name: name.into(),
+            delimiter: Some("/".into()),
+            attributes: attrs.iter().map(|s| s.to_string()).collect(),
+        };
+        let found = [
+            folder("INBOX", &[]),
+            folder("Archive", &["\\Archive"]),
+            folder("virtual/All", &["\\All"]),
+            folder("virtual", &["\\Noselect"]),
+        ];
+        assert_eq!(
+            survey_rows(&found, false),
+            vec![
+                ("INBOX".to_string(), Some("inbox".to_string())),
+                ("Archive".to_string(), Some("archive".to_string())),
+                ("virtual/All".to_string(), None),
+            ]
+        );
+        // On Gmail, All Mail is the archive.
+        let gmail = [folder("[Gmail]/All Mail", &["\\All"])];
+        assert_eq!(
+            survey_rows(&gmail, true),
+            vec![("[Gmail]/All Mail".to_string(), Some("archive".to_string()))]
+        );
+    }
+
+    #[test]
     fn the_archive_synced_is_the_one_the_drain_files_into() {
         // Two folders wearing the role, as a server flagging both \Archive
         // and \All would leave them. One is synced: the one mail goes to.
@@ -2347,5 +2804,91 @@ mod departure_tests {
         // baseline: the old one stays, so the next pass asks again.
         assert_eq!(settle_departures(&state, own, None, None), 0);
         assert_eq!(state.folder_seen.lock().unwrap().get(&own), Some(&(2, 5)));
+    }
+}
+
+#[cfg(test)]
+mod elsewhere_tests {
+    use super::announce_elsewhere;
+    use crate::state::Elsewhere;
+
+    fn raw(from: &str, subject: &str, id: &str) -> Vec<u8> {
+        format!(
+            "From: {from}\r\nTo: me@example.com\r\nSubject: {subject}\r\n\
+             Date: Mon, 7 Sep 2026 09:00:00 +0000\r\nMessage-ID: <{id}@example.com>\r\n\
+             Content-Type: text/plain\r\n\r\nbody\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// Mail arriving in an account that is not on screen. The window watches
+    /// the inbox of the account it shows and heard nothing of the others';
+    /// other clients announce every account's new mail. What the rules filed
+    /// elsewhere, and what was already read, is not news.
+    #[test]
+    fn new_mail_in_another_accounts_inbox_is_queued_to_be_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_state(dir.path());
+        let shown = state.account_id;
+        let (other, arrivals) = {
+            let store = state.store().unwrap();
+            let other = store.ensure_test_account().unwrap();
+            store.set_active_account(shown).unwrap();
+            let inbox = store.ensure_folder(other, "inbox", "INBOX").unwrap();
+            let receipts = store.ensure_named_folder(other, "Receipts").unwrap();
+            drop(store);
+            let mut store = state.store().unwrap();
+            let mut ids = Vec::new();
+            for (folder, uid, from, subject, read) in [
+                (
+                    inbox,
+                    1,
+                    "Riley Chen <riley@example.com>",
+                    "Lunch on Friday",
+                    false,
+                ),
+                (inbox, 2, "dana@example.com", "Read already", true),
+                (
+                    receipts,
+                    3,
+                    "Shop <shop@example.com>",
+                    "Filed by a rule",
+                    false,
+                ),
+            ] {
+                let got = store
+                    .ingest_raw(
+                        &state.blobs,
+                        other,
+                        Some(folder),
+                        Some(uid),
+                        &raw(from, subject, &uid.to_string()),
+                    )
+                    .unwrap();
+                if read {
+                    store
+                        .set_message_flags(got.message_id, petrel_engine::store::flags::SEEN)
+                        .unwrap();
+                }
+                ids.push(got.message_id);
+            }
+            (other, ids)
+        };
+
+        announce_elsewhere(&state, other, &arrivals);
+        let said: Vec<Elsewhere> = std::mem::take(&mut *state.pending_elsewhere.lock().unwrap());
+        assert_eq!(
+            said,
+            vec![Elsewhere {
+                account: other,
+                who: "Riley Chen".into(),
+                subject: "Lunch on Friday".into(),
+            }]
+        );
+
+        // The account on screen says its own: its inbox list is watched.
+        state.store().unwrap().set_active_account(other).unwrap();
+        announce_elsewhere(&state, other, &arrivals);
+        assert!(state.pending_elsewhere.lock().unwrap().is_empty());
     }
 }

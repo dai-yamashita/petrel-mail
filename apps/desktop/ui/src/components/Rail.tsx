@@ -843,6 +843,10 @@ export function Rail({
     <nav
       className="rail"
       ref={railRef}
+      // Takes the focus a click on a mailbox drops in WebKit, which does not
+      // focus a button it clicks: on the page, single keys are refused while
+      // a message is being written; in the rail, they are not.
+      tabIndex={-1}
       aria-label={t('rail-mailboxes')}
       data-collapsed={collapsed || undefined}
     >

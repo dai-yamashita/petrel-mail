@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from './lib/api';
 import { draftFromRecord } from './lib/draft-record';
-import { Compose, addresses, type Draft } from './components/Compose';
-import { firstUnsendable } from './lib/recipients';
+import { Compose, type Draft } from './components/Compose';
+import { firstUnsendable, hasRecipient } from './lib/recipients';
 import { Picker } from './components/Picker';
 import { ATTACHMENT_LIMIT, pickAttachments, stageDropped } from './lib/attachments';
 import { settleDraft } from './lib/close-draft';
@@ -89,6 +89,7 @@ export function ComposeWindow({ draftId }: { draftId: number }) {
       const known = slot.id ?? d.savedId ?? null;
       const id = await api.saveDraft(known, d.to, d.subject, d.body, d.html, {
         cc: d.cc,
+        bcc: d.bcc ?? '',
         inReplyTo: d.inReplyTo ?? null,
         references: d.references ?? [],
         attachments: (d.attachments ?? []).map((a) => a.path),
@@ -210,12 +211,26 @@ export function ComposeWindow({ draftId }: { draftId: number }) {
             })
             .catch((e) => setToast(t('compose-attach-failed', { error: String(e) })));
         }}
-        onSendLater={() => setScheduling(true)}
+        onSendLater={(d) => {
+          // The checks Send makes, before a time is asked for: a message
+          // scheduled with nobody to send to failed later, in the Outbox.
+          if (!hasRecipient(d)) {
+            setToast(t('compose-no-recipient'));
+            return;
+          }
+          const bad = firstUnsendable(d);
+          if (bad != null) {
+            setToast(t('compose-bad-recipient', { addr: bad }));
+            return;
+          }
+          setScheduling(true);
+        }}
         // Already in its own window: popping out again would either make a
         // second window onto the same draft or do nothing.
         onPopOut={() => setToast(t('compose-already-popped'))}
         onSend={(d) => {
-          if (addresses(d.to).length === 0) {
+          // To, Cc or Bcc: a message to blind copies alone can go.
+          if (!hasRecipient(d)) {
             setToast(t('compose-no-recipient'));
             return;
           }
@@ -250,6 +265,10 @@ export function ComposeWindow({ draftId }: { draftId: number }) {
         onCreate={() => {}}
         onChoose={(at) => {
           setScheduling(false);
+          if (!hasRecipient(draft)) {
+            setToast(t('compose-no-recipient'));
+            return;
+          }
           const bad = firstUnsendable(draft);
           if (bad != null) {
             setToast(t('compose-bad-recipient', { addr: bad }));

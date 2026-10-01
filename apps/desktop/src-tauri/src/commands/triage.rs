@@ -1,7 +1,8 @@
 //! Acting on mail: triage and its undo, tags, and folders.
 
-use crate::config::{imap_config_for, imap_config_from_servers};
+use crate::config::imap_config_from_servers;
 use crate::diag::log_sync;
+use crate::signin::{SIGN_IN_FIRST, SignIn, refused_or, server_for};
 use crate::state::{AppState, active_account, note_ui_touch};
 use petrel_engine::actions::{ActionKind, ActionReceipt};
 use petrel_engine::store::FolderSummary;
@@ -68,6 +69,50 @@ fn triage_account(
     match owner {
         Some(account) => Ok(account),
         None => active_account(store),
+    }
+}
+
+/// The account a folder belongs to, whose server its commands go to.
+///
+/// Not the account on screen. A confirmation opened on one account's folder
+/// stayed open across ⌘2, and its command then took the other account's
+/// server and the folder's path: Delete renamed a folder of the same name
+/// over there, and Move all to Trash binned its mail. The folder says whose
+/// it is.
+pub(crate) fn folder_account(
+    store: &petrel_engine::store::Store,
+    folder_id: i64,
+) -> Result<i64, String> {
+    for account in store.account_ids().map_err(|e| e.to_string())? {
+        if store
+            .account_owns_folder(account, folder_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(account);
+        }
+    }
+    Err("no such folder".into())
+}
+
+/// An account the window named, as long as it still exists.
+///
+/// For the commands that act on a whole account rather than on an item that
+/// carries one: Empty Trash and the identity. They are asked for the account
+/// the dialog or pane was opened on, because by the time the person confirms,
+/// the rail may be showing another — and "permanently empty the Trash" must
+/// never land on a Trash nobody looked at.
+pub(crate) fn named_account(
+    store: &petrel_engine::store::Store,
+    account_id: i64,
+) -> Result<i64, String> {
+    if store
+        .account_ids()
+        .map_err(|e| e.to_string())?
+        .contains(&account_id)
+    {
+        Ok(account_id)
+    } else {
+        Err("that account is no longer here".into())
     }
 }
 
@@ -170,20 +215,32 @@ pub fn create_folder(path: String, state: State<Arc<AppState>>) -> Result<i64, S
 /// which is what makes the next sync try again.
 #[tauri::command]
 pub async fn push_folder(folder_id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    push_folder_to_server(&state, folder_id).await
+}
+
+/// `push_folder`, for any state.
+async fn push_folder_to_server(state: &AppState, folder_id: i64) -> Result<(), String> {
     let (servers, path) = {
         let store = state.store()?;
-        let account = active_account(&store)?;
-        let waiting = store
-            .account_owns_folder(account, folder_id)
+        // Its own account's server, whichever account is on screen now.
+        let Ok(account) = folder_account(&store, folder_id) else {
+            return Ok(());
+        };
+        let waiting = !store
+            .folder_is_local(folder_id)
             .map_err(|e| e.to_string())?
-            && !store
-                .folder_is_local(folder_id)
-                .map_err(|e| e.to_string())?
             && store
                 .folder_awaits_server(folder_id)
                 .map_err(|e| e.to_string())?;
         if !waiting {
             return Ok(());
+        }
+        // Signed out, the folder stays waiting, and the sync after the
+        // account signs in again creates it, as it does after any failure.
+        // Said, not passed off as done: Ok here read as "Created" for a
+        // folder the server never got.
+        if state.signin(account).is_some() {
+            return Err(SIGN_IN_FIRST.into());
         }
         let path = store
             .folder_path(folder_id)
@@ -192,9 +249,16 @@ pub async fn push_folder(folder_id: i64, state: State<'_, Arc<AppState>>) -> Res
         let servers = store.account_servers(account).map_err(|e| e.to_string())?;
         (servers.map(|s| (account, s)), path)
     };
-    // Outside the lock: the keychain may ask, and nothing should queue behind it.
-    let Some(cfg) = servers.and_then(|(account, s)| imap_config_from_servers(account, s)) else {
+    let Some((account, servers)) = servers.filter(|(_, s)| !s.imap_host.is_empty()) else {
         return Ok(());
+    };
+    let stop = state.stop_signal(account);
+    // Outside the lock: the keychain may ask, and nothing should queue behind it.
+    let Some(cfg) = imap_config_from_servers(account, servers) else {
+        // Servers and no password Petrel can read: not a folder made, but an
+        // account that needs its password, as `server_for` has it.
+        state.set_signin(account, SignIn::Missing);
+        return Err(SIGN_IN_FIRST.into());
     };
     match petrel_providers::imap::create_folder(&cfg, &path).await {
         Ok(()) => {
@@ -207,7 +271,7 @@ pub async fn push_folder(folder_id: i64, state: State<'_, Arc<AppState>>) -> Res
             log_sync(&format!(
                 "server create {path} failed, next sync retries: {e}"
             ));
-            Err(e.to_string())
+            Err(refused_or(state, account, &stop, e))
         }
     }
 }
@@ -237,23 +301,24 @@ pub async fn rename_folder(
     new_path: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let (cfg, old_path) = {
+    let (cfg, old_path, account) = {
         let store = state.store()?;
-        let account = active_account(&store)?;
+        let account = folder_account(&store, folder_id)?;
         let path = store
             .folder_path(folder_id)
             .map_err(|e| e.to_string())?
             .ok_or("no such folder")?;
         let cfg = match only_here(&store, folder_id)? {
             true => None,
-            false => imap_config_for(&store, account),
+            false => server_for(&state, &store, account)?,
         };
-        (cfg, path)
+        (cfg, path, account)
     };
     if let Some(cfg) = cfg {
+        let stop = state.stop_signal(account);
         petrel_providers::imap::rename_folder(&cfg, &old_path, &new_path)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| refused_or(&state, account, &stop, e))?;
     }
     let mut store = state.store()?;
     store
@@ -267,23 +332,24 @@ pub async fn rename_folder(
 /// synced is destroyed. One that lives only here is deleted only here.
 #[tauri::command]
 pub async fn delete_folder(folder_id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let (cfg, path) = {
+    let (cfg, path, account) = {
         let store = state.store()?;
-        let account = active_account(&store)?;
+        let account = folder_account(&store, folder_id)?;
         let path = store
             .folder_path(folder_id)
             .map_err(|e| e.to_string())?
             .ok_or("no such folder")?;
         let cfg = match only_here(&store, folder_id)? {
             true => None,
-            false => imap_config_for(&store, account),
+            false => server_for(&state, &store, account)?,
         };
-        (cfg, path)
+        (cfg, path, account)
     };
     if let Some(cfg) = cfg {
+        let stop = state.stop_signal(account);
         petrel_providers::imap::delete_folder(&cfg, &path)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| refused_or(&state, account, &stop, e))?;
     }
     let mut store = state.store()?;
     let took = store.remove_folder(folder_id).map_err(|e| e.to_string())?;
@@ -307,10 +373,13 @@ pub async fn delete_folder(folder_id: i64, state: State<'_, Arc<AppState>>) -> R
 /// away. Emptying half a bin and saying it is empty would be the one
 /// outcome worse than not emptying it.
 #[tauri::command]
-pub async fn empty_trash(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+pub async fn empty_trash(
+    account_id: i64,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
     let (account, items) = {
         let store = state.store()?;
-        let account = active_account(&store)?;
+        let account = named_account(&store, account_id)?;
         let items = store.trash_contents(account).map_err(|e| e.to_string())?;
         (account, items)
     };
@@ -329,25 +398,37 @@ pub(crate) async fn destroy_trashed(
     account: i64,
     items: Vec<(String, u32, i64)>,
 ) -> Result<(usize, usize), String> {
-    let (cfg, uidplus) = {
-        let store = state.store()?;
-        (
-            imap_config_for(&store, account),
-            state.caps(account).has_uidplus,
-        )
-    };
     if items.is_empty() {
         return Ok((0, 0));
     }
+    // Asked only while the account can sign in: one expunge per message is
+    // one sign-in per message, and a 500-message Trash emptied while the
+    // password was refused was 500 refused sign-ins.
+    let (cfg, uidplus) = {
+        let store = state.store()?;
+        (
+            server_for(state, &store, account)?,
+            state.caps(account).has_uidplus,
+        )
+    };
+    let stop = state.stop_signal(account);
     let mut gone = 0usize;
     let mut kept = 0usize;
+    let mut refused = false;
     for (path, uid, message_id) in items {
         let removed = match &cfg {
+            // Refused part-way, the rest stay: nothing more is asked of a
+            // server that has said no.
+            Some(_) if refused => false,
             Some(cfg) => {
                 match petrel_providers::imap::expunge_uid(cfg, &path, uid, uidplus).await {
                     Ok(_) => true,
                     Err(e) => {
                         log_sync(&format!("empty trash: {path} uid {uid}: {e}"));
+                        if e.is_sign_in_refused() {
+                            state.refused_by(account, &stop);
+                            refused = true;
+                        }
                         false
                     }
                 }
@@ -365,6 +446,9 @@ pub(crate) async fn destroy_trashed(
         }
     }
     log_sync(&format!("trash: {gone} removed, {kept} kept"));
+    if refused && gone == 0 {
+        return Err(SIGN_IN_FIRST.into());
+    }
     Ok((gone, kept))
 }
 
@@ -415,9 +499,16 @@ pub async fn mark_folder_read(
     read: bool,
     state: State<'_, Arc<AppState>>,
 ) -> Result<usize, String> {
-    let (cfg, paths, changed) = {
+    let (cfg, paths, changed, account) = {
         let store = state.store()?;
-        let account = active_account(&store)?;
+        let account = folder_account(&store, folder_id)?;
+        // Asked before the local half: signed out, nothing changes here
+        // either, rather than marking read here what the server never hears.
+        // A folder that lives only here needs no server.
+        let cfg = match only_here(&store, folder_id)? {
+            true => None,
+            false => server_for(&state, &store, account)?,
+        };
         // The subtree, because that is what "all" means on a row with folders
         // under it. IMAP has no recursive STORE, so this is one command per
         // mailbox — sixteen for a real Archive, against the ten thousand a
@@ -431,9 +522,10 @@ pub async fn mark_folder_read(
         let changed = store
             .mark_folder_seen(folder_id, read)
             .map_err(|e| e.to_string())?;
-        (imap_config_for(&store, account), paths, changed)
+        (cfg, paths, changed, account)
     };
     if let Some(cfg) = cfg {
+        let stop = state.stop_signal(account);
         let mut total = 0u32;
         for path in &paths {
             match petrel_providers::imap::store_flag_all(&cfg, path, "\\Seen", read).await {
@@ -441,7 +533,7 @@ pub async fn mark_folder_read(
                 // Reported, not swallowed. The local half already happened and
                 // the next sync will notice the disagreement; what must not
                 // happen is silence about a server that said no.
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(refused_or(&state, account, &stop, e)),
             }
         }
         log_sync(&format!(
@@ -465,9 +557,9 @@ pub async fn trash_folder_contents(
     folder_id: i64,
     state: State<'_, Arc<AppState>>,
 ) -> Result<usize, String> {
-    let (cfg, from_paths, to_path, to_id, has_move) = {
+    let (cfg, from_paths, to_path, to_id, has_move, account) = {
         let store = state.store()?;
-        let account = active_account(&store)?;
+        let account = folder_account(&store, folder_id)?;
         let from_paths: Vec<String> = store
             .folder_subtree(folder_id)
             .map_err(|e| e.to_string())?
@@ -483,11 +575,12 @@ pub async fn trash_folder_contents(
             .map_err(|e| e.to_string())?
             .ok_or("no such folder")?;
         (
-            imap_config_for(&store, account),
+            server_for(&state, &store, account)?,
             from_paths,
             to_path,
             to_id,
             state.caps(account).has_move,
+            account,
         )
     };
     if from_paths.contains(&to_path) {
@@ -497,11 +590,12 @@ pub async fn trash_folder_contents(
     // move that the server refused would show an empty folder that is still
     // full on every other client.
     if let Some(cfg) = cfg {
+        let stop = state.stop_signal(account);
         let mut moved = 0u32;
         for from in &from_paths {
             moved += petrel_providers::imap::move_all(&cfg, from, &to_path, has_move)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| refused_or(&state, account, &stop, e))?;
         }
         log_sync(&format!(
             "moved {moved} message(s) from {} mailbox(es) to {to_path}",
@@ -516,7 +610,7 @@ pub async fn trash_folder_contents(
 
 #[cfg(test)]
 mod tests {
-    use super::triage_account;
+    use super::{folder_account, named_account, triage_account};
     use petrel_engine::store::{NewMessage, Store};
 
     fn one_message(store: &mut Store, account: i64) -> i64 {
@@ -548,6 +642,34 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_command_acts_for_the_account_the_folder_is_in() {
+        let store = Store::open_in_memory().unwrap();
+        let a = store.ensure_test_account().unwrap();
+        let b = store.ensure_test_account().unwrap();
+        // The same name in both accounts, as "Contracts" was in the probe.
+        let in_a = store.ensure_named_folder(a, "Contracts").unwrap();
+        let in_b = store.ensure_named_folder(b, "Contracts").unwrap();
+        // The window has moved on to B, as ⌘2 under an open dialog did.
+        store.set_active_account(b).unwrap();
+
+        assert_eq!(folder_account(&store, in_a), Ok(a));
+        assert_eq!(folder_account(&store, in_b), Ok(b));
+        assert!(folder_account(&store, 987_654).is_err());
+    }
+
+    #[test]
+    fn a_named_account_is_taken_as_named_while_it_exists() {
+        let store = Store::open_in_memory().unwrap();
+        let a = store.ensure_test_account().unwrap();
+        let b = store.ensure_test_account().unwrap();
+        store.set_active_account(b).unwrap();
+
+        assert_eq!(named_account(&store, a), Ok(a));
+        store.remove_account(a).unwrap();
+        assert!(named_account(&store, a).is_err());
+    }
+
+    #[test]
     fn an_id_with_nothing_behind_it_falls_back_to_the_account_on_screen() {
         let mut store = Store::open_in_memory().unwrap();
         let a = store.ensure_test_account().unwrap();
@@ -556,5 +678,150 @@ mod tests {
         store.set_active_account(b).unwrap();
         assert_eq!(triage_account(&store, 987_654, None), Ok(b));
         assert_eq!(triage_account(&store, 987_654, Some(987_654)), Ok(b));
+    }
+}
+
+#[cfg(test)]
+mod signed_out_tests {
+    //! The review's probe C. Empty Trash, and the bin's own expiry, made one
+    //! connection per message, each a sign-in, without looking at whether
+    //! the account could sign in: a 500-message Trash emptied while the
+    //! password was refused was 500 refused sign-ins. And an account with
+    //! servers but no password Petrel could read counted as one with no
+    //! server: its Trash was tombstoned here and reported gone while the
+    //! server kept every message.
+    use super::{destroy_trashed, push_folder_to_server};
+    use crate::scripted_imap::{Srv, raw, serve};
+    use crate::signin::test_support::{servers_at, unkeyed_account};
+    use crate::signin::{SIGN_IN_FIRST, SignIn};
+    use crate::state::test_state;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// A Trash of `n` messages on `account`, each a placement with a UID.
+    fn full_trash(state: &crate::state::AppState, account: i64, n: u32) -> Vec<(String, u32, i64)> {
+        let mut store = state.store.lock().unwrap();
+        store
+            .sync_folders(
+                account,
+                &[
+                    ("INBOX".into(), Some("inbox".into())),
+                    ("Trash".into(), Some("trash".into())),
+                ],
+            )
+            .unwrap();
+        let trash = store.folder_for_role(account, "trash").unwrap().unwrap();
+        for uid in 1..=n {
+            store
+                .ingest_raw(&state.blobs, account, Some(trash), Some(uid), &raw(uid))
+                .unwrap();
+        }
+        store.trash_contents(account).unwrap()
+    }
+
+    #[test]
+    fn empty_trash_on_a_refused_account_asks_the_server_nothing() {
+        let _turn = crate::config::cache_turn();
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let account = unkeyed_account(&state);
+        let srv = Srv::new("UIDPLUS", &[("INBOX", ""), ("Trash", "\\Trash")], &[]);
+        tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            servers_at(&state, account, port);
+            crate::config::remember_password(account, "revoked");
+            let items = full_trash(&state, account, 12);
+            assert_eq!(items.len(), 12);
+            state.set_signin(account, SignIn::Refused);
+            let result = destroy_trashed(&state, account, items).await;
+            let conns = srv.conns.load(Ordering::SeqCst);
+            let left = state
+                .store
+                .lock()
+                .unwrap()
+                .trash_contents(account)
+                .unwrap()
+                .len();
+            crate::config::forget_password(account);
+            assert_eq!(result, Err(SIGN_IN_FIRST.to_string()));
+            assert_eq!(conns, 0, "sign-in attempts for one Empty Trash");
+            assert_eq!(left, 12, "nothing is tombstoned here either");
+        });
+    }
+
+    #[test]
+    fn an_account_with_servers_and_no_password_is_not_a_local_account() {
+        let _turn = crate::config::cache_turn();
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let account = unkeyed_account(&state);
+        let srv = Srv::new("UIDPLUS", &[("INBOX", ""), ("Trash", "\\Trash")], &[]);
+        tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            servers_at(&state, account, port);
+            // No password anywhere for this id.
+            crate::config::forget_password(account);
+            let items = full_trash(&state, account, 3);
+            let result = destroy_trashed(&state, account, items).await;
+            let left = state
+                .store
+                .lock()
+                .unwrap()
+                .trash_contents(account)
+                .unwrap()
+                .len();
+            assert_eq!(result, Err(SIGN_IN_FIRST.to_string()));
+            assert_eq!(left, 3, "the server still has them, so they stay");
+            assert_eq!(state.signin(account), Some(SignIn::Missing));
+            assert_eq!(srv.conns.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// The second UI review's finding 5. A folder made while the account is
+    /// signed out stays here, waiting, and the push says so instead of Ok —
+    /// which the window read as "Created" for a folder the server never got.
+    /// Nor does it ask the server.
+    #[test]
+    fn a_folder_made_while_signed_out_is_not_said_to_be_on_the_server() {
+        let _turn = crate::config::cache_turn();
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let account = unkeyed_account(&state);
+        let srv = Srv::new("UIDPLUS", &[("INBOX", "")], &[]);
+        tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            servers_at(&state, account, port);
+            crate::config::remember_password(account, "revoked");
+            state.set_signin(account, SignIn::Refused);
+            let folder = state
+                .store
+                .lock()
+                .unwrap()
+                .ensure_named_folder(account, "Projects")
+                .unwrap();
+            let result = push_folder_to_server(&state, folder).await;
+            let waiting = state
+                .store
+                .lock()
+                .unwrap()
+                .folder_awaits_server(folder)
+                .unwrap();
+            crate::config::forget_password(account);
+            assert_eq!(result, Err(SIGN_IN_FIRST.to_string()));
+            assert_eq!(srv.conns.load(Ordering::SeqCst), 0, "asked the server");
+            assert!(waiting, "kept here, for the sync after signing in");
+        });
+    }
+
+    /// An account with no server at all is Petrel's own, and its Trash is
+    /// emptied here.
+    #[test]
+    fn a_local_accounts_trash_is_emptied_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let account = unkeyed_account(&state);
+        let items = full_trash(&state, account, 2);
+        let result = tauri::async_runtime::block_on(destroy_trashed(&state, account, items));
+        assert_eq!(result, Ok((2, 0)));
     }
 }

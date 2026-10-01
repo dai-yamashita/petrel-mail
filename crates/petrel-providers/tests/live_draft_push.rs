@@ -30,6 +30,7 @@ async fn a_draft_edit_replaces_its_server_copy() {
         from_name: "Petrel".into(),
         to: vec![],
         cc: vec![],
+        bcc: vec![],
         subject: "petrel draft push test".into(),
         body_text: body.into(),
         body_html: Some(format!("<p>{body}</p>")),

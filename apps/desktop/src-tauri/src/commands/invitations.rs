@@ -213,6 +213,7 @@ pub fn respond_invitation(
             in_reply_to: in_reply_to.clone(),
             references: in_reply_to.into_iter().collect(),
             attachments: vec![path],
+            bcc: String::new(),
         };
         let id = store
             .save_draft_full(
@@ -436,6 +437,7 @@ mod tests {
             from_name: "Me".into(),
             to: vec![clean_header("org@example.com")],
             cc: vec![],
+            bcc: vec![],
             subject,
             body_text: "hello".into(),
             body_html: None,

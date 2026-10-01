@@ -3,11 +3,11 @@ import type { Draft } from '../components/Compose';
 /** How long typing has to pause before the draft is written. */
 export const AUTOSAVE_MS = 1500;
 
-/** Whether a draft holds anything worth keeping. Cc and attachments count:
- *  a draft that was only a Cc line was once dropped on close. */
+/** Whether a draft holds anything worth keeping. Cc, Bcc and attachments
+ *  count: a draft that was only a Cc line was once dropped on close. */
 export function draftHasContent(d: Draft): boolean {
   return Boolean(
-    d.to || d.cc || d.subject || d.body.trim() || (d.attachments?.length ?? 0) > 0,
+    d.to || d.cc || d.bcc || d.subject || d.body.trim() || (d.attachments?.length ?? 0) > 0,
   );
 }
 
@@ -18,6 +18,8 @@ export function draftSignature(d: Draft): string {
   return JSON.stringify([
     d.to,
     d.cc,
+    // A message from before there was a Bcc has none, the same as an empty one.
+    d.bcc ?? '',
     d.subject,
     d.body,
     d.html,

@@ -15,6 +15,7 @@ pub fn save_draft(
     draft_id: Option<i64>,
     to: String,
     cc: Option<String>,
+    bcc: Option<String>,
     subject: String,
     body: String,
     html: String,
@@ -55,20 +56,7 @@ pub fn save_draft(
                 .into_owned(),
         );
     }
-    // Scrubbed on the way in as well as on the way out. The composer's
-    // fields are ordinary text to the person typing them, but a reply's
-    // subject and reply headers arrive from a message somebody else wrote —
-    // and a header value carrying a newline is not a value, it is a second
-    // header. Only the header fields: a body may contain whatever it likes.
-    let envelope = petrel_engine::store::DraftEnvelope {
-        in_reply_to: in_reply_to.map(|v| clean_header(&v)),
-        references: references
-            .unwrap_or_default()
-            .iter()
-            .map(|r| clean_header(r))
-            .collect(),
-        attachments: files,
-    };
+    let envelope = draft_envelope(in_reply_to, references, files, bcc);
     let id = store
         .save_draft_full(
             account,
@@ -86,6 +74,32 @@ pub fn save_draft(
     // pushes at once through `push_draft` instead of waiting it out.
     schedule_draft_push(Arc::clone(state.inner()), id);
     Ok(id)
+}
+
+/// The parts of a draft that are not its text, as the store keeps them.
+///
+/// Scrubbed on the way in as well as on the way out. The composer's fields
+/// are ordinary text to the person typing them, but a reply's subject and
+/// reply headers arrive from a message somebody else wrote — and a header
+/// value carrying a newline is not a value, it is a second header. Only the
+/// header fields: a body may contain whatever it likes. Bcc is one: it is
+/// written into the copies kept in Sent and Drafts.
+fn draft_envelope(
+    in_reply_to: Option<String>,
+    references: Option<Vec<String>>,
+    attachments: Vec<String>,
+    bcc: Option<String>,
+) -> petrel_engine::store::DraftEnvelope {
+    petrel_engine::store::DraftEnvelope {
+        in_reply_to: in_reply_to.map(|v| clean_header(&v)),
+        references: references
+            .unwrap_or_default()
+            .iter()
+            .map(|r| clean_header(r))
+            .collect(),
+        attachments,
+        bcc: clean_header(bcc.as_deref().unwrap_or("")),
+    }
 }
 
 /// Pushes the draft's current text to the server now — the composer closing
@@ -240,13 +254,19 @@ pub fn load_draft(id: i64, state: State<Arc<AppState>>) -> Result<DraftRecord, S
     let Some(parsed) = petrel_mime::parse_message(&raw) else {
         return Ok(record);
     };
+    Ok(record_from_message(id, &parsed))
+}
+
+/// The composer's view of a draft another client wrote: its recipients, Bcc
+/// included, its words and the thread it answers, read from the message.
+fn record_from_message(id: i64, parsed: &petrel_mime::ParsedMessage) -> DraftRecord {
     let join = |list: &[(Option<String>, String)]| {
         list.iter()
             .map(|(_, addr)| addr.clone())
             .collect::<Vec<_>>()
             .join(", ")
     };
-    Ok(DraftRecord {
+    DraftRecord {
         id,
         to: join(&parsed.to),
         cc: join(&parsed.cc),
@@ -260,8 +280,44 @@ pub fn load_draft(id: i64, state: State<Arc<AppState>>) -> Result<DraftRecord, S
             in_reply_to: parsed.references.last().cloned().map(|r| format!("<{r}>")),
             references: parsed.references.iter().map(|r| format!("<{r}>")).collect(),
             attachments: Vec::new(),
+            bcc: join(&parsed.bcc),
         },
-    })
+    }
+}
+
+#[cfg(test)]
+mod bcc_tests {
+    use super::{draft_envelope, record_from_message};
+
+    /// The composer's Bcc field is kept with the draft, scrubbed like any
+    /// other header value: it is written into the copies kept in Sent and
+    /// Drafts, where a newline would be a header of somebody else's choosing.
+    #[test]
+    fn a_drafts_blind_copies_are_kept_and_scrubbed() {
+        let e = draft_envelope(
+            None,
+            None,
+            Vec::new(),
+            Some("priya@example.net,\r\nX-Injected: yes".into()),
+        );
+        assert_eq!(e.bcc, "priya@example.net,X-Injected: yes");
+        assert_eq!(draft_envelope(None, None, Vec::new(), None).bcc, "");
+    }
+
+    /// A draft written in another client keeps its blind copies when it is
+    /// opened here, read from its own Bcc header.
+    #[test]
+    fn a_draft_from_another_client_keeps_its_blind_copies() {
+        let raw = b"From: Sam <sam@example.com>\r\nTo: dana@example.com\r\n\
+Bcc: Priya Nair <priya@example.net>, board@example.org\r\n\
+Subject: Numbers\r\nMessage-ID: <d1@example.com>\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\r\nDraft words\r\n";
+        let parsed = petrel_mime::parse_message(raw).unwrap();
+        let record = record_from_message(5, &parsed);
+        assert_eq!(record.to, "dana@example.com");
+        assert_eq!(record.envelope.bcc, "priya@example.net, board@example.org");
+        assert_eq!(record.body.trim(), "Draft words");
+    }
 }
 
 /// Discards a draft, or a message waiting in the outbox.
@@ -815,15 +871,19 @@ pub fn get_identity(state: State<Arc<AppState>>) -> Result<Identity, String> {
     store.identity(account).map_err(|e| e.to_string())
 }
 
+/// Writes the name and signature of the account the Identities pane was
+/// opened on, not whichever the rail shows by the time a keystroke saves: a
+/// switch under the open pane wrote one account's name over the other's.
 #[tauri::command(async)]
 pub fn set_identity(
+    account_id: i64,
     display_name: String,
     signature: String,
     signature_on_reply: bool,
     state: State<Arc<AppState>>,
 ) -> Result<(), String> {
     let store = state.store()?;
-    let account = active_account(&store)?;
+    let account = crate::commands::triage::named_account(&store, account_id)?;
     store
         .set_identity(account, &display_name, &signature, signature_on_reply)
         .map_err(|e| e.to_string())

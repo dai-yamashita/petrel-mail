@@ -163,3 +163,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p petrel-desktop --all-targets --features custom-protocol -- -D warnings
       - run: cargo test -p petrel-desktop --features custom-protocol
+      # The shell's tests against scripted IMAP servers (what an offline
+      # launch learns, and when) only compile under this feature, the same
+      # trap the providers' scripted servers fell into. One platform is
+      # enough: they test the sync logic, not the platform.
+      - name: Shell tests against scripted servers
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo clippy -p petrel-desktop --all-targets --features dev-plaintext-imap -- -D warnings
+          cargo test -p petrel-desktop --features dev-plaintext-imap
+      # release.sh ships one universal binary, but this runner is Apple
+      # silicon, so the Intel half was compiled for the first time on the
+      # day it was audited. Building it here means a change that breaks it
+      # shows up on the push that made it, not on release day. A build, not
+      # a test run: the runner cannot execute it.
+      - name: Intel half of the universal build
+        if: matrix.os == 'macos-latest'
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build -p petrel-desktop --features custom-protocol --target x86_64-apple-darwin

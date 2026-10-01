@@ -60,6 +60,29 @@ impl BlobStore {
         if let Ok(meta) = fs::metadata(&final_path) {
             return Ok((hash, meta.len()));
         }
+        let size = self.put(&hash, &final_path, bytes)?;
+        Ok((hash, size))
+    }
+
+    /// Writes these bytes again where the stored blob no longer reads back
+    /// as them: a damaged file, a truncated restore, bit rot. `write` leaves
+    /// any file already under the hash alone, so the same bytes fetched again
+    /// never mended one (docs/25 review). Answers whether it had to.
+    pub fn repair(&self, bytes: &[u8]) -> Result<bool> {
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        if self.read(&hash).is_ok() {
+            return Ok(false);
+        }
+        let final_path = self
+            .path_for(&hash)
+            .expect("blake3 hex is always long enough to shard");
+        self.put(&hash, &final_path, bytes)?;
+        Ok(true)
+    }
+
+    /// Compresses `bytes` into a temporary file and renames it into place,
+    /// over whatever was there. Returns the size on disk.
+    fn put(&self, hash: &str, final_path: &Path, bytes: &[u8]) -> Result<u64> {
         fs::create_dir_all(final_path.parent().expect("blob path has parent"))?;
         // A name no other write can be using. Two syncs fetching the same
         // message — the same bytes, so the same hash — met in this file:
@@ -78,9 +101,8 @@ impl BlobStore {
             f.write_all(&compressed)?;
             f.sync_all()?;
         }
-        fs::rename(&tmp, &final_path)?;
-        let size = fs::metadata(&final_path)?.len();
-        Ok((hash, size))
+        fs::rename(&tmp, final_path)?;
+        Ok(fs::metadata(final_path)?.len())
     }
 
     /// Reads and **verifies** the blob against its own name. Blobs are
