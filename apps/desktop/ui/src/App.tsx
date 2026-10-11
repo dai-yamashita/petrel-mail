@@ -198,10 +198,6 @@ export function App() {
   // together rather than each noticing separately or, worse, some not
   // noticing at all. The name is about where it came from, not its only use.
   const [accountEpoch, setAccountEpoch] = useState(0);
-  // The same, readable after an await: a load started under one account
-  // must not open its answer under another.
-  const accountEpochRef = useRef(accountEpoch);
-  accountEpochRef.current = accountEpoch;
   // Bumped when a triage or an undo has settled. The rail's recount keys on
   // it, so every action is followed by one recount once the burst is over.
   const [triageEpoch, setTriageEpoch] = useState(0);
@@ -317,6 +313,22 @@ export function App() {
     activeAccount,
     identity,
   } = useReferenceData(status?.seeding, accountEpoch);
+  // The account on screen, readable after an await: a reply, a forward or a
+  // draft asked for under one account must not open its answer under
+  // another. Not the epoch, which also moves when a folder is marked read or
+  // the Trash emptied: a reply whose quote came back after one of those was
+  // dropped without a word.
+  const activeAccountRef = useRef(activeAccount?.id);
+  activeAccountRef.current = activeAccount?.id;
+  // What a new message starts from: the account's name and signature, as
+  // the store last gave them or as Settings has changed them since. Read as
+  // a message starts and never drawn, so it is not state. Settings reports
+  // every keystroke in the signature, and as state each one redrew the whole
+  // window, the list and the reader with it.
+  const identityRef = useRef(identity);
+  useEffect(() => {
+    identityRef.current = identity;
+  }, [identity]);
 
   // Made shared, the order everything takes is the one you were just
   // looking at. Without this the first flip of the switch reordered the list
@@ -1018,12 +1030,13 @@ export function App() {
   }, []);
 
   const startCompose = () => {
+    const me = identityRef.current;
     openComposer({
       to: '',
       cc: '',
       subject: '',
-      body: startingBody(identity, false),
-      html: startingHtml(identity, false),
+      body: startingBody(me, false),
+      html: startingHtml(me, false),
     });
   };
 
@@ -1473,6 +1486,10 @@ export function App() {
   const startReply = async (id: number, all: boolean, targetId?: number) => {
     const row = items.find((m) => m.id === id);
     if (!row) return;
+    // Started under one account, as `resumeDraft` is. A quote that answered
+    // after a switch opened the reply under the new account, From line and
+    // saves and all, addressed to the old account's correspondent.
+    const account = activeAccountRef.current;
     try {
       const last =
         targetId != null
@@ -1487,16 +1504,18 @@ export function App() {
       // Reply-To as well: where the author asked replies to go, which is not
       // always where they came from.
       const quoted = await api.quoteMessage(last.id).catch(() => null);
-      const { to, cc } = replyTargets(last, identity?.address ?? '', all, quoted?.reply_to ?? []);
+      if (activeAccountRef.current !== account) return;
+      const me = identityRef.current;
+      const { to, cc } = replyTargets(last, me?.address ?? '', all, quoted?.reply_to ?? []);
       const html = quoted
         ? replyBody(
-            startingHtml(identity, true),
+            startingHtml(me, true),
             quoted.from,
             quoted.date_ms,
             quoted.html,
             settings.language === 'system' ? undefined : settings.language,
           )
-        : startingHtml(identity, true);
+        : startingHtml(me, true);
       openComposer({
         to: to.join(', '),
         cc: cc.join(', '),
@@ -1505,7 +1524,7 @@ export function App() {
         subject: row.subject.match(/^re:/i) ? row.subject : `Re: ${row.subject}`,
         // The text half of what the editor will show, quote and all, as a
         // forward needs; see `plainTextOf`.
-        body: quoted ? plainTextOf(html) : startingBody(identity, true),
+        body: quoted ? plainTextOf(html) : startingBody(me, true),
         html,
         ...replyHeaders(last),
       });
@@ -1525,6 +1544,8 @@ export function App() {
   const startForward = async (id: number, targetId?: number) => {
     const row = items.find((m) => m.id === id);
     if (!row) return;
+    // Under the account it was started in, or not at all: see `startReply`.
+    const account = activeAccountRef.current;
     try {
       const target =
         targetId != null
@@ -1532,6 +1553,7 @@ export function App() {
           : (await api.threadDetail(row.thread_id, { limit: 1 })).at(-1);
       if (!target) return;
       const quoted = await api.quoteMessage(target.id).catch(() => null);
+      if (activeAccountRef.current !== account) return;
       const subject = quoted?.subject?.trim() || row.subject;
       // The original's attachments go with it, as every client forwards
       // them, up to the size a message can carry. What does not fit is named
@@ -1554,14 +1576,16 @@ export function App() {
               return [];
             })
           : [];
+      if (activeAccountRef.current !== account) return;
       if (tooBig.length > 0) {
         setToast(
           t('compose-too-large', { name: tooBig.join(', '), limit: fileSize(ATTACHMENT_LIMIT) }),
         );
       }
+      const me = identityRef.current;
       const html = quoted
         ? forwardBody(
-            startingHtml(identity, true),
+            startingHtml(me, true),
             quoted.from,
             quoted.to,
             subject,
@@ -1569,7 +1593,7 @@ export function App() {
             quoted.html,
             settings.language === 'system' ? undefined : settings.language,
           )
-        : startingHtml(identity, true);
+        : startingHtml(me, true);
       openComposer({
         to: '',
         cc: '',
@@ -1578,7 +1602,7 @@ export function App() {
         // The text half of the forwarded message too, not the signature
         // alone: the editor has not reported anything yet, and a forward
         // sent without an edit never makes it; see `plainTextOf`.
-        body: quoted ? plainTextOf(html) : startingBody(identity, true),
+        body: quoted ? plainTextOf(html) : startingBody(me, true),
         html,
       });
     } catch (e) {
@@ -1592,17 +1616,17 @@ export function App() {
     // The draft was asked for under one account. If the window has moved to
     // another while the load was in flight, opening it now would put the
     // old account's message in a composer that saves to the new one.
-    const epoch = accountEpochRef.current;
+    const onScreen = activeAccountRef.current;
     try {
       const d = await api.loadDraft(id);
-      if (accountEpochRef.current !== epoch) return;
+      if (activeAccountRef.current !== onScreen) return;
       openComposer({ ...draftFromRecord(d), account: account ?? null });
       // Asked as the draft opens, not at save time: the person is about to
       // continue from one of two versions, and should choose before typing
       // into the wrong one. The data layer kept both; that is what makes
       // this a question instead of a loss.
       const conflict = await api.draftConflict(id);
-      if (accountEpochRef.current !== epoch) return;
+      if (activeAccountRef.current !== onScreen) return;
       if (conflict) setDraftConflict({ draftId: id, otherId: conflict.other_id });
     } catch (e) {
       setToast(t('compose-resume-failed', { error: String(e) }));
@@ -2556,15 +2580,16 @@ export function App() {
   useMessageLinks(
     useCallback(
       (addr: string) => {
+        const me = identityRef.current;
         openComposer({
           to: addr,
           cc: '',
           subject: '',
-          body: startingBody(identity, false),
-          html: startingHtml(identity, false),
+          body: startingBody(me, false),
+          html: startingHtml(me, false),
         });
       },
-      [identity, openComposer],
+      [openComposer],
     ),
     // A link whose spelling hides where it goes gets a question first. The
     // question names both spellings, because the whole trick is that one of
@@ -3244,6 +3269,8 @@ export function App() {
           // message in one of five states, and the row's job is to say which
           // in plain words and offer only the actions that state allows.
           <Outbox
+            // The one row Z pulls back, as `undo` decides it.
+            zKey={outgoing && !outgoingHeld ? outgoing.id : null}
             signin={status?.signin ?? null}
             onSignIn={
               activeAccount ? () => signInAccount(activeAccount.id, activeAccount.email) : undefined
@@ -3381,12 +3408,13 @@ export function App() {
             shown.current.ids.add(id);
           }}
           onComposeMailto={(to, subject) => {
+            const me = identityRef.current;
             openComposer({
               to,
               cc: '',
               subject,
-              body: startingBody(identity, false),
-              html: startingHtml(identity, false),
+              body: startingBody(me, false),
+              html: startingHtml(me, false),
             });
           }}
           onReplyTo={(messageId, all) => {
@@ -3614,13 +3642,15 @@ export function App() {
         // mail, so the note is shown to the accounts it describes.
         labelsNotFolders={activeAccount?.kind === 'gmail'}
         open={picker !== null}
-        mode={picker === 'send-later' ? 'snooze' : (picker ?? 'folder')}
+        mode={picker ?? 'folder'}
         // What the choice will land on. One conversation is named; several
         // are counted, as the row menu counts them. It used to name the open
         // conversation even when the choice was about to hit three others.
+        // Send later lands on the message being written, which it named the
+        // conversation open behind the composer instead.
         subject={
           picker === 'send-later'
-            ? (active?.subject ?? null)
+            ? (draft?.subject || null)
             : pickerIds.length > 1
               ? t('menu-applies-to', { count: pickerIds.length })
               : (rowsOf(pickerIds, items)[0]?.subject ?? null)
@@ -3693,6 +3723,10 @@ export function App() {
           }
         }}
         onCreate={(name) => {
+          // Only Move and Tag make anything. Snooze and Send later offer
+          // times, and a name reaching here from one of them is a filter
+          // typed there, which became a tag on the conversation underneath.
+          if (picker !== 'folder' && picker !== 'tag') return;
           const say = later();
           const make = picker === 'folder' ? api.createFolder(name) : api.createTag(name);
           void make
@@ -3802,6 +3836,12 @@ export function App() {
           api.accounts().then(setAccounts).catch(() => {});
         }}
         onMessage={settingsSay}
+        // New messages start from the window's copy of the identity, so a
+        // signature set there reaches the next one, not the first after a
+        // relaunch. Into the ref, not state: nothing on screen shows it.
+        onIdentityChange={(account, next) => {
+          if (account === activeAccount?.id) identityRef.current = next;
+        }}
       />
       {outgoing && (
         // Its own bar, not the toast: this one is a control with a deadline,

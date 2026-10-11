@@ -178,6 +178,25 @@ pub(crate) fn print_navigation_allowed(url: &tauri::Url) -> bool {
     allowed
 }
 
+/// A window with WebKit's link previews turned off.
+///
+/// Tauri leaves them on, and a force click on a link in a message then showed
+/// the system's own preview of the page: it fetched the page, ran its script
+/// and drew it, without a word from Petrel. That skipped everything a click on
+/// the same link goes through, the look-alike question among it. A link leaves
+/// Petrel only through `open_external`, and a preview was a second door beside
+/// it. Every window goes through here, so none of them can open one again.
+///
+/// The setting exists only on the Mac; elsewhere the builder comes back as it
+/// was.
+pub(crate) fn without_link_preview<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
+    builder: tauri::WebviewWindowBuilder<'a, R, M>,
+) -> tauri::WebviewWindowBuilder<'a, R, M> {
+    #[cfg(target_os = "macos")]
+    let builder = builder.allow_link_preview(false);
+    builder
+}
+
 /// The app's own page, in every spelling the platforms give it — plus the
 /// dev server, which only a development build ever loads.
 fn app_origin(url: &tauri::Url) -> bool {
@@ -717,7 +736,7 @@ pub fn run() {
                         "waiting for a password".into();
                 }
                 (_, Some(cfg)) => {
-                    eprintln!("[sync] account configured: {} @ {}", cfg.user, cfg.host);
+                    eprintln!("[sync] account {account} configured");
                     spawn_real_sync(state.clone(), account, cfg);
                 }
                 (_, None) => {
@@ -939,11 +958,11 @@ pub fn run() {
             if std::env::var("PETREL_MINIMAL").is_ok() {
                 #[cfg(target_os = "macos")]
                 app.set_activation_policy(tauri::ActivationPolicy::Regular);
-                tauri::WebviewWindowBuilder::new(
+                without_link_preview(tauri::WebviewWindowBuilder::new(
                     app,
                     "main",
                     tauri::WebviewUrl::App("minimal.html".into()),
-                )
+                ))
                 .title("minimal")
                 .inner_size(700.0, 400.0)
                 .build()?;
@@ -988,33 +1007,37 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
-            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
-                .title("Petrel")
-                // Tauri's own drag-and-drop handler registers a native drop
-                // target over the whole webview, and on Windows that stops the
-                // page's own HTML5 drag events from ever firing. Dragging a
-                // conversation onto a mailbox is a page-level gesture, so the
-                // page has to be the one hearing it.
-                //
-                // Nothing is lost by turning it off: we accept no OS file
-                // drops today, and when compose learns to take an attachment
-                // that way it arrives as `dataTransfer.files` on the same
-                // HTML5 drop event this enables.
-                .disable_drag_drop_handler()
-                .inner_size(1440.0, 900.0)
-                .min_inner_size(900.0, 560.0)
-                .position(40.0, 40.0)
-                .focused(true)
-                .initialization_script(&init)
-                .on_navigation(main_navigation_allowed)
-                .on_page_load(|_webview, payload| {
-                    log_sync(&format!(
-                        "[pageload] {:?} {}",
-                        payload.event(),
-                        payload.url()
-                    ));
-                })
-                .build()?;
+            without_link_preview(tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::default(),
+            ))
+            .title("Petrel")
+            // Tauri's own drag-and-drop handler registers a native drop
+            // target over the whole webview, and on Windows that stops the
+            // page's own HTML5 drag events from ever firing. Dragging a
+            // conversation onto a mailbox is a page-level gesture, so the
+            // page has to be the one hearing it.
+            //
+            // Nothing is lost by turning it off: we accept no OS file
+            // drops today, and when compose learns to take an attachment
+            // that way it arrives as `dataTransfer.files` on the same
+            // HTML5 drop event this enables.
+            .disable_drag_drop_handler()
+            .inner_size(1440.0, 900.0)
+            .min_inner_size(900.0, 560.0)
+            .position(40.0, 40.0)
+            .focused(true)
+            .initialization_script(&init)
+            .on_navigation(main_navigation_allowed)
+            .on_page_load(|_webview, payload| {
+                log_sync(&format!(
+                    "[pageload] {:?} {}",
+                    payload.event(),
+                    payload.url()
+                ));
+            })
+            .build()?;
 
             // Say where it actually landed — a window that opens behind another
             // app looks identical to one that failed to open.

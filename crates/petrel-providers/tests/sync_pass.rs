@@ -730,6 +730,7 @@ async fn a_move_without_move_does_not_copy_twice_on_retry() {
         &cfg,
         "INBOX",
         1,
+        None,
         "Archive",
         false,
         true,
@@ -759,6 +760,7 @@ async fn a_move_without_move_does_not_copy_twice_on_retry() {
         &cfg,
         "INBOX",
         1,
+        None,
         "Archive",
         false,
         true,
@@ -783,7 +785,7 @@ async fn without_uidplus_the_source_copy_is_flagged_and_left() {
     let port = server(Arc::clone(&state)).await;
     let cfg = plain(port);
 
-    let expunged = move_uid(&cfg, "INBOX", 1, "Archive", false, false, None)
+    let expunged = move_uid(&cfg, "INBOX", 1, None, "Archive", false, false, None)
         .await
         .unwrap();
     assert!(!expunged, "the caller is told");

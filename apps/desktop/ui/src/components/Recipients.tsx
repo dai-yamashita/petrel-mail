@@ -65,12 +65,21 @@ export function Recipients({ label, value, onChange, inputRef, handle }: Props) 
     [],
   );
 
-  const commit = (addr: string) => {
-    const next = [...chips, addr.trim()].filter(Boolean);
-    onChange(next.join(', '));
+  // Split on the way in, so a pasted list joins the field as one recipient per
+  // entry and the value never carries the line breaks it arrived with.
+  const commit = (addr: string): string => {
+    const next = [...chips, ...splitRecipients(addr)].join(', ');
+    onChange(next);
     setTyped('');
     setOptions([]);
+    return next;
   };
+
+  // The field as it stood before a pasted column became chips, and what the
+  // paste made of it. The paste never reaches the input, so the input's own
+  // undo knows nothing of it, and taking back a column of thirty took thirty
+  // Backspaces. ⌘Z takes it back while the field still holds what it made.
+  const beforePaste = useRef<{ value: string; typed: string; made: string } | null>(null);
 
   // The chip's button goes with the chip, and focus with it, to the body,
   // where the next keystroke is a shortcut. Back into the field, where the
@@ -143,6 +152,22 @@ export function Recipients({ label, value, onChange, inputRef, handle }: Props) 
           autoComplete="off"
           spellCheck={false}
           onChange={(e) => setTyped(e.target.value)}
+          onPaste={(e) => {
+            // A column of addresses arrives one per line, and a one-line field
+            // turns the breaks into spaces before anything here sees them: the
+            // whole column became one chip. So a paste with a line break in it
+            // is read while the breaks are still there, and committed as the
+            // recipients it holds, together with whatever was already typed
+            // around the caret.
+            const text = e.clipboardData.getData('text/plain');
+            if (!/[\r\n]/.test(text)) return;
+            e.preventDefault();
+            const el = e.currentTarget;
+            const from = el.selectionStart ?? typed.length;
+            const to = el.selectionEnd ?? from;
+            const made = commit(typed.slice(0, from) + text + typed.slice(to));
+            beforePaste.current = { value, typed, made };
+          }}
           onBlur={() => {
             // Leaving the field commits what was typed. Losing a half-typed
             // address because you clicked the body is the kind of small theft
@@ -150,6 +175,22 @@ export function Recipients({ label, value, onChange, inputRef, handle }: Props) 
             if (typed.trim()) commit(typed);
           }}
           onKeyDown={(e) => {
+            const undo = beforePaste.current;
+            if (
+              undo &&
+              e.key.toLowerCase() === 'z' &&
+              (e.metaKey || e.ctrlKey) &&
+              !e.shiftKey &&
+              !e.altKey &&
+              !typed &&
+              valueRef.current === undo.made
+            ) {
+              e.preventDefault();
+              beforePaste.current = null;
+              onChange(undo.value);
+              setTyped(undo.typed);
+              return;
+            }
             if (options.length > 0 && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
               e.preventDefault();
               setHighlight((h) =>

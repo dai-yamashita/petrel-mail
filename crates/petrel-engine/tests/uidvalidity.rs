@@ -6,6 +6,7 @@
 //! the same key ingest dedupes on, an incomplete listing never evicts
 //! history, and no message row or blob is ever deleted.
 
+use petrel_engine::actions::{ActionKind, PlacementPolicy};
 use petrel_engine::blob::BlobStore;
 use petrel_engine::store::Store;
 
@@ -273,7 +274,7 @@ fn healing_fills_only_the_number_that_was_lost() {
     // The server, asked by Message-ID, says the message is now UID 900.
     assert!(
         store
-            .heal_placement_uid(a.message_id, account, "INBOX", 900)
+            .heal_placement_uid(a.message_id, account, "INBOX", 900, None)
             .expect("heal")
     );
     assert_eq!(store.max_uid(folder).unwrap(), Some(900));
@@ -291,9 +292,245 @@ fn healing_fills_only_the_number_that_was_lost() {
         .expect("ingest");
     assert!(
         !store
-            .heal_placement_uid(b.message_id, account, "INBOX", 999)
+            .heal_placement_uid(b.message_id, account, "INBOX", 999, None)
             .expect("no-op heal")
     );
+}
+
+/// The drain's heal writes what a search by Message-ID found, and the
+/// number belongs to the folder's UIDVALIDITY as it stood before the search
+/// asked (review r1, R1-8). Recovery can record a new one meanwhile, and
+/// written after it the old number would pass the server's check against
+/// some other message. It is written only while the validity is the one it
+/// was asked under.
+#[test]
+fn a_heal_from_before_a_renumbering_is_not_written_after_it() {
+    let (_dir, mut store, blobs, account, folder) = setup();
+    store.set_folder_validity(folder, Some(1)).unwrap();
+    let a = store
+        .ingest_raw(
+            &blobs,
+            account,
+            Some(folder),
+            Some(41),
+            &fixture("a@x", "a"),
+        )
+        .expect("ingest");
+    // A renumbering, and a listing that did not reach the message.
+    store
+        .remap_folder_after_reset(folder, &[], false)
+        .expect("remap");
+
+    // The drain read validity 1 and asked; the server said UID 900. Before
+    // the heal, recovery finished and recorded validity 2.
+    store.set_folder_validity(folder, Some(2)).unwrap();
+    assert!(
+        !store
+            .heal_placement_uid(a.message_id, account, "INBOX", 900, Some(1))
+            .expect("heal")
+    );
+    assert_eq!(
+        store.max_uid(folder).unwrap(),
+        None,
+        "a number from before the renumbering was written after it"
+    );
+
+    // Asked under the validity the folder has, the heal goes as before.
+    assert!(
+        store
+            .heal_placement_uid(a.message_id, account, "INBOX", 7, Some(2))
+            .expect("heal")
+    );
+    assert_eq!(store.max_uid(folder).unwrap(), Some(7));
+}
+
+/// Review r1, R1-1. A move queued by a build from before validities were
+/// kept names its source by a number with no UIDVALIDITY. Paired with the
+/// folder's validity as it stands, the number went out under the new one
+/// once the sync had mapped the folder again, passed the server's check, and
+/// moved whichever message held it then. It is asked for by Message-ID
+/// instead, in the folder the move took the message out of.
+#[test]
+fn a_move_queued_before_validities_were_kept_is_asked_for_by_message_id() {
+    let (_dir, mut store, blobs, account, inbox) = setup();
+    store
+        .ensure_folder(account, "archive", "Archive")
+        .expect("archive");
+    let mut ids = Vec::new();
+    for (uid, mid, subj) in [(1, "z@x", "Z"), (2, "a@x", "A"), (3, "b@x", "B")] {
+        ids.push(
+            store
+                .ingest_raw(&blobs, account, Some(inbox), Some(uid), &fixture(mid, subj))
+                .expect("ingest")
+                .message_id,
+        );
+    }
+    // Queued by the old build: INBOX UID 2, and no validity. Queued here
+    // while the folder's reads NULL, which writes `null` into the payload,
+    // read as the old build's missing key is.
+    let a = ids[1];
+    let thread = store.thread_of(a).unwrap().unwrap_or(-a);
+    store
+        .apply_thread_action(
+            account,
+            thread,
+            ActionKind::Archive,
+            None,
+            PlacementPolicy::Exclusive,
+        )
+        .expect("queue");
+    store.set_folder_validity(inbox, Some(1)).unwrap();
+
+    // The server deleted Z and renumbered: A is 1 now and B 2. Recovery's
+    // listing did not reach A, older than its window, and it recorded
+    // validity 2.
+    store
+        .remap_folder_after_reset(inbox, &[(2, Some("b@x".to_string()))], false)
+        .expect("remap");
+    store.set_folder_validity(inbox, Some(2)).unwrap();
+
+    let rows = store.pending_actions(account).expect("pending");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].uid, None,
+        "UID 2 under validity 2 is msg B: {rows:?}"
+    );
+    assert_eq!(rows[0].folder_path, "INBOX");
+    assert_eq!(rows[0].candidate_paths, vec!["INBOX".to_string()]);
+}
+
+/// A folder never numbered has nothing to check a number against: Gmail's
+/// All Mail is never asked its UIDVALIDITY. Its numbers go as they are.
+#[test]
+fn a_move_from_a_folder_never_numbered_keeps_its_number() {
+    let (_dir, mut store, blobs, account, inbox) = setup();
+    store
+        .ensure_folder(account, "archive", "Archive")
+        .expect("archive");
+    let a = store
+        .ingest_raw(&blobs, account, Some(inbox), Some(5), &fixture("a@x", "A"))
+        .expect("ingest")
+        .message_id;
+    let thread = store.thread_of(a).unwrap().unwrap_or(-a);
+    store
+        .apply_thread_action(
+            account,
+            thread,
+            ActionKind::Archive,
+            None,
+            PlacementPolicy::Exclusive,
+        )
+        .expect("queue");
+    let rows = store.pending_actions(account).expect("pending");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0].uid, rows[0].uid_validity), (Some(5), None));
+}
+
+/// Review r1, R1-4. Undo puts a move's source placement back with the UID
+/// captured when the move was queued. After a renumbering the re-map has
+/// mended, that number is another message's under the folder's new
+/// UIDVALIDITY, and every later change to this one (a star, a read, Delete
+/// forever) was addressed at it and passed the server's check. The number
+/// goes back only under the validity it was captured with; otherwise the
+/// placement has none, and the drain asks the folder when it needs one.
+#[test]
+fn undo_after_a_remap_puts_back_no_number_from_before_it() {
+    let (_dir, mut store, blobs, account, inbox) = setup();
+    store
+        .ensure_folder(account, "archive", "Archive")
+        .expect("archive");
+    let mut ids = Vec::new();
+    for (uid, mid, subj) in [(1, "z@x", "Z"), (2, "a@x", "A"), (3, "b@x", "B")] {
+        ids.push(
+            store
+                .ingest_raw(&blobs, account, Some(inbox), Some(uid), &fixture(mid, subj))
+                .expect("ingest")
+                .message_id,
+        );
+    }
+    store.set_folder_validity(inbox, Some(1)).unwrap();
+    let a = ids[1];
+
+    // Archived while offline: INBOX UID 2 under validity 1.
+    let thread = store.thread_of(a).unwrap().unwrap_or(-a);
+    let receipt = store
+        .apply_thread_action(
+            account,
+            thread,
+            ActionKind::Archive,
+            None,
+            PlacementPolicy::Exclusive,
+        )
+        .expect("queue");
+
+    // The server deleted Z and renumbered: A is 1, B 2. Recovery, in
+    // `recover_folder`'s order: the re-map, the re-fetch of what it could not
+    // match (A, whose inbox placement the archive took), then the validity.
+    let server = [
+        (1u32, Some("a@x".to_string())),
+        (2, Some("b@x".to_string())),
+    ];
+    let out = store
+        .remap_folder_after_reset(inbox, &server, true)
+        .expect("remap");
+    assert_eq!(out.to_fetch, vec![1], "A is fetched again");
+    store
+        .ingest_raw(&blobs, account, Some(inbox), Some(1), &fixture("a@x", "A"))
+        .expect("refetch");
+    store.set_folder_validity(inbox, Some(2)).unwrap();
+
+    // The drain has not delivered the archive yet, and the person presses Z.
+    assert!(store.undo_action(receipt.action_id).unwrap());
+
+    // Any later change to A is addressed by its inbox placement.
+    let star = store
+        .apply_thread_action(
+            account,
+            thread,
+            ActionKind::Star,
+            None,
+            PlacementPolicy::Exclusive,
+        )
+        .expect("star");
+    let rows: Vec<_> = store
+        .pending_actions(account)
+        .expect("pending")
+        .into_iter()
+        .filter(|r| r.action_id == star.action_id && r.message_id == a)
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_ne!(
+        rows[0].uid,
+        Some(2),
+        "A's star is addressed at UID 2 under validity 2, which is msg B: {rows:?}"
+    );
+}
+
+/// And while the folder keeps its numbering, undo puts the number back as
+/// it always did.
+#[test]
+fn undo_puts_the_number_back_while_the_numbering_stands() {
+    let (_dir, mut store, blobs, account, inbox) = setup();
+    store
+        .ensure_folder(account, "archive", "Archive")
+        .expect("archive");
+    store.set_folder_validity(inbox, Some(1)).unwrap();
+    let a = store
+        .ingest_raw(&blobs, account, Some(inbox), Some(2), &fixture("a@x", "A"))
+        .expect("ingest")
+        .message_id;
+    let thread = store.thread_of(a).unwrap().unwrap_or(-a);
+    let receipt = store
+        .apply_thread_action(
+            account,
+            thread,
+            ActionKind::Archive,
+            None,
+            PlacementPolicy::Exclusive,
+        )
+        .expect("queue");
+    assert!(store.undo_action(receipt.action_id).unwrap());
+    assert_eq!(store.placement_uid(a, inbox).unwrap(), Some(Some(2)));
 }
 
 #[test]

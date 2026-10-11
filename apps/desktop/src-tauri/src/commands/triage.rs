@@ -269,7 +269,8 @@ async fn push_folder_to_server(state: &AppState, folder_id: i64) -> Result<(), S
         }
         Err(e) => {
             log_sync(&format!(
-                "server create {path} failed, next sync retries: {e}"
+                "server create of folder {folder_id} failed, next sync retries: {}",
+                crate::sync::loggable(&e)
             ));
             Err(refused_or(state, account, &stop, e))
         }
@@ -381,10 +382,47 @@ pub async fn empty_trash(
         let store = state.store()?;
         let account = named_account(&store, account_id)?;
         let items = store.trash_contents(account).map_err(|e| e.to_string())?;
-        (account, items)
+        (account, binned(&store, account, items))
     };
     let (gone, kept) = destroy_trashed(&state, account, items).await?;
     Ok(format!("{gone}/{kept}"))
+}
+
+/// One message in the bin, as Empty Trash and the bin's expiry expunge it.
+pub(crate) struct Binned {
+    path: String,
+    /// The folder, by id: what the log names it by.
+    folder: Option<i64>,
+    uid: u32,
+    /// The UIDVALIDITY `uid` was learned under. The server refuses the
+    /// expunge if the folder has been renumbered since, rather than erase
+    /// whatever message holds the number now.
+    validity: Option<u32>,
+    message: i64,
+}
+
+/// What the store lists in the bin, `(path, uid, message)`, each with its
+/// folder and the UIDVALIDITY of its number. Read through the same guard as
+/// the list, so a number cannot be paired with a validity from after a
+/// renumbering it predates.
+pub(crate) fn binned(
+    store: &petrel_engine::store::Store,
+    account: i64,
+    listed: Vec<(String, u32, i64)>,
+) -> Vec<Binned> {
+    listed
+        .into_iter()
+        .map(|(path, uid, message)| {
+            let at = store.folder_at(account, &path).ok().flatten();
+            Binned {
+                folder: at.map(|(id, _)| id),
+                validity: at.and_then(|(_, validity)| validity),
+                path,
+                uid,
+                message,
+            }
+        })
+        .collect()
 }
 
 /// Expunges a set of trashed messages and tombstones them here.
@@ -396,7 +434,7 @@ pub async fn empty_trash(
 pub(crate) async fn destroy_trashed(
     state: &Arc<AppState>,
     account: i64,
-    items: Vec<(String, u32, i64)>,
+    items: Vec<Binned>,
 ) -> Result<(usize, usize), String> {
     if items.is_empty() {
         return Ok((0, 0));
@@ -411,23 +449,59 @@ pub(crate) async fn destroy_trashed(
             state.caps(account).has_uidplus,
         )
     };
+    expunge_binned(state, account, cfg, uidplus, items).await
+}
+
+/// The expunges themselves, with the account's server already found: `None`
+/// for an account with no server, whose mail is Petrel's own to drop.
+pub(crate) async fn expunge_binned(
+    state: &Arc<AppState>,
+    account: i64,
+    cfg: Option<petrel_providers::imap::ImapConfig>,
+    uidplus: bool,
+    items: Vec<Binned>,
+) -> Result<(usize, usize), String> {
     let stop = state.stop_signal(account);
     let mut gone = 0usize;
     let mut kept = 0usize;
     let mut refused = false;
-    for (path, uid, message_id) in items {
+    // Bins the server has renumbered since their numbers were learned. The
+    // rest of their mail would be refused the same way, a sign-in each,
+    // until the sync maps them again (review r1, R1-2); it is kept, and
+    // asked about then.
+    let mut renumbered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in items {
+        let Binned {
+            path,
+            folder,
+            uid,
+            validity,
+            message: message_id,
+        } = item;
         let removed = match &cfg {
             // Refused part-way, the rest stay: nothing more is asked of a
             // server that has said no.
             Some(_) if refused => false,
+            Some(_) if renumbered.contains(&path) => false,
             Some(cfg) => {
-                match petrel_providers::imap::expunge_uid(cfg, &path, uid, uidplus).await {
+                match petrel_providers::imap::expunge_uid(cfg, &path, uid, validity, uidplus).await
+                {
                     Ok(_) => true,
                     Err(e) => {
-                        log_sync(&format!("empty trash: {path} uid {uid}: {e}"));
+                        log_sync(&format!(
+                            "empty trash: {} uid {uid}: {}",
+                            folder.map_or_else(
+                                || "a folder no longer here".to_string(),
+                                |id| format!("folder {id}")
+                            ),
+                            crate::sync::loggable(&e)
+                        ));
                         if e.is_sign_in_refused() {
                             state.refused_by(account, &stop);
                             refused = true;
+                        }
+                        if e.is_renumbered() {
+                            renumbered.insert(path.clone());
                         }
                         false
                     }
@@ -598,7 +672,7 @@ pub async fn trash_folder_contents(
                 .map_err(|e| refused_or(&state, account, &stop, e))?;
         }
         log_sync(&format!(
-            "moved {moved} message(s) from {} mailbox(es) to {to_path}",
+            "moved {moved} message(s) from {} mailbox(es) to folder {to_id}",
             from_paths.len()
         ));
     }
@@ -699,7 +773,7 @@ mod signed_out_tests {
     use std::sync::atomic::Ordering;
 
     /// A Trash of `n` messages on `account`, each a placement with a UID.
-    fn full_trash(state: &crate::state::AppState, account: i64, n: u32) -> Vec<(String, u32, i64)> {
+    fn full_trash(state: &crate::state::AppState, account: i64, n: u32) -> Vec<super::Binned> {
         let mut store = state.store.lock().unwrap();
         store
             .sync_folders(
@@ -716,7 +790,7 @@ mod signed_out_tests {
                 .ingest_raw(&state.blobs, account, Some(trash), Some(uid), &raw(uid))
                 .unwrap();
         }
-        store.trash_contents(account).unwrap()
+        super::binned(&store, account, store.trash_contents(account).unwrap())
     }
 
     #[test]

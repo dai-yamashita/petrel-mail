@@ -30,6 +30,27 @@ fn is_refused_password(recorded: &str) -> bool {
     recorded.starts_with("auth:")
 }
 
+/// How a row's reason starts when the message names someone it cannot be
+/// sent to. The entries follow, so the person can see which one to fix. The
+/// Outbox says it in the person's language (`heldReason` in the UI), matching
+/// these words, so they change together.
+const NOT_AN_ADDRESS: &str = "not an address";
+
+/// A row's reason when the message names nobody at all. Matched by the
+/// Outbox, as `NOT_AN_ADDRESS` is.
+const NO_RECIPIENT: &str = "a message needs at least one recipient";
+
+/// A recorded failure as the log may keep it. A server's words lose their
+/// addresses; entries refused before sending lose everything, because what
+/// is not an address is usually a name.
+fn loggable(detail: &str) -> String {
+    if detail.starts_with(NOT_AN_ADDRESS) {
+        NOT_AN_ADDRESS.to_string()
+    } else {
+        without_addresses(detail)
+    }
+}
+
 pub(crate) fn sender_address(identity: Option<&Identity>, login: &str) -> String {
     identity
         .map(|i| i.address.trim())
@@ -47,6 +68,78 @@ pub(crate) fn address_domain(address: &str) -> String {
         .filter(|d| !d.is_empty())
         .unwrap_or("localhost")
         .to_string()
+}
+
+/// Splits a recipient field into its entries: at a comma, a semicolon or a
+/// line break, but never inside a quoted name or inside `<…>`. Each entry is
+/// trimmed, and blanks are dropped.
+///
+/// The composer's rule (`splitRecipients` in the UI), so the send goes to the
+/// recipients the person saw as chips. Split at every comma, the chip
+/// `"Wu, Dana" <dana@example.com>` was two entries, and `"Wu` is no address:
+/// the message was refused, and it never went. A line break is where a column
+/// pasted one address to a line divides. A quote or a `<` protects only when
+/// it closes, and a `<` closes at the next `>`, before any other `<`: one
+/// typed and never closed made a single entry of every recipient after it.
+pub(crate) fn split_recipients(field: &str) -> Vec<String> {
+    let chars: Vec<char> = field.chars().collect();
+    // Where a quote or a `<` opened that never closed: read as a plain
+    // character from then on. Each pass finds at most one more.
+    let mut plain = std::collections::HashSet::new();
+    loop {
+        match split_pass(&chars, &plain) {
+            Ok(entries) => {
+                return entries
+                    .iter()
+                    .map(|e| e.trim())
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            Err(unclosed) => {
+                plain.insert(unclosed);
+            }
+        }
+    }
+}
+
+/// One reading of a recipient field: its entries, or where the first quote
+/// or `<` that never closes was opened.
+fn split_pass(
+    chars: &[char],
+    plain: &std::collections::HashSet<usize>,
+) -> Result<Vec<String>, usize> {
+    let mut entries = Vec::new();
+    let mut entry = String::new();
+    let (mut quote_at, mut bracket_at): (Option<usize>, Option<usize>) = (None, None);
+    for (i, &c) in chars.iter().enumerate() {
+        if plain.contains(&i) {
+            entry.push(c);
+            continue;
+        }
+        match c {
+            '"' => quote_at = if quote_at.is_none() { Some(i) } else { None },
+            '<' if quote_at.is_none() => {
+                // An address holds no `<`, so the one before never closed.
+                if let Some(at) = bracket_at {
+                    return Err(at);
+                }
+                bracket_at = Some(i);
+            }
+            '>' if quote_at.is_none() => bracket_at = None,
+            ',' | ';' | '\n' | '\r' if quote_at.is_none() && bracket_at.is_none() => {
+                entries.push(std::mem::take(&mut entry));
+                continue;
+            }
+            _ => {}
+        }
+        entry.push(c);
+    }
+    if let Some(at) = quote_at.or(bracket_at) {
+        return Err(at);
+    }
+    entries.push(entry);
+    Ok(entries)
 }
 
 /// The store lock, without pinning a tokio worker on `Mutex::lock`.
@@ -169,7 +262,8 @@ pub(crate) fn spawn_outbox_clock(
 /// string, because the four verdicts call for four different responses: done,
 /// try again, stop and tell the user, or — the one that matters — *find out*.
 struct Attempt {
-    message_id: String,
+    /// None when it was refused before there was a message to send.
+    message_id: Option<String>,
     outcome: petrel_engine::outbox::AttemptOutcome,
     /// The server's words, for the row to show when it stopped.
     detail: String,
@@ -272,16 +366,26 @@ async fn attempt(
         references,
         attachments: files,
     };
-    if msg.recipients().is_empty() {
-        return Err("a message needs at least one recipient".into());
-    }
     // Refused here rather than narrowed to the people who were named
     // properly. At the wire a half-typed address is simply left out, and the
     // person would never learn the message did not reach them; the reason
-    // lands on the outbox row instead, as a server's refusal would have.
+    // lands on the outbox row instead, as a server's refusal would have. And
+    // held there as a refusal, for an edit: the message reads the same on
+    // every try, and retried, its row only ever said "Nothing was sent".
     let bad = msg.unsendable();
-    if !bad.is_empty() {
-        return Err(format!("not an address: {}", bad.join(", ")));
+    let refused = if !bad.is_empty() {
+        Some(format!("{NOT_AN_ADDRESS}: {}", bad.join(", ")))
+    } else if msg.recipients().is_empty() {
+        Some(NO_RECIPIENT.to_string())
+    } else {
+        None
+    };
+    if let Some(detail) = refused {
+        return Ok(Attempt {
+            message_id: None,
+            outcome: AttemptOutcome::RejectedPermanently,
+            detail,
+        });
     }
     let (message_id, raw) =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| msg.render(&domain)))
@@ -321,7 +425,7 @@ async fn attempt(
     };
     if outcome != AttemptOutcome::Accepted {
         return Ok(Attempt {
-            message_id,
+            message_id: Some(message_id),
             outcome,
             detail,
         });
@@ -370,7 +474,7 @@ async fn attempt(
     }
     log_sync(&format!("sent {message_id}"));
     Ok(Attempt {
-        message_id,
+        message_id: Some(message_id),
         outcome,
         detail,
     })
@@ -538,11 +642,7 @@ pub(crate) async fn send_due(state: Arc<AppState>, account: i64) {
                 }
             }
         };
-        let to: Vec<String> =
-            d.to.split([',', ';'])
-                .map(|a| a.trim().to_string())
-                .filter(|a| !a.is_empty())
-                .collect();
+        let to = split_recipients(&d.to);
         let attempts = {
             wait_store(&state)
                 .await
@@ -551,12 +651,8 @@ pub(crate) async fn send_due(state: Arc<AppState>, account: i64) {
                 .unwrap_or(0)
         };
 
-        let cc: Vec<String> =
-            d.cc.split([',', ';'])
-                .map(|a| a.trim().to_string())
-                .filter(|a| !a.is_empty())
-                .collect();
-        let bcc = crate::sync::drafts::addresses_of(&d.envelope.bcc);
+        let cc = split_recipients(&d.cc);
+        let bcc = split_recipients(&d.envelope.bcc);
         // The whole message, not only its text: a reply that waited in the
         // undo window still threads into its conversation, and still carries
         // what was attached to it.
@@ -579,7 +675,7 @@ pub(crate) async fn send_due(state: Arc<AppState>, account: i64) {
         .await;
 
         let (outcome, detail, message_id) = match result {
-            Ok(a) => (a.outcome, a.detail, Some(a.message_id)),
+            Ok(a) => (a.outcome, a.detail, a.message_id),
             // Could not even assemble the message — a missing attachment, no
             // account. Not a transport verdict, so it is treated as a failure
             // before anything was committed: safe to retry once it is fixed.
@@ -630,7 +726,7 @@ pub(crate) async fn send_due(state: Arc<AppState>, account: i64) {
                 log_sync(&format!(
                     "queued send failed, retrying in {}s: {}",
                     wait / 1000,
-                    without_addresses(&detail)
+                    loggable(&detail)
                 ));
                 let _ = store.set_send_state(
                     id,
@@ -641,10 +737,7 @@ pub(crate) async fn send_due(state: Arc<AppState>, account: i64) {
                 );
             }
             SendState::FailedPermanent => {
-                log_sync(&format!(
-                    "queued send rejected: {}",
-                    without_addresses(&detail)
-                ));
+                log_sync(&format!("queued send rejected: {}", loggable(&detail)));
                 let _ = store.set_send_state(
                     id,
                     SendState::FailedPermanent,
@@ -659,7 +752,7 @@ pub(crate) async fn send_due(state: Arc<AppState>, account: i64) {
                 // the one response that loses mail.
                 log_sync(&format!(
                     "queued send needs attention: {}",
-                    without_addresses(&detail)
+                    loggable(&detail)
                 ));
                 let _ = store.set_send_state(
                     id,
@@ -760,5 +853,308 @@ mod auth_banner_tests {
             "550 no such user"
         )));
         assert!(!is_refused_password(&record_failure("connect", "refused")));
+    }
+}
+
+#[cfg(test)]
+mod recipient_tests {
+    use super::{loggable, send_due, split_recipients};
+    use crate::state::{AppState, now_ms, test_state};
+    use petrel_engine::store::{AccountServers, DraftEnvelope, OutboxRow};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    /// The composer's rule: a comma, a semicolon or a line break ends an
+    /// entry, except inside a quoted name or inside `<…>`.
+    #[test]
+    fn a_field_splits_where_the_composer_splits_it() {
+        assert_eq!(
+            split_recipients("\"Wu, Dana\" <dana@example.com>, alex@example.com"),
+            ["\"Wu, Dana\" <dana@example.com>", "alex@example.com"]
+        );
+        assert_eq!(
+            split_recipients("\"Wu; Dana\" <dana@example.com>; alex@example.com"),
+            ["\"Wu; Dana\" <dana@example.com>", "alex@example.com"]
+        );
+        // A column pasted from a spreadsheet, one to a line.
+        assert_eq!(
+            split_recipients("ann@example.com\nbob@example.com\r\ncy@example.com"),
+            ["ann@example.com", "bob@example.com", "cy@example.com"]
+        );
+        // A quoted local part is still one address.
+        assert_eq!(
+            split_recipients("Dana <\"wu,dana\"@example.com>, alex@example.com"),
+            ["Dana <\"wu,dana\"@example.com>", "alex@example.com"]
+        );
+        // Trimmed, and the blanks that trailing separators leave are gone.
+        assert_eq!(
+            split_recipients("  ann@example.com ,, ;\n bob@example.com , "),
+            ["ann@example.com", "bob@example.com"]
+        );
+        assert!(split_recipients("").is_empty());
+        assert!(split_recipients(" ,;\n ").is_empty());
+    }
+
+    /// A quote or a `<` that never closes protects nothing: the separators
+    /// after it still separate, as the composer's chips do. Kept whole, one
+    /// typed `<` made a single entry of every recipient after it. Nothing is
+    /// guessed at either way: what is left with the stray character is no
+    /// address, so the message is still refused, with its text on the row.
+    #[test]
+    fn an_unclosed_quote_or_bracket_protects_nothing() {
+        let quote = split_recipients("\"Wu, Dana <dana@example.com>, alex@example.com");
+        assert_eq!(
+            quote,
+            ["\"Wu", "Dana <dana@example.com>", "alex@example.com"]
+        );
+        assert_eq!(
+            split_recipients("Dana <dana@example.com, bob@example.com"),
+            ["Dana <dana@example.com", "bob@example.com"]
+        );
+        // A `<` closes at the next `>`, not at one after another `<`.
+        assert_eq!(
+            split_recipients("Dana <dana@example.com, Bob <bob@example.com>; cy@example.com"),
+            [
+                "Dana <dana@example.com",
+                "Bob <bob@example.com>",
+                "cy@example.com"
+            ]
+        );
+        // What closes still holds together.
+        assert_eq!(
+            split_recipients("Dana <dana,wu@example.com>, Bob <bob@example.com"),
+            ["Dana <dana,wu@example.com>", "Bob <bob@example.com"]
+        );
+        assert_eq!(
+            split_recipients("Dana <\"wu,dana\"@example.com>, \"Lee, Al <al@example.com>"),
+            [
+                "Dana <\"wu,dana\"@example.com>",
+                "\"Lee",
+                "Al <al@example.com>"
+            ]
+        );
+        assert_eq!(
+            petrel_providers::smtp::unsendable_recipients(&quote),
+            ["\"Wu"],
+            "the stray quote is no address, so nothing goes"
+        );
+        assert_eq!(
+            petrel_providers::smtp::unsendable_recipients(&split_recipients(
+                "Dana <dana@example.com, bob@example.com"
+            )),
+            ["Dana <dana@example.com"]
+        );
+    }
+
+    /// Everyone the fields name reaches the envelope, and the recipient sees
+    /// the name as it was written.
+    #[test]
+    fn everyone_named_goes_on_the_envelope() {
+        let msg = petrel_providers::smtp::Outgoing {
+            from_addr: "sam@example.com".into(),
+            from_name: "Sam".into(),
+            to: split_recipients("\"Wu, Dana\" <dana@example.com>, alex@example.com"),
+            cc: split_recipients(""),
+            bcc: split_recipients("\"Nair, Priya\" <priya@example.net>"),
+            subject: "Numbers".into(),
+            body_text: "In.".into(),
+            body_html: None,
+            in_reply_to: None,
+            references: vec![],
+            attachments: vec![],
+        };
+        assert!(msg.unsendable().is_empty(), "{:?}", msg.unsendable());
+        assert_eq!(
+            msg.recipients(),
+            ["dana@example.com", "alex@example.com", "priya@example.net"]
+        );
+        let (_, raw) = msg.render("example.com");
+        let parsed = petrel_mime::parse_message(&raw).unwrap();
+        assert_eq!(
+            parsed.to,
+            vec![
+                (Some("Wu, Dana".to_string()), "dana@example.com".to_string()),
+                (None, "alex@example.com".to_string()),
+            ]
+        );
+        assert!(parsed.bcc.is_empty(), "no Bcc on the wire");
+    }
+
+    /// What is not an address is usually a name, and the log keeps no names.
+    #[test]
+    fn the_log_keeps_no_entry_that_was_refused() {
+        assert_eq!(loggable("not an address: Dana Wu, \"Wu"), "not an address");
+        assert_eq!(
+            loggable("550 5.1.1 <dana@example.com>: no such user"),
+            "550 5.1.1 <address> no such user"
+        );
+    }
+
+    /// Every line a submission server was sent, in order.
+    type Heard = Arc<Mutex<Vec<String>>>;
+
+    /// A submission server that greets, offers STARTTLS and agrees to it.
+    ///
+    /// A loopback socket cannot present a certificate this client would
+    /// accept, so the conversation ends at the handshake, as it does in
+    /// petrel-providers' STARTTLS tests. What it shows is whether a message
+    /// was handed to the server at all: one refused before sending never
+    /// opens a connection.
+    async fn submission_server() -> (u16, Heard) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let heard: Heard = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&heard);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let (rx, mut tx) = sock.into_split();
+                let mut reader = BufReader::new(rx);
+                let _ = tx.write_all(b"220 mail.example ESMTP\r\n").await;
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    log.lock().unwrap().push(line.trim_end().to_string());
+                    let upper = line.to_ascii_uppercase();
+                    if upper.starts_with("EHLO") {
+                        let _ = tx
+                            .write_all(b"250-mail.example\r\n250-STARTTLS\r\n250 AUTH PLAIN\r\n")
+                            .await;
+                    } else if upper.starts_with("STARTTLS") {
+                        let _ = tx.write_all(b"220 2.0.0 Ready to start TLS\r\n").await;
+                        break;
+                    } else {
+                        let _ = tx.write_all(b"250 ok\r\n").await;
+                    }
+                    line.clear();
+                }
+            }
+        });
+        (port, heard)
+    }
+
+    /// The account sends through `port` on loopback, its password cached so
+    /// no keychain is asked.
+    fn wire(state: &AppState, port: u16) {
+        state
+            .store()
+            .unwrap()
+            .set_account_servers(
+                state.account_id,
+                &AccountServers {
+                    imap_host: "127.0.0.1".into(),
+                    imap_port: 993,
+                    smtp_host: "127.0.0.1".into(),
+                    smtp_port: port,
+                    username: "sam".into(),
+                    provider: String::new(),
+                },
+            )
+            .unwrap();
+        crate::config::remember_password(state.account_id, "pw");
+    }
+
+    /// A message due now, its fields as the composer stores them: the chips
+    /// joined by ", ".
+    fn queue(state: &AppState, to: &str, bcc: &str) -> i64 {
+        let store = state.store().unwrap();
+        let id = store
+            .save_draft_full(
+                state.account_id,
+                None,
+                to,
+                "",
+                "Numbers",
+                "In.",
+                "",
+                &DraftEnvelope {
+                    bcc: bcc.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.schedule_send(id, Some(now_ms() - 1)).unwrap();
+        id
+    }
+
+    fn row(state: &AppState, id: i64) -> OutboxRow {
+        state
+            .store()
+            .unwrap()
+            .outbox(state.account_id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("still in the outbox")
+    }
+
+    /// Fifth audit #174 (pass 2's probe). The composer keeps
+    /// `"Wu, Dana" <dana@example.com>` as one chip; the send split it at the
+    /// comma, refused `"Wu` as no address, and retried for ever without ever
+    /// reaching the server. "Last, First" is how corporate address books write
+    /// names, and how Thunderbird copies them.
+    #[test]
+    fn a_quoted_name_with_a_comma_is_one_recipient() {
+        let _turn = crate::config::cache_turn();
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let (row, heard) = tauri::async_runtime::block_on(async {
+            let (port, heard) = submission_server().await;
+            wire(&state, port);
+            let id = queue(
+                &state,
+                "\"Wu, Dana\" <dana@example.com>, alex@example.com",
+                "\"Nair, Priya\" <priya@example.net>",
+            );
+            send_due(Arc::clone(&state), state.account_id).await;
+            (row(&state, id), heard.lock().unwrap().clone())
+        });
+        crate::config::forget_password(state.account_id);
+        println!(
+            "server heard {heard:?}; row {:?} {:?}",
+            row.state, row.error
+        );
+        assert!(
+            heard.iter().any(|l| l.starts_with("STARTTLS")),
+            "the message never reached the server: {:?}",
+            row.error
+        );
+        assert!(
+            !row.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not an address"),
+            "{:?}",
+            row.error
+        );
+    }
+
+    /// A name typed where an address belongs. No retry changes what the
+    /// message says, so it is held for the person with the reason on its row,
+    /// instead of "Nothing was sent. Trying again…" every half hour for good.
+    #[test]
+    fn an_entry_that_is_not_an_address_holds_the_message_and_says_why() {
+        let _turn = crate::config::cache_turn();
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let (row, heard) = tauri::async_runtime::block_on(async {
+            let (port, heard) = submission_server().await;
+            wire(&state, port);
+            let id = queue(&state, "Dana Wu, alex@example.com", "");
+            send_due(Arc::clone(&state), state.account_id).await;
+            (row(&state, id), heard.lock().unwrap().clone())
+        });
+        crate::config::forget_password(state.account_id);
+        println!(
+            "server heard {heard:?}; row {:?} {:?}, next try {:?}",
+            row.state, row.error, row.next_ms
+        );
+        assert!(heard.is_empty(), "nothing goes with a recipient missing");
+        assert_eq!(row.state, "FailedPermanent", "{:?}", row.error);
+        assert_eq!(row.next_ms, None, "and nothing is retried");
+        assert!(
+            row.error.as_deref().unwrap_or("").contains("Dana Wu"),
+            "the row names the entry to fix: {:?}",
+            row.error
+        );
     }
 }

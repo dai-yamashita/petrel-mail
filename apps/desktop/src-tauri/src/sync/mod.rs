@@ -6,6 +6,10 @@ mod caps_tests;
 pub(crate) mod drafts;
 pub(crate) mod drain;
 pub(crate) mod reindex;
+#[cfg(all(test, feature = "dev-plaintext-imap"))]
+mod renumber_tests;
+#[cfg(all(test, feature = "dev-plaintext-imap"))]
+mod stateful_imap;
 
 use crate::diag::{friendly_sync_error_for, is_imap_parse_error, is_sign_in_refusal, log_sync};
 use crate::send::{spawn_outbox_clock, spawn_send_worker};
@@ -835,10 +839,11 @@ async fn create_waiting_folders(state: &Arc<AppState>, account: i64, cfg: &ImapC
                 if let Ok(store) = state.store.lock() {
                     let _ = store.confirm_folder_on_server(id);
                 }
-                log_sync(&format!("created {path} on the server"));
+                log_sync(&format!("created folder {id} on the server"));
             }
             Err(e) => log_sync(&format!(
-                "server create {path} failed, next sync retries: {e}"
+                "server create of folder {id} failed, next sync retries: {}",
+                loggable(&e)
             )),
         }
     }
@@ -1447,9 +1452,19 @@ async fn run_sync_cycle(
                     seen.remove(folder_id);
                 }
                 match recover_folder(state, account, cfg, path, *folder_id).await {
-                    Ok(_) => moved = true,
+                    Ok(_) => {
+                        moved = true;
+                        // A change queued against the old numbering was
+                        // refused by the server's SELECT and waits. Its
+                        // number is learned again now, so it goes now,
+                        // rather than at the next sweep minutes away.
+                        state.nudge_drain(account);
+                    }
                     Err(e) => {
-                        log_sync(&format!("folder {folder_id}: recovery failed: {e}"));
+                        log_sync(&format!(
+                            "folder {folder_id}: recovery failed: {}",
+                            loggable(&e)
+                        ));
                         last_failure = Some(e.to_string());
                         failures += 1;
                     }
@@ -1457,11 +1472,7 @@ async fn run_sync_cycle(
             }
             PassOutcome::Failed { detail } => {
                 if verbose {
-                    if is_imap_parse_error(detail) {
-                        log_sync(&format!("folder {folder_id}: FAILED: imap-parse"));
-                    } else {
-                        log_sync(&format!("folder {folder_id}: FAILED: {detail}"));
-                    }
+                    log_sync(&format!("folder {folder_id}: FAILED: {}", loggable(detail)));
                 }
                 last_failure = Some(detail.clone());
                 failures += 1;
@@ -1496,6 +1507,84 @@ async fn run_sync_cycle(
 /// Tells the window the mail moved, so the list on screen looks again.
 pub(crate) fn note_mail_moved(state: &AppState) {
     state.mail_gen.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A failure as sync.log may carry it.
+///
+/// A reply the IMAP parser choked on comes back with the reply quoted in the
+/// error, as bytes and as text: a FETCH line with its subject and addresses.
+/// The cycle has always logged those by their kind alone; backfill, recovery,
+/// the Gmail sweeps and the reconcile wrote them out whole (fifth audit #191).
+///
+/// A refusal quotes what it refused, too. Dovecot answers a move into a
+/// folder it lacks with "Mailbox doesn't exist: <name>" and Gmail with
+/// "Unknown Mailbox: <name>", and a folder's name is the person's own words.
+/// So a NO or a BAD is logged by its kind and its code, `NO [TRYCREATE]`,
+/// never its text (review r1, R1-3). The whole of it still reaches the
+/// window, where the person reads it.
+pub(crate) fn loggable(e: &impl std::fmt::Display) -> String {
+    let text = e.to_string();
+    if is_imap_parse_error(&text) {
+        "imap-parse".into()
+    } else {
+        refusal_by_code(&text).unwrap_or(text)
+    }
+}
+
+/// `text` with a NO or BAD response cut down to its kind and code, or `None`
+/// when it holds neither. Three shapes reach here. async-imap's is
+/// `no response: code: Some(TryCreate), info: Some("…")`, and a code it does
+/// not parse is left at the head of the info, in brackets. The other two are
+/// Petrel's own, for the commands whose replies it reads itself: the
+/// server's tagged reply as sent (`protocol: EXAMINE: NO [NONEXISTENT] …`),
+/// and its status by name (`protocol: UID SEARCH: No …`). What comes before
+/// the response is Petrel's own words, and stays.
+fn refusal_by_code(text: &str) -> Option<String> {
+    // The code as a server writes it: an atom at the head of the text.
+    let bracketed = |s: &str| {
+        let code: String = s
+            .strip_prefix('[')?
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        (!code.is_empty()).then(|| code.to_ascii_uppercase())
+    };
+    let said = |kind: &str, code: Option<String>| match code {
+        Some(code) => format!("{kind} [{code}]"),
+        None => kind.to_string(),
+    };
+    for (marker, kind) in [("no response: ", "NO"), ("bad response: ", "BAD")] {
+        let Some(at) = text.find(marker) else {
+            continue;
+        };
+        let rest = &text[at + marker.len()..];
+        let code = match rest.strip_prefix("code: Some(") {
+            Some(parsed) => Some(
+                parsed
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect::<String>()
+                    .to_ascii_uppercase(),
+            ),
+            None => rest
+                .split_once("info: Some(\"")
+                .and_then(|(_, info)| bracketed(info)),
+        };
+        return Some(format!("{}{}", &text[..at], said(kind, code)));
+    }
+    let (command, reply) = text.strip_prefix("protocol: ")?.split_once(": ")?;
+    let (status, words) = reply.split_once(' ').unwrap_or((reply, ""));
+    let kind = if status.eq_ignore_ascii_case("NO") {
+        "NO"
+    } else if status.eq_ignore_ascii_case("BAD") {
+        "BAD"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "protocol: {command}: {}",
+        said(kind, bracketed(words))
+    ))
 }
 
 /// Drops the placements a pass's search says have left `folder_id`, and
@@ -1802,7 +1891,9 @@ async fn tend_the_bin(state: &Arc<AppState>, account: i64) {
         let Ok(store) = state.store.lock() else {
             return;
         };
-        store.trash_expired(account, days, now).unwrap_or_default()
+        // Each number with its folder's validity, read under this one guard.
+        let due = store.trash_expired(account, days, now).unwrap_or_default();
+        crate::commands::triage::binned(&store, account, due)
     };
     if expired.is_empty() {
         return;
@@ -1865,7 +1956,7 @@ fn apply_rules_to(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
 
     // ---- read, parse and match, with the store free ------------------------
     // What each matching rule wants done, in the order it must happen.
-    let mut work: Vec<(i64, ActionKind, Option<i64>, String)> = Vec::new();
+    let mut work: Vec<(i64, ActionKind, Option<i64>, i64)> = Vec::new();
     let mut announce: Vec<(String, String)> = Vec::new();
     // One conversation, one action per rule. Two messages of the same thread
     // arriving in the same pass each matched, and each queued the whole
@@ -1909,7 +2000,7 @@ fn apply_rules_to(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
             // The order, and the move/skip-inbox interaction, belong with the
             // rules engine where they can be tested without an AppState.
             for (kind, target) in petrel_engine::rules::planned_actions(a) {
-                work.push((thread, kind, target, rule.name.clone()));
+                work.push((thread, kind, target, rule.id));
             }
         }
     }
@@ -1928,13 +2019,14 @@ fn apply_rules_to(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
         let Ok(store) = state.store.lock() else {
             return;
         };
-        for (thread, kind, target, name) in work {
+        for (thread, kind, target, rule) in work {
             match store.apply_thread_action(account, thread, kind, target, policy) {
                 // A rule naming a folder or tag the user has since deleted is
                 // refused by the store rather than half-performed. Said out
                 // loud here, because the rule will go on being wrong every
-                // time it matches until someone edits it.
-                Err(e) => log_sync(&format!("rule \"{name}\": {e}")),
+                // time it matches until someone edits it. By its id: the name
+                // is the person's own words, as often as not a sender's.
+                Err(e) => log_sync(&format!("rule {rule}: {e}")),
                 Ok(_) => applied += 1,
             }
         }
@@ -2001,7 +2093,7 @@ async fn run_label_sweep(state: &Arc<AppState>, account: i64, cfg: &ImapConfig) 
         }
         // Not fatal: without it, filing falls back to the folder each
         // message arrived from, which is what it was before.
-        Err(e) => log_sync(&format!("label sweep failed: {e}")),
+        Err(e) => log_sync(&format!("label sweep failed: {}", loggable(&e))),
     }
 }
 
@@ -2043,7 +2135,7 @@ async fn number_swept_inbox_placements(state: &Arc<AppState>, account: i64, cfg:
     let listing = match petrel_providers::imap::fetch_id_map_range(cfg, &path, 1, u32::MAX).await {
         Ok(l) => l,
         Err(e) => {
-            log_sync(&format!("inbox identity listing failed: {e}"));
+            log_sync(&format!("inbox identity listing failed: {}", loggable(&e)));
             return;
         }
     };
@@ -2056,7 +2148,10 @@ async fn number_swept_inbox_placements(state: &Arc<AppState>, account: i64, cfg:
             out.rematched, out.dropped
         )),
         Ok(_) => {}
-        Err(e) => log_sync(&format!("inbox placement reconcile failed: {e}")),
+        Err(e) => log_sync(&format!(
+            "inbox placement reconcile failed: {}",
+            loggable(&e)
+        )),
     }
 }
 
@@ -2111,7 +2206,7 @@ async fn run_thrid_sweep(state: &Arc<AppState>, account: i64, cfg: &ImapConfig) 
             }
         }
         // Not fatal: threading falls back to what References could prove.
-        Err(e) => log_sync(&format!("thread sweep failed: {e}")),
+        Err(e) => log_sync(&format!("thread sweep failed: {}", loggable(&e))),
     }
 }
 
@@ -2164,7 +2259,10 @@ async fn reconcile_ghost_placements(
             match petrel_providers::imap::uids_in_folder(cfg, &path).await {
                 Ok(uids) => uids.into_iter().collect(),
                 Err(e) => {
-                    log_sync(&format!("folder {folder_id}: reconcile sweep failed: {e}"));
+                    log_sync(&format!(
+                        "folder {folder_id}: reconcile sweep failed: {}",
+                        loggable(&e)
+                    ));
                     continue;
                 }
             };
@@ -2237,7 +2335,7 @@ async fn reconcile_ghost_placements(
                                 "folder {folder_id}: uid {uid} is a second live copy of a stored message; kept as its own"
                             ));
                         }
-                        Err(e) => log_sync(&format!("folder {folder_id}: second copy uid {uid} failed: {e}")),
+                        Err(e) => log_sync(&format!("folder {folder_id}: second copy uid {uid} failed: {}", loggable(&e))),
                     }
                     return;
                 }
@@ -2890,5 +2988,79 @@ mod elsewhere_tests {
         state.store().unwrap().set_active_account(other).unwrap();
         announce_elsewhere(&state, other, &arrivals);
         assert!(state.pending_elsewhere.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod loggable_tests {
+    use super::loggable;
+
+    /// Review r1, R1-3. A server's refusal quotes what it refused, and that
+    /// is a folder's name: Dovecot's "Mailbox doesn't exist: <name>", Gmail's
+    /// "Unknown Mailbox: <name>". A real account logged one such line 112
+    /// times (`drain::refusal_tests`). A NO or a BAD is logged by its kind
+    /// and its code, in every shape a refusal reaches the log in.
+    #[test]
+    fn a_refusal_is_logged_by_its_kind_and_code() {
+        for (error, logged) in [
+            // async-imap's, with the code it parsed.
+            (
+                "imap: no response: code: Some(TryCreate), info: Some(\"Mailbox doesn't exist: Larkspur Holdings (0.001 + 0.000 secs).\")",
+                "imap: NO [TRYCREATE]",
+            ),
+            // A code it does not parse stays at the head of the text.
+            (
+                "imap: no response: code: None, info: Some(\"[NONEXISTENT] Unknown Mailbox: Larkspur Holdings (Failure)\")",
+                "imap: NO [NONEXISTENT]",
+            ),
+            // A failed folder's detail, as the sync pass words it.
+            (
+                "no response: code: None, info: Some(\"Mailbox doesn't exist: Larkspur Holdings\")",
+                "NO",
+            ),
+            (
+                "imap: bad response: code: None, info: Some(\"Error in IMAP command CREATE: Invalid mailbox name: Larkspur/\")",
+                "imap: BAD",
+            ),
+            (
+                "protocol: created, but the server refused to subscribe: no response: code: None, info: Some(\"Larkspur Holdings\")",
+                "protocol: created, but the server refused to subscribe: NO",
+            ),
+            // Petrel's own exchanges: the tagged reply as the server sent
+            // it, and its status by name.
+            (
+                "protocol: EXAMINE: NO [NONEXISTENT] Mailbox doesn't exist: Larkspur Holdings",
+                "protocol: EXAMINE: NO [NONEXISTENT]",
+            ),
+            (
+                "protocol: UID SEARCH: No Mailbox doesn't exist: Larkspur Holdings",
+                "protocol: UID SEARCH: NO",
+            ),
+            (
+                "protocol: UID: Bad Error in IMAP command: Larkspur Holdings",
+                "protocol: UID: BAD",
+            ),
+        ] {
+            assert_eq!(loggable(&error), logged, "{error}");
+        }
+    }
+
+    /// What is not a refusal says nothing of the person's mail, and is kept
+    /// whole: "No route to host" is not a NO.
+    #[test]
+    fn anything_else_is_logged_as_it_stands() {
+        for error in [
+            "network: No route to host (os error 65)",
+            "the folder was renumbered (UIDVALIDITY 1 is now 2); nothing was done",
+            "protocol: there is no Message-ID to search for",
+            "protocol: connection closed mid-command",
+            "tls: the TLS handshake did not finish within 30s",
+        ] {
+            assert_eq!(loggable(&error), error);
+        }
+        assert_eq!(
+            loggable(&"imap: parse: Error { input: [42, 32], code: TakeWhile1 } during parsing"),
+            "imap-parse"
+        );
     }
 }

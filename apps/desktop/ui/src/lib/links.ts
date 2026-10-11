@@ -31,13 +31,16 @@ export type Link =
  * `apple.com` to a person and resolves somewhere else entirely. Browsers
  * defuse it by showing the punycode form; a mail client hands the URL to
  * the browser, so the moment to say something is before it goes.
+ *
+ * The other spelling that lies is a user name: see `userinfoRisk`.
  */
 export type HomographRisk = {
-  /** What the address looks like: the destination's own letters. */
+  /** What the address looks like: the destination's own letters, or the
+   *  user name a reader takes for the site. */
   asTyped: string;
   /** What it actually resolves to, in the ASCII form DNS uses. */
   asPunycode: string;
-  reason: 'mixed-script' | 'latin-lookalike';
+  reason: 'mixed-script' | 'latin-lookalike' | 'userinfo';
 };
 
 /** Letters of other alphabets that pass for Latin ones at a glance. The
@@ -198,6 +201,62 @@ export function homographRisk(href: string): HomographRisk | null {
 }
 
 /**
+ * A link whose user name poses as the site.
+ *
+ * Whatever stands between `https://` and an `@` is a user name handed to the
+ * site, not where the link goes: `https://www.paypal.com@evil.example/` opens
+ * evil.example. It reads as paypal, and a long enough name pushed the real
+ * host off the end of the hover readout. A link in mail has almost no honest
+ * reason to carry one, so any link with a user name or a password is asked
+ * about, and the question names the host.
+ */
+function userinfoRisk(url: URL): HomographRisk | null {
+  if (!url.username && !url.password) return null;
+  return {
+    // As the URL spells it: percent-encoded, so nothing in it can reorder
+    // the sentence it is quoted in.
+    asTyped: url.password ? `${url.username}:${url.password}` : url.username,
+    asPunycode: url.hostname,
+    reason: 'userinfo',
+  };
+}
+
+/** Whether a link gets a question before it opens: a user name posing as the
+ *  site, or a host spelled to pass for another. */
+export function linkRisk(href: string): HomographRisk | null {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+  return userinfoRisk(url) ?? homographRisk(href);
+}
+
+/**
+ * What the hover readout shows for a link: its address, less any user name
+ * and password.
+ *
+ * The readout is cut from the end because the start of an address says where
+ * it goes, and a user name is the one thing that breaks that rule: a link
+ * starting `https://www.paypal.com.account-security…@` was cut before its
+ * host. Without the name the host comes straight after the scheme again. The
+ * click still asks, and the question names both.
+ */
+export function linkReadout(href: string): string {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return href;
+  }
+  if (!url.username && !url.password) return href;
+  url.username = '';
+  url.password = '';
+  return url.href;
+}
+
+/**
  * Reads a link's destination.
  *
  * An allowlist, not a blocklist. `file:` reaches local content, `javascript:`
@@ -226,7 +285,8 @@ export function classifyLink(href: string): Link {
 }
 
 /**
- * The destination of whatever link is under the pointer, or null.
+ * The destination of whatever link is under the pointer, as the readout
+ * shows it (`linkReadout`), or null.
  *
  * Shown because the link opens in a browser, so there is no address bar on the
  * way to check it against — and because link text that disagrees with its
@@ -238,7 +298,7 @@ export function useHoveredLink(): string | null {
     function onMessage(e: MessageEvent) {
       const url = (e.data as { petrelHover?: unknown })?.petrelHover;
       if (typeof url !== 'string') return;
-      setHref(url || null);
+      setHref(url ? linkReadout(url) : null);
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
@@ -266,7 +326,7 @@ export function useMessageLinks(
       if (typeof href !== 'string') return;
       const link = classifyLink(href);
       if (link.kind === 'web') {
-        const risk = homographRisk(link.url);
+        const risk = linkRisk(link.url);
         if (risk && onRisky) {
           onRisky(risk, () => void api.openExternal(link.url));
           return;

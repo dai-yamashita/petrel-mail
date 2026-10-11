@@ -2,6 +2,7 @@
 
 use crate::diag::log_sync;
 use crate::state::{AppState, stopped, unless_stopped};
+use crate::sync::loggable;
 use petrel_engine::store::Store;
 use petrel_providers::imap::ImapConfig;
 use std::sync::Arc;
@@ -45,13 +46,15 @@ fn flag_op(kind: &petrel_engine::actions::ActionKind) -> Option<(&'static str, b
 /// How many following rows share this flag STORE.
 ///
 /// Stops at the first row that would need a search or a different folder —
-/// those must stay in order relative to this action.
+/// those must stay in order relative to this action — or whose number was
+/// learned under another UIDVALIDITY, since one STORE is checked against one.
 fn consecutive_flag_uids(
     pending: &[petrel_engine::store::PendingAction],
     start: usize,
     kind_json: &str,
     folder: &str,
     first_uid: u32,
+    validity: Option<u32>,
     max: usize,
 ) -> Vec<(usize, i64, u32)> {
     let mut out = vec![(start, pending[start].action_id, first_uid)];
@@ -66,7 +69,7 @@ fn consecutive_flag_uids(
         } else {
             row.folder_path.as_str()
         };
-        if later != folder {
+        if later != folder || row.uid_validity != validity {
             break;
         }
         let Some(uid) = row.uid else { break };
@@ -74,6 +77,21 @@ fn consecutive_flag_uids(
         i += 1;
     }
     out
+}
+
+/// A folder as sync.log names it — by its id, never its path, which is the
+/// person's own words: a client's name, "Job hunt" (AGENTS.md) — and the
+/// UIDVALIDITY its stored numbers belong to.
+fn folder_ref(state: &AppState, account: i64, path: &str) -> (String, Option<u32>) {
+    match state
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.folder_at(account, path).ok().flatten())
+    {
+        Some((id, validity)) => (format!("folder {id}"), validity),
+        None => ("a folder no longer here".into(), None),
+    }
 }
 
 /// The size of a message as the store holds it: the bytes the server sent,
@@ -295,6 +313,14 @@ pub(crate) async fn drain_actions(
     let mut refused_at: Option<usize> = None;
     // Where the pass stopped because its worker was told to stop.
     let mut stopped_at: Option<usize> = None;
+    // Folders the server refused a command in because it has renumbered them
+    // since their numbers were learned. Every other change there is refused
+    // the same way until the sync maps the folder again, and asking cost a
+    // connection and a sign-in each: 120 queued mark-reads were 120 sign-ins
+    // in one pass, and the first pass's sync, which is what releases them,
+    // waited behind them all (review r1, R1-2). The rest wait unasked.
+    let mut renumbered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unasked = 0usize;
     'items: for (idx, item) in pending.iter().enumerate() {
         if batched.contains(&idx) {
             continue;
@@ -340,8 +366,23 @@ pub(crate) async fn drain_actions(
         // guessing. The key is the store's own: one with a suffix the store
         // added matches nothing on the server, so a forgery's row is never
         // healed onto the message it imitates.
+        //
+        // A number goes with the UIDVALIDITY it was learned under, and the
+        // server refuses the command if the folder has been renumbered since
+        // (fifth audit #168). One the heal finds goes with the folder's
+        // validity as it stood before the search asked: read after, a
+        // renumbering that landed in between could pair the new validity
+        // with a number from before it, which is the one pairing that acts on
+        // the wrong message. This way round the worst is a refusal, and the
+        // action waits for the next drain. The placement is healed only
+        // while the folder still has that validity, for the same reason:
+        // written after recovery had recorded a new one, the old number
+        // stayed on the placement, paired with the new validity, for every
+        // change after (review r1, R1-8).
         let key = item.msgid.as_deref().filter(|m| !m.is_empty());
-        let mut resolved = item.uid.map(|u| (u, item.folder_path.clone()));
+        let mut resolved = item
+            .uid
+            .map(|u| (u, item.folder_path.clone(), item.uid_validity));
         let mut search_failed = false;
         if resolved.is_none()
             && let Some(key) = key
@@ -363,6 +404,15 @@ pub(crate) async fn drain_actions(
                 .and_then(|s| s.carries_its_message_id_alone(item.message_id).ok())
                 .unwrap_or(false);
             for path in &item.candidate_paths {
+                // Renumbered under its stored numbers: what it answers cannot
+                // be acted on until the sync maps it again. As with a read
+                // that failed, no other folder's copy is taken in its place.
+                if renumbered.contains(path) {
+                    search_failed = true;
+                    unasked += 1;
+                    break;
+                }
+                let (place, validity) = folder_ref(&state, account, path);
                 match petrel_providers::imap::copies_of_message_id(&cfg, path, key).await {
                     Ok(copies) => match copies.as_slice() {
                         [] => {}
@@ -378,7 +428,7 @@ pub(crate) async fn drain_actions(
                                 Ok(true) => {
                                     let u = copy.uid;
                                     log_sync(&format!(
-                                        "action {}: {path} answers to the Message-ID with UID {u}",
+                                        "action {}: {place} answers to the Message-ID with UID {u}",
                                         item.action_id
                                     ));
                                     if let Ok(store) = state.store.lock() {
@@ -387,13 +437,14 @@ pub(crate) async fn drain_actions(
                                             account,
                                             path,
                                             u,
+                                            validity,
                                         );
                                     }
-                                    resolved = Some((u, path.clone()));
+                                    resolved = Some((u, path.clone(), validity));
                                     break;
                                 }
                                 Ok(false) => log_sync(&format!(
-                                    "action {}: {path} holds a different message under the Message-ID; not healing",
+                                    "action {}: {place} holds a different message under the Message-ID; not healing",
                                     item.action_id
                                 )),
                                 Err(e) if signed_out(&state, account, stop, &e) => {
@@ -407,15 +458,16 @@ pub(crate) async fn drain_actions(
                                 Err(e) => {
                                     search_failed = true;
                                     log_sync(&format!(
-                                        "action {}: reading the copy in {path} failed: {e}",
-                                        item.action_id
+                                        "action {}: reading the copy in {place} failed: {}",
+                                        item.action_id,
+                                        loggable(&e)
                                     ));
                                     break;
                                 }
                             }
                         }
                         several => log_sync(&format!(
-                            "action {}: {path} holds {} messages under the Message-ID; not guessing",
+                            "action {}: {place} holds {} messages under the Message-ID; not guessing",
                             item.action_id,
                             several.len()
                         )),
@@ -430,14 +482,15 @@ pub(crate) async fn drain_actions(
                     Err(e) => {
                         search_failed = true;
                         log_sync(&format!(
-                            "action {}: search of {path} failed: {e}",
-                            item.action_id
+                            "action {}: search of {place} failed: {}",
+                            item.action_id,
+                            loggable(&e)
                         ));
                     }
                 }
             }
         }
-        let Some((uid, folder_path)) = resolved else {
+        let Some((uid, folder_path, validity)) = resolved else {
             if search_failed {
                 stuck += 1;
                 continue;
@@ -463,6 +516,11 @@ pub(crate) async fn drain_actions(
         } else {
             folder_path
         };
+        if renumbered.contains(&folder) {
+            stuck += 1;
+            unasked += 1;
+            continue;
+        }
 
         let result = match kind {
             ActionKind::MarkRead
@@ -476,6 +534,7 @@ pub(crate) async fn drain_actions(
                     &item.kind_json,
                     &folder,
                     uid,
+                    validity,
                     petrel_providers::imap::STORE_FLAG_BATCH,
                 );
                 // The same question for every row riding along in the batch:
@@ -485,7 +544,8 @@ pub(crate) async fn drain_actions(
                 }
                 let uids: Vec<u32> = group.iter().map(|(_, _, u)| *u).collect();
                 let result =
-                    petrel_providers::imap::store_flags(&cfg, &folder, &uids, flag, add).await;
+                    petrel_providers::imap::store_flags(&cfg, &folder, &uids, validity, flag, add)
+                        .await;
                 if result.is_ok() {
                     for (i, action_id, _) in &group {
                         if *i != idx {
@@ -516,17 +576,19 @@ pub(crate) async fn drain_actions(
                     .and_then(|p| p.get("target").and_then(|t| t.as_i64()));
                 let dest = state.store.lock().ok().and_then(|s| {
                     target
-                        .and_then(|fid| s.folder_path(fid).ok().flatten())
+                        .and_then(|fid| Some((fid, s.folder_path(fid).ok().flatten()?)))
                         .or_else(|| {
                             s.folders_of(item.message_id).ok().and_then(|fids| {
                                 fids.into_iter()
-                                    .filter_map(|fid| s.folder_path(fid).ok().flatten())
-                                    .find(|p| *p != folder)
+                                    .filter_map(|fid| {
+                                        Some((fid, s.folder_path(fid).ok().flatten()?))
+                                    })
+                                    .find(|(_, p)| *p != folder)
                             })
                         })
                 });
                 match dest {
-                    Some(to) if to != folder => {
+                    Some((dest_id, to)) if to != folder => {
                         // Read only where a move can take the careful path:
                         // the server's MOVE needs no check.
                         // The stored size is a test only where another row
@@ -557,6 +619,7 @@ pub(crate) async fn drain_actions(
                             &cfg,
                             &folder,
                             uid,
+                            validity,
                             &to,
                             has_move,
                             has_uidplus,
@@ -569,10 +632,14 @@ pub(crate) async fn drain_actions(
                             // and try once more; servers signal this as
                             // TRYCREATE but not all of them say the word. Not
                             // over a refused password: that is a second
-                            // refused sign-in for nothing.
-                            Err(e) if !e.is_sign_in_refused() => {
+                            // refused sign-in for nothing. Nor over a source
+                            // renumbered since: no folder is missing, and the
+                            // retry would only be refused the same way.
+                            Err(e) if !e.is_sign_in_refused() && !e.is_renumbered() => {
                                 log_sync(&format!(
-                                    "move to {to} failed ({e}); creating and retrying"
+                                    "action {}: the move to folder {dest_id} failed ({}); creating it and retrying",
+                                    item.action_id,
+                                    loggable(&e)
                                 ));
                                 match petrel_providers::imap::create_folder(&cfg, &to).await {
                                     Ok(()) => {
@@ -580,6 +647,7 @@ pub(crate) async fn drain_actions(
                                             &cfg,
                                             &folder,
                                             uid,
+                                            validity,
                                             &to,
                                             has_move,
                                             has_uidplus,
@@ -602,7 +670,8 @@ pub(crate) async fn drain_actions(
                             // Copied and flagged, not expunged: no UIDPLUS, and a
                             // bare EXPUNGE would commit other clients' deletions.
                             log_sync(&format!(
-                                "{folder}: moved by copy; the source copy is flagged deleted, not expunged (no UIDPLUS)"
+                                "{}: moved by copy; the source copy is flagged deleted, not expunged (no UIDPLUS)",
+                                folder_ref(&state, account, &folder).0
                             ));
                         }
                         if moved.is_ok()
@@ -624,18 +693,33 @@ pub(crate) async fn drain_actions(
                 // The local row is already a tombstone, so its placements are
                 // the last record of where the server copy lives. Expunge from
                 // the folder it was queued against.
-                match petrel_providers::imap::expunge_uid(&cfg, &folder, uid, has_uidplus).await {
+                match petrel_providers::imap::expunge_uid(&cfg, &folder, uid, validity, has_uidplus)
+                    .await
+                {
                     // Marked \\Deleted but not expunged: the server has no
                     // UIDPLUS, and a bare EXPUNGE would have committed every
                     // other pending deletion in the mailbox too. Worth a line
                     // in the log, because the message outlives the gesture.
                     Ok(false) => {
                         log_sync(&format!(
-                            "{folder}: marked deleted but not expunged (no UIDPLUS)"
+                            "{}: marked deleted but not expunged (no UIDPLUS)",
+                            folder_ref(&state, account, &folder).0
                         ));
                         Ok(())
                     }
-                    Ok(true) => Ok(()),
+                    // Gone from the server, so gone here: that copy's
+                    // placement goes, and the row is put back to the
+                    // tombstone the action made. A renumbering can revive it
+                    // before the drain gets here (recovery fetches what it
+                    // cannot match, and a tombstone is not matched), with no
+                    // folder to show it in. The row's other placements stay:
+                    // they are copies the server still holds.
+                    Ok(true) => {
+                        if let Ok(store) = state.store.lock() {
+                            let _ = store.settle_expunged_copy(item.message_id, account, &folder);
+                        }
+                        Ok(())
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -670,14 +754,19 @@ pub(crate) async fn drain_actions(
                 };
                 let adding = matches!(kind, ActionKind::Tag);
                 if looks_like_gmail {
-                    petrel_providers::imap::store_gmail_labels(&cfg, &folder, uid, &name, adding)
-                        .await
+                    petrel_providers::imap::store_gmail_labels(
+                        &cfg, &folder, uid, validity, &name, adding,
+                    )
+                    .await
                 } else {
                     // Everywhere else a tag travels as an IMAP keyword, which
                     // Dovecot persists beside the system flags. These actions
                     // used to sit 'queued' forever with nowhere to go.
                     let keyword = petrel_engine::keywords::tag_keyword(&name);
-                    petrel_providers::imap::store_flag(&cfg, &folder, uid, &keyword, adding).await
+                    petrel_providers::imap::store_flag(
+                        &cfg, &folder, uid, validity, &keyword, adding,
+                    )
+                    .await
                 }
             }
         };
@@ -703,7 +792,14 @@ pub(crate) async fn drain_actions(
                 break 'items;
             }
             Err(e) => {
+                if e.is_renumbered() {
+                    renumbered.insert(folder.clone());
+                }
                 let text = e.to_string();
+                // What sync.log may carry of it: a reply the parser choked
+                // on is quoted whole in the error, mail text and all, and a
+                // refusal quotes the folder it refused.
+                let shown = loggable(&e);
                 // A refusal retrying cannot fix is counted, and after enough
                 // of them the action leaves the queue. Anything else — a
                 // broken pipe, a sleeping laptop — is not counted at all:
@@ -726,13 +822,13 @@ pub(crate) async fn drain_actions(
                 if spent {
                     undeliverable += 1;
                     log_sync(&format!(
-                        "action {}: {text}; asked {GIVE_UP_AFTER} times, marked undeliverable",
+                        "action {}: {shown}; asked {GIVE_UP_AFTER} times, marked undeliverable",
                         item.action_id
                     ));
                 } else {
                     stuck += 1;
                     log_sync(&format!(
-                        "action {} could not be delivered: {text}",
+                        "action {} could not be delivered: {shown}",
                         item.action_id
                     ));
                 }
@@ -744,6 +840,11 @@ pub(crate) async fn drain_actions(
     } else {
         String::new()
     };
+    if unasked > 0 {
+        tail.push_str(&format!(
+            "; {unasked} wait, unasked, for a renumbered folder to be mapped again"
+        ));
+    }
     if let Some(at) = refused_at {
         let left = (at..pending.len()).filter(|i| !batched.contains(i)).count();
         stuck += left;
@@ -885,6 +986,7 @@ mod batch_tests {
             payload_json: "{}".into(),
             message_id: action,
             uid,
+            uid_validity: Some(7),
             folder_path: folder.into(),
             msgid: None,
             candidate_paths: Vec::new(),
@@ -903,12 +1005,13 @@ mod batch_tests {
             "\"mark_read\"",
             "INBOX",
             1,
+            Some(7),
             petrel_providers::imap::STORE_FLAG_BATCH,
         );
         assert_eq!(group.len(), 40, "stops before the row with no UID");
         assert_eq!(group.last().map(|(_, _, u)| *u), Some(40));
 
-        let full: Vec<PendingAction> = (0..150)
+        let mut full: Vec<PendingAction> = (0..150)
             .map(|i| row("\"mark_read\"", "INBOX", Some(i as u32 + 1), i))
             .collect();
         let group = super::consecutive_flag_uids(
@@ -917,9 +1020,24 @@ mod batch_tests {
             "\"mark_read\"",
             "INBOX",
             1,
+            Some(7),
             petrel_providers::imap::STORE_FLAG_BATCH,
         );
         assert_eq!(group.len(), 100);
+
+        // One STORE is checked against one UIDVALIDITY: a number learned
+        // under another goes on its own.
+        full[30].uid_validity = Some(8);
+        let group = super::consecutive_flag_uids(
+            &full,
+            0,
+            "\"mark_read\"",
+            "INBOX",
+            1,
+            Some(7),
+            petrel_providers::imap::STORE_FLAG_BATCH,
+        );
+        assert_eq!(group.len(), 30, "stops before the other numbering");
     }
 }
 

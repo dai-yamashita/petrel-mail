@@ -21,7 +21,7 @@ pub(crate) async fn push_draft_to_server(
     state: &Arc<AppState>,
     draft_id: i64,
 ) -> Result<(), String> {
-    let (account, record, msgid, old_uid, cfg, drafts_path, identity, from_addr) = {
+    let (account, record, msgid, old_uid, cfg, drafts_folder, identity, from_addr) = {
         let mut store = state.store()?;
         // The draft's own account, never the active one: a send or a save can
         // finish after the rail has been switched, and the copy must land in
@@ -70,11 +70,16 @@ pub(crate) async fn push_draft_to_server(
             }
             return Ok(());
         };
-        let drafts_path = store
+        // With the UIDVALIDITY the recorded copy's number belongs to, read
+        // under the same guard as the number: the old copy is expunged by it.
+        let drafts_folder = store
             .folder_for_role(account, "drafts")
             .ok()
             .flatten()
-            .and_then(|fid| store.folder_path(fid).ok().flatten());
+            .and_then(|fid| {
+                let path = store.folder_path(fid).ok().flatten()?;
+                Some((fid, path, store.folder_validity(fid).ok().flatten()))
+            });
         let identity = store.identity(account).ok();
         // The draft's Message-ID is minted under the account's own address,
         // the same one the message will go out as — never the login name,
@@ -104,12 +109,12 @@ pub(crate) async fn push_draft_to_server(
             msgid,
             old_uid,
             cfg,
-            drafts_path,
+            drafts_folder,
             identity,
             from_addr,
         )
     };
-    let Some(drafts_path) = drafts_path else {
+    let Some((drafts_id, drafts_path, drafts_validity)) = drafts_folder else {
         return Ok(());
     };
 
@@ -137,6 +142,7 @@ pub(crate) async fn push_draft_to_server(
             &cfg,
             &drafts_path,
             old,
+            drafts_validity,
             state.caps(account).has_uidplus,
         )
         .await
@@ -149,7 +155,7 @@ pub(crate) async fn push_draft_to_server(
     if let Ok(mut store) = state.store.lock() {
         let _ = store.set_draft_server_uid(draft_id, new_uid);
     }
-    log_sync(&format!("draft {draft_id} pushed to {drafts_path}"));
+    log_sync(&format!("draft {draft_id} pushed to folder {drafts_id}"));
     Ok(())
 }
 
@@ -179,6 +185,12 @@ pub(crate) fn schedule_draft_push(state: Arc<AppState>, draft_id: i64) {
         }
     });
 }
+
+/// A server copy of a draft to remove: its folder's path, its UID, and the
+/// UIDVALIDITY that UID was learned under. A removal held while the account
+/// was signed out can wait hours, and a folder renumbered meanwhile has given
+/// the number to another message; the server's SELECT refuses it then.
+pub(crate) type ServerCopy = (String, u32, Option<u32>);
 
 /// Deletes the draft's server copies — for a draft being discarded, or one
 /// that just became a sent message. Reads through the caller's guard,
@@ -216,16 +228,18 @@ pub(crate) fn drop_server_draft_using(state: &AppState, store: &Store, draft_id:
 }
 
 /// Removes server copies of a draft, one by one.
-async fn expunge_copies(
+pub(crate) async fn expunge_copies(
     cfg: &petrel_providers::imap::ImapConfig,
-    copies: Vec<(String, u32)>,
+    copies: Vec<ServerCopy>,
     uidplus: bool,
 ) {
     // UIDPLUS makes the expunge surgical. Without it a copy is only
     // flagged \Deleted, because a bare EXPUNGE would commit other
     // clients' deletions too, and it stays until the server expunges it.
-    for (path, uid) in copies {
-        if let Err(e) = petrel_providers::imap::expunge_uid(cfg, &path, uid, uidplus).await {
+    for (path, uid, validity) in copies {
+        if let Err(e) =
+            petrel_providers::imap::expunge_uid(cfg, &path, uid, validity, uidplus).await
+        {
             log_sync(&format!("server draft copy (uid {uid}) not removed: {e}"));
         }
     }
@@ -322,7 +336,7 @@ fn hand_back(
     account: i64,
     mailbox: &Option<(String, String)>,
     drafts: Vec<i64>,
-    drops: Vec<(String, u32)>,
+    drops: Vec<ServerCopy>,
 ) {
     if *state.stop_signal(account).borrow() {
         return;
@@ -338,8 +352,9 @@ fn hand_back(
 /// The server copies of a draft to drop, by folder path and UID: every one
 /// the store has numbered in Drafts, or in the Trash or Spam a conversation
 /// took it to (`Store::draft_copies`), and the copy the last push recorded,
-/// which Drafts may not have numbered yet. Each once.
-fn server_copies(store: &Store, account: i64, draft_id: i64) -> Vec<(String, u32)> {
+/// which Drafts may not have numbered yet. Each once, and each with its
+/// folder's UIDVALIDITY, read through the same guard as the number.
+pub(crate) fn server_copies(store: &Store, account: i64, draft_id: i64) -> Vec<ServerCopy> {
     let mut copies = store.draft_copies(draft_id).unwrap_or_default();
     let pushed = store
         .draft_sync_state(draft_id)
@@ -356,6 +371,16 @@ fn server_copies(store: &Store, account: i64, draft_id: i64) -> Vec<(String, u32
         copies.push((path, uid));
     }
     copies
+        .into_iter()
+        .map(|(path, uid)| {
+            let validity = store
+                .folder_at(account, &path)
+                .ok()
+                .flatten()
+                .and_then(|(_, validity)| validity);
+            (path, uid, validity)
+        })
+        .collect()
 }
 
 /// The copy of a draft that goes to the server's Drafts folder.
@@ -389,16 +414,11 @@ pub(crate) fn draft_copy(
     msg.sender_copy(&msg.render_with_id(msgid))
 }
 
-/// Splits a recipient field the way the composer's chip field does —
-/// commas and semicolons — for rendering a draft whose addresses are still
-/// one string. A draft may legitimately have none at all.
+/// Splits a recipient field as the send does (`split_recipients`), for
+/// rendering a draft whose addresses are still one string. A draft may
+/// legitimately have none at all.
 pub(crate) fn addresses_of(field: &str) -> Vec<String> {
-    field
-        .split([',', ';'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+    crate::send::split_recipients(field)
 }
 
 #[cfg(test)]
@@ -434,6 +454,47 @@ mod draft_copy_tests {
         assert_eq!(parsed.message_id.as_deref(), Some("d1@example.com"));
         assert_eq!(parsed.to, vec![(None, "dana@example.com".to_string())]);
     }
+
+    /// A quoted name with a comma is one recipient here too (fifth audit
+    /// #174). Split at every comma, `"Wu, Dana" <dana@example.com>` became
+    /// `"Wu`, dropped as no address, and `Dana" <…>`: the copy named her
+    /// "Dana", and a blind copy lost half its name the same way.
+    #[test]
+    fn the_server_copy_keeps_a_quoted_name_with_a_comma_whole() {
+        let record = DraftRecord {
+            id: 1,
+            to: "\"Wu, Dana\" <dana@example.com>, alex@example.com".into(),
+            cc: String::new(),
+            subject: "Numbers".into(),
+            body: "In.".into(),
+            html: String::new(),
+            envelope: DraftEnvelope {
+                bcc: "\"Nair, Priya\" <priya@example.net>".into(),
+                ..Default::default()
+            },
+        };
+        let raw = draft_copy(
+            &record,
+            "sam@example.com".into(),
+            "Sam".into(),
+            "d2@example.com",
+        );
+        let parsed = petrel_mime::parse_message(&raw).unwrap();
+        assert_eq!(
+            parsed.to,
+            vec![
+                (Some("Wu, Dana".to_string()), "dana@example.com".to_string()),
+                (None, "alex@example.com".to_string()),
+            ]
+        );
+        assert_eq!(
+            parsed.bcc,
+            vec![(
+                Some("Nair, Priya".to_string()),
+                "priya@example.net".to_string()
+            )]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -442,17 +503,21 @@ mod server_copies_tests {
     use petrel_engine::actions::{ActionKind, PlacementPolicy};
     use petrel_engine::store::Store;
 
-    /// A draft pushed once: the copy's UID recorded, and numbered in Drafts.
+    /// A draft pushed once: the copy's UID recorded, and numbered in Drafts,
+    /// whose numbers belong to UIDVALIDITY 3.
     fn pushed() -> (Store, i64, i64) {
         let mut store = Store::open_in_memory().unwrap();
         let account = store.ensure_test_account().unwrap();
-        store.ensure_folder(account, "drafts", "Drafts").unwrap();
+        let drafts = store.ensure_folder(account, "drafts", "Drafts").unwrap();
+        store.set_folder_validity(drafts, Some(3)).unwrap();
         store.ensure_folder(account, "trash", "Trash").unwrap();
         let id = store
             .save_draft(account, None, "sam@example.com", "Plans", "yes", "")
             .unwrap();
         store.set_draft_server_uid(id, Some(7)).unwrap();
-        store.heal_placement_uid(id, account, "Drafts", 7).unwrap();
+        store
+            .heal_placement_uid(id, account, "Drafts", 7, Some(3))
+            .unwrap();
         (store, account, id)
     }
 
@@ -461,7 +526,7 @@ mod server_copies_tests {
         let (store, account, id) = pushed();
         assert_eq!(
             server_copies(&store, account, id),
-            vec![("Drafts".to_string(), 7)]
+            vec![("Drafts".to_string(), 7, Some(3))]
         );
     }
 
@@ -480,10 +545,15 @@ mod server_copies_tests {
                 PlacementPolicy::Exclusive,
             )
             .unwrap();
-        store.heal_placement_uid(id, account, "Trash", 12).unwrap();
+        store
+            .heal_placement_uid(id, account, "Trash", 12, None)
+            .unwrap();
         assert_eq!(
             server_copies(&store, account, id),
-            vec![("Trash".to_string(), 12), ("Drafts".to_string(), 7)]
+            vec![
+                ("Trash".to_string(), 12, None),
+                ("Drafts".to_string(), 7, Some(3))
+            ]
         );
     }
 
@@ -496,7 +566,7 @@ mod server_copies_tests {
         store.place_message_at(id, archive, 30).unwrap();
         assert_eq!(
             server_copies(&store, account, id),
-            vec![("Drafts".to_string(), 7)]
+            vec![("Drafts".to_string(), 7, Some(3))]
         );
         // Moved to the Trash, with no UID there yet: only the push's copy.
         store
@@ -510,7 +580,7 @@ mod server_copies_tests {
             .unwrap();
         assert_eq!(
             server_copies(&store, account, id),
-            vec![("Drafts".to_string(), 7)]
+            vec![("Drafts".to_string(), 7, Some(3))]
         );
     }
 }

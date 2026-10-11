@@ -359,6 +359,44 @@ impl Store {
         Ok(())
     }
 
+    /// Plants the addresses an older extractor would have written, as
+    /// `(role, address, name)`: the address rows and the index's `addrs`,
+    /// the way ingest writes them. Behind the feature for the same reason as
+    /// `overwrite_extracted`.
+    #[cfg(feature = "testkit")]
+    pub fn overwrite_addresses(
+        &mut self,
+        id: i64,
+        addresses: &[(&str, &str, Option<&str>)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM message_addresses WHERE message_id = ?1",
+            params![id],
+        )?;
+        for (role, addr, name) in addresses {
+            tx.execute(
+                "INSERT INTO message_addresses(message_id, role, addr_norm, display)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, role, addr, name],
+            )?;
+        }
+        let addrs = addresses
+            .iter()
+            .map(|(_, addr, name)| match name {
+                Some(n) => format!("{n} {addr}"),
+                None => addr.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        tx.execute(
+            "UPDATE fts_content SET addrs = ?2 WHERE message_id = ?1",
+            params![id, addrs],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Pushes committed WAL pages back into the main file and truncates it.
     ///
     /// RESTART leaves the file at its peak size. A re-extraction on this

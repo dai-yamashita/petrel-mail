@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { pressEnded, startsDrag } from './press';
 
 /**
  * Makes a fixed-position panel draggable by a handle, without disturbing how
@@ -57,21 +58,13 @@ export function useDragWindow() {
       // Only the handle itself. A drag started on the close button would mean
       // the button never gets its click.
       if ((e.target as HTMLElement).closest('button, input, select, textarea, a')) return;
-      if (e.button !== 0) return;
+      // Not a Control-click either. WebKit's menu took its release, and the
+      // composer followed the pointer, holding it, until the next click.
+      if (!startsDrag(e)) return;
       from.current = { px: e.clientX, py: e.clientY, ox: offset.x, oy: offset.y };
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     },
     [offset.x, offset.y],
-  );
-
-  const onPointerMove = useCallback(
-    (e: React.PointerEvent) => {
-      const start = from.current;
-      if (!start) return;
-      e.preventDefault();
-      setOffset(clamp(start.ox + (e.clientX - start.px), start.oy + (e.clientY - start.py)));
-    },
-    [clamp],
   );
 
   const onPointerUp = useCallback((e: React.PointerEvent) => {
@@ -79,6 +72,22 @@ export function useDragWindow() {
     const el = e.currentTarget as HTMLElement;
     if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
   }, []);
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      const start = from.current;
+      if (!start) return;
+      // The button came up somewhere this handle never heard about: the move
+      // is over, and the pointer goes back to the rest of the window.
+      if (pressEnded(e)) {
+        onPointerUp(e);
+        return;
+      }
+      e.preventDefault();
+      setOffset(clamp(start.ox + (e.clientX - start.px), start.oy + (e.clientY - start.py)));
+    },
+    [clamp, onPointerUp],
+  );
 
   // A window that shrinks can leave the panel outside it. Re-clamping on resize
   // is what stops a dragged composer from being lost by resizing the window.

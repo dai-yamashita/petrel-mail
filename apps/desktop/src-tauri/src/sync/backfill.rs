@@ -2,7 +2,7 @@
 
 use crate::diag::log_sync;
 use crate::state::{AppState, stopped, ui_recently_active};
-use crate::sync::{folders_to_sync_from, ingest_fenced};
+use crate::sync::{folders_to_sync_from, ingest_fenced, loggable};
 use petrel_providers::imap::ImapConfig;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -181,7 +181,10 @@ async fn run_backfill_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig
             Stride::Worked
         }
         Err(e) => {
-            log_sync(&format!("backfill folder {folder_id} failed: {e}"));
+            log_sync(&format!(
+                "backfill folder {folder_id} failed: {}",
+                loggable(&e)
+            ));
             if e.is_sign_in_refused() {
                 return Stride::Refused;
             }
@@ -242,7 +245,7 @@ async fn run_allmail_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig)
             Ok(Some(next)) => next,
             Ok(None) => return Stride::Done,
             Err(e) => {
-                log_sync(&format!("all-mail walk could not start: {e}"));
+                log_sync(&format!("all-mail walk could not start: {}", loggable(&e)));
                 return refused_or_failed(&e);
             }
         },
@@ -259,7 +262,7 @@ async fn run_allmail_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig)
     let listed = match petrel_providers::imap::fetch_id_map_range(cfg, &path, first, last).await {
         Ok(l) => l,
         Err(e) => {
-            log_sync(&format!("all-mail stride failed: {e}"));
+            log_sync(&format!("all-mail stride failed: {}", loggable(&e)));
             return refused_or_failed(&e); // failed is not finished; retry after a wait
         }
     };
@@ -308,7 +311,7 @@ async fn run_allmail_tick(state: &Arc<AppState>, account: i64, cfg: &ImapConfig)
             // stride are fetched when the account signs in again, not
             // passed over.
             Err(e) if e.is_sign_in_refused() => {
-                log_sync(&format!("all-mail stride failed: {e}"));
+                log_sync(&format!("all-mail stride failed: {}", loggable(&e)));
                 return Stride::Refused;
             }
             Err(_) => 0,
@@ -363,5 +366,79 @@ mod backoff_tests {
         // a panic or a wrap to nothing.
         assert_eq!(backoff_after(200), Duration::from_secs(15 * 60));
         assert_eq!(backoff_after(u32::MAX), Duration::from_secs(15 * 60));
+    }
+}
+
+/// Fifth audit #191: a reply the parser cannot read is quoted whole in the
+/// error, and backfill logged the error as it stood.
+#[cfg(all(test, feature = "dev-plaintext-imap"))]
+mod parse_failure_tests {
+    use super::{Stride, run_backfill_tick};
+    use crate::state::test_state;
+    use crate::sync::stateful_imap::{Imap, raw_msg, serve};
+    use petrel_providers::imap::{Credential, ImapConfig, Security};
+    use std::sync::Arc;
+
+    #[test]
+    fn a_reply_backfill_cannot_parse_is_logged_by_its_kind_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let account = state.account_id;
+        let srv = Imap::new("MOVE UIDPLUS", &[("INBOX", "")]);
+        for i in 1..=3 {
+            srv.put(
+                "INBOX",
+                raw_msg(&format!("h{i}@example.com"), "history", "h"),
+                &["\\Seen"],
+            );
+        }
+        // The newest is held; backfill walks down from it.
+        {
+            let mut store = state.store.lock().unwrap();
+            store
+                .sync_folders(account, &[("INBOX".into(), Some("inbox".into()))])
+                .unwrap();
+            let inbox = store.folder_for_role(account, "inbox").unwrap().unwrap();
+            let newest = srv.held("INBOX").pop().unwrap();
+            store
+                .ingest_raw(
+                    &state.blobs,
+                    account,
+                    Some(inbox),
+                    Some(newest.uid),
+                    &newest.raw,
+                )
+                .unwrap();
+        }
+        srv.garble_next(
+            "UID FETCH",
+            b"* 2 FETCH (UID 2 BODY[] Subject:Quarterly-salaries-P191 From:dana.p191@example.com)\r\n",
+        );
+        let stride = tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            let cfg = ImapConfig {
+                host: "127.0.0.1".into(),
+                port,
+                user: "u".into(),
+                credential: Credential::password("pw"),
+                security: Security::InsecurePlaintext,
+            };
+            run_backfill_tick(&state, account, &cfg).await
+        });
+        assert_eq!(
+            stride,
+            Stride::Failed,
+            "the stride failed, to be asked again"
+        );
+        let log = crate::diag::test_log_text();
+        let leaks: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("P191") || l.contains("p191"))
+            .collect();
+        assert!(leaks.is_empty(), "mail text in sync.log: {leaks:#?}");
+        assert!(
+            log.contains("failed: imap-parse"),
+            "the failure is still logged"
+        );
     }
 }

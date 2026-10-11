@@ -72,5 +72,6 @@ export function useReferenceData(seeding: boolean | undefined, accountEpoch: num
     setAccounts,
     activeAccount,
     identity,
+    setIdentity,
   };
 }

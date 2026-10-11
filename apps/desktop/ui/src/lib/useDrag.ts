@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { DRAG_THRESHOLD, acceptsDrop, draggableFrom, draggedIds } from './dnd';
+import { pressEnded, startsDrag } from './press';
 
 /**
  * What is being carried.
@@ -93,6 +94,16 @@ function holdPointer(pointerId: number) {
   }
 }
 
+/** Hands the pointer back when the press ended with no pointerup to end the
+ *  capture by itself. */
+function letGo(pointerId: number) {
+  try {
+    if (document.body.hasPointerCapture(pointerId)) document.body.releasePointerCapture(pointerId);
+  } catch {
+    // Nothing was held.
+  }
+}
+
 /**
  * Dragging conversations with the pointer.
  *
@@ -115,6 +126,12 @@ export function useDrag(
   // would otherwise close over the first render's value forever.
   const live = useRef<Dragging | null>(null);
   const pending = useRef<{ payload: Payload; label: string; x: number; y: number } | null>(null);
+  // Moves in a row that said the button was up. WebKit on the Mac reads
+  // `buttons` from the hardware when it handles a move, not from the move, so
+  // the last drag before a release can arrive already saying "up". One is
+  // that; a second, with no pointerup between, is a release that went
+  // somewhere else.
+  const upMoves = useRef(0);
 
   const set = useCallback((next: Dragging | null) => {
     live.current = next;
@@ -186,6 +203,25 @@ export function useDrag(
 
   useEffect(() => {
     function move(e: PointerEvent) {
+      // A release this never heard: a native dialog can take it, and so can
+      // a window losing focus mid-drag. Moves with the button up mean the
+      // press is over, so whatever it began ends here, with nothing dropped.
+      // Left alone, the next click dropped a folder nobody was carrying into
+      // whatever it landed on. The second such move, not the first: the last
+      // move before a real release can already say "up" (`upMoves`), and
+      // ending the drag on it lost the drop its release was about to make.
+      if ((pending.current || live.current) && pressEnded(e)) {
+        upMoves.current += 1;
+        if (upMoves.current < 2) return;
+        upMoves.current = 0;
+        pending.current = null;
+        if (live.current) {
+          set(null);
+          letGo(e.pointerId);
+        }
+        return;
+      }
+      upMoves.current = 0;
       const start = pending.current;
       if (start && !live.current) {
         // Still deciding whether this is a click or a drag.
@@ -210,6 +246,7 @@ export function useDrag(
     }
 
     function up(e: PointerEvent) {
+      upMoves.current = 0;
       const held = live.current;
       pending.current = null;
       if (!held) return;
@@ -266,7 +303,7 @@ export function useDrag(
   /** Attach to a row: begins a drag once the pointer has travelled far enough. */
   const start = useCallback(
     (e: React.PointerEvent, rowId: number, selected: ReadonlySet<number>, subject: string) => {
-      if (e.button !== 0) return;
+      if (!startsDrag(e)) return;
       // Nothing to drag to, so nothing to drag. Starting a drag that no
       // destination would accept is a gesture that can only end in nothing
       // happening, which reads as the feature being broken.
@@ -296,7 +333,7 @@ export function useDrag(
    * how you file several at once. Neither is the "real" direction.
    */
   const startTag = useCallback((e: React.PointerEvent, tagId: number, name: string) => {
-    if (e.button !== 0) return;
+    if (!startsDrag(e)) return;
     // The tag's own edit menu is a control on the row, not a handle.
     const control = (e.target as HTMLElement).closest('button, [role="button"]');
     if (control && control !== e.currentTarget) return;
@@ -317,7 +354,7 @@ export function useDrag(
    * `dropMeaning` gives its rows no meaning as a target.
    */
   const startSearch = useCallback((e: React.PointerEvent, searchId: number, name: string) => {
-    if (e.button !== 0) return;
+    if (!startsDrag(e)) return;
     // The row's own menu is a control, not a handle — the same guard the tag
     // row needs for the same reason.
     const control = (e.target as HTMLElement).closest('button, [role="button"]');
@@ -332,7 +369,7 @@ export function useDrag(
 
   /** Attach to a folder row: begins carrying the folder toward a new parent. */
   const startFolder = useCallback((e: React.PointerEvent, folderId: number, label: string) => {
-    if (e.button !== 0) return;
+    if (!startsDrag(e)) return;
     const control = (e.target as HTMLElement).closest('input, a, .tag-edit, .tree-toggle');
     if (control) return;
     pending.current = {

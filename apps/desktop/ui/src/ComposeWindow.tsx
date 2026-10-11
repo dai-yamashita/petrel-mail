@@ -258,7 +258,7 @@ export function ComposeWindow({ draftId }: { draftId: number }) {
       />
       <Picker
         open={scheduling}
-        mode="snooze"
+        mode="send-later"
         subject={draft.subject || null}
         options={snoozeOptions()}
         onClose={() => setScheduling(false)}

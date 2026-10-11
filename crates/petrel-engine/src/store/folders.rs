@@ -895,6 +895,34 @@ impl Store {
             .map(|v| v as u32))
     }
 
+    /// The folder this account holds at `path`, and the UIDVALIDITY its stored
+    /// numbers belong to.
+    ///
+    /// What a UID kept or found for that path is checked against before
+    /// anything acts on it, and what a log names the folder by.
+    ///
+    /// The validity read here pairs only with a number read from a placement
+    /// under the same guard. Recovery records the new validity only after it
+    /// has re-numbered the placements, so that reader can meet a new number
+    /// under the old validity (refused by the server's SELECT, and asked
+    /// again) but never an old number under the new one. A number held
+    /// anywhere else goes with the validity it was learned under, and is
+    /// checked against that: an action's captured source
+    /// (`pending_actions`), the one undo puts back (`undo_action`), one a
+    /// search found (`heal_placement_uid`). Paired with the validity as it
+    /// stands, each named another message once recovery had run (review r1).
+    pub fn folder_at(&self, account_id: i64, path: &str) -> Result<Option<(i64, Option<u32>)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, uidvalidity FROM folders WHERE account_id = ?1 AND path = ?2",
+                params![account_id, path],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?
+            .map(|(id, validity)| (id, validity.map(|v| v as u32))))
+    }
+
     /// Records the UIDVALIDITY the folder's UIDs now belong to.
     ///
     /// In a recovery this is deliberately the *last* step, after the re-map
@@ -1000,6 +1028,19 @@ impl Store {
                 .collect();
             self.tombstone_unplaced(folder_id, &proven_gone)?;
         }
+        // The copy a draft's last push recorded is a number in Drafts too,
+        // and as much a lie now. It follows the number the re-map gave the
+        // draft's own placement, or goes: kept as it was, the removal of a
+        // sent draft's server copies expunged whatever message had inherited
+        // it, under the folder's new validity.
+        tx.execute(
+            "UPDATE messages SET draft_server_uid =
+                 (SELECT p.uid FROM placements p
+                   WHERE p.message_id = messages.id AND p.folder_id = ?1)
+              WHERE account_id = ?2 AND draft_server_uid IS NOT NULL
+                AND EXISTS (SELECT 1 FROM folders WHERE id = ?1 AND role = 'drafts')",
+            params![folder_id, account],
+        )?;
         tx.commit()?;
         Ok(out)
     }
@@ -1008,19 +1049,33 @@ impl Store {
     /// Writes a UID the server has just confirmed onto the one placement that
     /// lost its number — and only onto one that lost it. A placement already
     /// holding a UID belongs to the sync; the drain never overrules it.
+    ///
+    /// And only while the folder's UIDVALIDITY is still `validity`, the one
+    /// read before the server was asked. Recovery can finish in between, and
+    /// a number from before its renumbering, written after it, pairs with
+    /// the new validity and passes the server's check against some other
+    /// message (review r1, R1-8).
     pub fn heal_placement_uid(
         &self,
         message_id: i64,
         account_id: i64,
         folder_path: &str,
         uid: u32,
+        validity: Option<u32>,
     ) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE placements SET uid = ?1
              WHERE message_id = ?2 AND uid IS NULL
                AND folder_id = (SELECT id FROM folders
-                                 WHERE account_id = ?3 AND path = ?4)",
-            params![uid as i64, message_id, account_id, folder_path],
+                                 WHERE account_id = ?3 AND path = ?4
+                                   AND uidvalidity IS ?5)",
+            params![
+                uid as i64,
+                message_id,
+                account_id,
+                folder_path,
+                validity.map(|v| v as i64)
+            ],
         )?;
         Ok(n > 0)
     }

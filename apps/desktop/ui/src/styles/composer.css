@@ -15,6 +15,9 @@
   border-start-end-radius: 12px;
   background: var(--surface);
   box-shadow: 0 -8px 40px rgba(24, 39, 48, 0.18);
+  /* Under the dialogs (46): Send later and Snooze open from it, and Settings,
+     the palette and Help can open over it. Above them, it hid the list of
+     times it had just asked for. */
   z-index: 45;
 }
 

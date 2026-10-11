@@ -627,7 +627,20 @@ fn body_of(msg: &mail_parser::Message<'_>, parsed: &[u8], html: bool) -> Option<
             && let Some(text) =
                 crate::charset::decode(charset, &undo_transfer(part.encoding, slice))
         {
-            return Some(text);
+            // The only part of a message is filed as both bodies, and the
+            // parser converts it to the type asked for on the way out. So
+            // must this. Plain text handed over as HTML ran its lines
+            // together and lost anything in angle brackets, and HTML handed
+            // over as text was indexed as markup (docs/24 #18).
+            return Some(match (&part.body, html) {
+                (mail_parser::PartType::Text(_), true) => {
+                    mail_parser::decoders::html::text_to_html(&text)
+                }
+                (mail_parser::PartType::Html(_), false) => {
+                    mail_parser::decoders::html::html_to_text(&text)
+                }
+                _ => text,
+            });
         }
     }
     if html {
@@ -1599,6 +1612,73 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
     fn an_empty_body_is_still_a_message() {
         let m = parse_message(&message("8bit", b"")).expect("parses");
         assert!(m.body_text.trim().is_empty(), "body was {:?}", m.body_text);
+    }
+}
+
+/// A body decoded here comes out as the type it was asked for, as the
+/// parser's own bodies do.
+///
+/// mail-parser files a text-only message's one part as its HTML body too, and
+/// an HTML-only message's as its text, and converts each on the way out. The
+/// bodies decoded here skipped the conversion: a plain-text HZ message reached
+/// the reader as HTML, so its lines ran together and `<x@example.com>` was
+/// taken for a tag and dropped, and an HTML-only message was indexed as markup
+/// (docs/24 #18).
+#[cfg(test)]
+mod part_types_decoded_here {
+    use super::*;
+
+    fn shown(m: &ParsedMessage) -> String {
+        crate::sanitize_html(m.body_html.as_deref().unwrap_or(""), false).html
+    }
+
+    #[test]
+    fn a_plain_hz_message_keeps_its_lines_in_the_reader() {
+        let raw = b"From: Dana <dana@example.com>\r\nSubject: hz\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=HZ-GB-2312\r\n\r\n\
+Hi ~{VPND~}!\r\nSecond line <x@example.com>\r\n";
+        let m = parse_message(raw).expect("parses");
+        let html = shown(&m);
+        assert!(
+            html.contains("Hi 中文!<br"),
+            "the lines ran together: {html:?}"
+        );
+        assert!(
+            html.contains("Second line &lt;x@example.com&gt;"),
+            "the address was taken for a tag: {html:?}"
+        );
+        assert!(
+            m.body_text.contains("Second line <x@example.com>"),
+            "body was {:?}",
+            m.body_text
+        );
+    }
+
+    #[test]
+    fn plain_text_under_an_unknown_label_too() {
+        let raw = b"From: a@example.com\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=unknown-8bit\r\n\r\n\
+caf\xe9\r\nsecond line <x@example.com>\r\n";
+        let html = shown(&parse_message(raw).expect("parses"));
+        assert!(html.contains("café<br"), "the lines ran together: {html:?}");
+        assert!(html.contains("&lt;x@example.com&gt;"), "shown as {html:?}");
+    }
+
+    #[test]
+    fn an_html_only_message_is_indexed_by_its_words() {
+        let raw = b"From: a@example.com\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+Content-Type: text/html; charset=unknown-8bit\r\n\r\n\
+<html><head><style>p{color:red}</style></head><body><p>caf\xe9 words</p></body></html>\r\n";
+        let m = parse_message(raw).expect("parses");
+        assert_eq!(m.index_text(), "café words");
+        assert!(
+            m.body_html
+                .as_deref()
+                .is_some_and(|h| h.contains("<p>café words</p>")),
+            "the HTML itself is still the HTML: {:?}",
+            m.body_html
+        );
     }
 }
 

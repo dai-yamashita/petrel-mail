@@ -13,6 +13,7 @@ import { TagMenu } from './TagMenu';
 import { FolderMenu } from './FolderMenu';
 import { NameDialog } from './NameDialog';
 import { acceptsDrop } from '../lib/dnd';
+import { followPress } from '../lib/press';
 import type { InsertPoint } from '../lib/useDrag';
 import {
   buildFolderTree,
@@ -229,21 +230,10 @@ export function Rail({
     setNamingDialog('folder');
   };
 
-  // Pointer drag, with the listeners on the window rather than the handle: a
-  // fast drag outruns a 6px target, and losing the pointer mid-resize leaves
-  // the rail stuck at whatever width the last event happened to land on.
-  const startDrag = (e: React.PointerEvent) => {
-    e.preventDefault();
-    const move = (ev: PointerEvent) => onResize(ev.clientX);
-    const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-      document.body.classList.remove('resizing');
-    };
-    document.body.classList.add('resizing');
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
-  };
+  // The same press as the list/reader divider's, by the same rule: a context
+  // click on the edge used to leave the rail resizing with the pointer until
+  // the next click. `followPress` says why.
+  const startDrag = (e: React.PointerEvent) => followPress(e, onResize);
 
   /* The hierarchy the paths already spell, drawn as one. A mailbox tree
      like Archive/Yearly/2023 is how people actually file, and a flat list

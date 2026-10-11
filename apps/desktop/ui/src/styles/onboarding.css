@@ -133,6 +133,15 @@
   flex: 1;
 }
 
+/* "Enter settings manually", waiting on an address as Continue does. In the
+   help text's ink, with no pointer and no underline, so it does not read as
+   a link that does nothing. */
+.onb-acts .linkish:disabled {
+  color: var(--ink3);
+  cursor: default;
+  text-decoration: none;
+}
+
 .onb-servers {
   display: grid;
   gap: 6px;

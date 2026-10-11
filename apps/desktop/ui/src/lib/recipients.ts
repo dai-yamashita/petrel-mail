@@ -5,6 +5,9 @@
  * the chip field asks of it.
  */
 
+/** What ends one recipient and starts the next, outside quotes and `<…>`. */
+const SEPARATORS = new Set([',', ';', '\n', '\r']);
+
 /** Splits a recipient field, forgiving the separators people actually type.
  *
  * Deliberately tolerant: someone pasting from a calendar invite or a signature
@@ -12,26 +15,67 @@
  * their paste teaches them to distrust the field rather than teaching them the
  * separator.
  *
- * A comma inside double quotes is part of a name, not a separator: pasting
+ * A line break separates too. A column of addresses copied from a spreadsheet
+ * or another client arrives one per line, and Apple Mail, Gmail and
+ * Thunderbird all make a recipient of each line. Here the three became one
+ * red chip, and Send refused it as a single address.
+ *
+ * A comma inside double quotes is part of a name: pasting
  * `"Wu, Dana" <dana@example.com>` used to make two chips, one of them an
- * address of `"Wu`, and the send was refused for it.
+ * address of `"Wu`, and the send was refused for it. Nothing inside `<…>`
+ * splits either, since that is the address itself. A quote or a `<` protects
+ * only when it closes, and a `<` closes at the next `>`, before any other
+ * `<`: one typed and never closed swallowed every recipient after it into a
+ * single red chip. The send path splits by the same rule (`split_recipients`
+ * in send.rs), so the chips on screen are the recipients on the envelope.
  */
 export function splitRecipients(field: string): string[] {
+  const chars = [...field];
+  // Where a quote or a `<` opened that never closed: read as a plain
+  // character from then on. Each pass finds at most one more.
+  const plain = new Set<number>();
+  for (;;) {
+    const pass = splitPass(chars, plain);
+    if (typeof pass === 'number') {
+      plain.add(pass);
+      continue;
+    }
+    return pass.map((a) => a.trim()).filter(Boolean);
+  }
+}
+
+/** One reading of the field: its entries, or where the first quote or `<`
+ *  that never closes was opened. */
+function splitPass(chars: string[], plain: Set<number>): string[] | number {
   const out: string[] = [];
   let current = '';
-  let quoted = false;
-  for (const ch of field) {
+  let quoteAt = -1;
+  let bracketAt = -1;
+  for (let i = 0; i < chars.length; i += 1) {
+    const ch = chars[i];
+    if (plain.has(i)) {
+      current += ch;
+      continue;
+    }
     if (ch === '"') {
-      quoted = !quoted;
-    } else if (!quoted && (ch === ',' || ch === ';')) {
+      quoteAt = quoteAt < 0 ? i : -1;
+    } else if (quoteAt < 0 && ch === '<') {
+      // An address holds no `<`, so the one before never closed.
+      if (bracketAt >= 0) return bracketAt;
+      bracketAt = i;
+    } else if (quoteAt < 0 && ch === '>') {
+      bracketAt = -1;
+    } else if (quoteAt < 0 && bracketAt < 0 && SEPARATORS.has(ch)) {
       out.push(current);
       current = '';
       continue;
     }
     current += ch;
   }
+  if (quoteAt >= 0) return quoteAt;
+  if (bracketAt >= 0) return bracketAt;
   out.push(current);
-  return out.map((a) => a.trim()).filter(Boolean);
+  return out;
 }
 
 /** The address inside a recipient entry: `Name <addr>` gives `addr`, and a

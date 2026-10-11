@@ -352,6 +352,11 @@ impl Store {
                         "({placed} AND coalesce(m.snoozed_until_ms, 0)
                                        <= (strftime('%s','now') * 1000))"
                     )
+                } else if name == "drafts" {
+                    // A draft with a send time is post, and the Drafts view
+                    // leaves it to the Outbox. Search found it in Drafts
+                    // while the list beside it said nothing (docs/24 #34).
+                    format!("({placed} AND m.send_after_ms IS NULL)")
                 } else {
                     placed
                 }

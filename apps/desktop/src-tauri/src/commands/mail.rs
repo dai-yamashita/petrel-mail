@@ -304,19 +304,23 @@ pub fn print_message(
         .parse()
         .map_err(|e| format!("{e}"))?;
     let said = serde_json::to_string(&strings).unwrap_or_else(|_| "{}".into());
-    WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
-        .title("Print")
-        .initialization_script(format!("window.__PETREL_PRINT__ = {said};"))
-        // The printed page is a top-level document: nothing it links to may
-        // load in its place. Its own script swallows clicks; this is the
-        // webview refusing whatever gets past that.
-        .on_navigation(crate::print_navigation_allowed)
-        // Wide enough for the sheet the print document draws — a 174mm column
-        // plus its padding — rather than exactly the old 700px, which left the
-        // preview with no margin at all and measured a page wider than paper.
-        .inner_size(772.0, 900.0)
-        .build()
-        .map_err(|e| e.to_string())?;
+    crate::without_link_preview(WebviewWindowBuilder::new(
+        &app,
+        &label,
+        WebviewUrl::External(url),
+    ))
+    .title("Print")
+    .initialization_script(format!("window.__PETREL_PRINT__ = {said};"))
+    // The printed page is a top-level document: nothing it links to may
+    // load in its place. Its own script swallows clicks; this is the
+    // webview refusing whatever gets past that.
+    .on_navigation(crate::print_navigation_allowed)
+    // Wide enough for the sheet the print document draws — a 174mm column
+    // plus its padding — rather than exactly the old 700px, which left the
+    // preview with no margin at all and measured a page wider than paper.
+    .inner_size(772.0, 900.0)
+    .build()
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -413,17 +417,21 @@ pub fn view_message_source(
     } else {
         strings.title.clone()
     };
-    WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
-        // Not the subject: a window title is chrome the platform may record,
-        // and no part of a message's text needs to be in it.
-        .title(title)
-        .initialization_script(&init)
-        // Same fence as the print window. Nothing this page names may load in
-        // its place, and there is nothing in it that should try.
-        .on_navigation(crate::print_navigation_allowed)
-        .inner_size(820.0, 900.0)
-        .build()
-        .map_err(|e| e.to_string())?;
+    crate::without_link_preview(WebviewWindowBuilder::new(
+        &app,
+        &label,
+        WebviewUrl::External(url),
+    ))
+    // Not the subject: a window title is chrome the platform may record,
+    // and no part of a message's text needs to be in it.
+    .title(title)
+    .initialization_script(&init)
+    // Same fence as the print window. Nothing this page names may load in
+    // its place, and there is nothing in it that should try.
+    .on_navigation(crate::print_navigation_allowed)
+    .inner_size(820.0, 900.0)
+    .build()
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

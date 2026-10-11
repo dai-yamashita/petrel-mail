@@ -158,3 +158,52 @@ fn a_blind_copy_counts_as_someone_written_to() {
         .expect("offered while typing");
     assert!(priya.written_to, "{offered:?}");
 }
+
+/// Sent mail stored before Bcc was read gains it. The blind copies were in
+/// its bytes all along, but only re-extraction reaches mail already held, and
+/// it runs only when the extraction version moves (docs/26 #185). Until then
+/// the reader showed no Bcc line, search could not find a blind-copied
+/// address, and nobody blind-copied counted as written to.
+#[test]
+fn sent_mail_stored_before_bcc_was_read_gains_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("p.db")).unwrap();
+    let blobs = BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    let sent = store.ensure_folder(account, "sent", "Sent").unwrap();
+    let id = store
+        .ingest_raw(&blobs, account, Some(sent), Some(3), SENT_COPY)
+        .unwrap()
+        .message_id;
+    // As a build from before Bcc left it: every address but the blind ones,
+    // and the extraction done for version 10, the last without them.
+    store
+        .overwrite_addresses(
+            id,
+            &[
+                ("from", "sam@example.com", Some("Sam Ortiz")),
+                ("to", "dana@example.com", Some("Dana Wu")),
+                ("cc", "alex@example.com", None),
+            ],
+        )
+        .unwrap();
+    store.set_setting("extraction_version", "10").unwrap();
+    let thread = store.thread_of(id).unwrap().unwrap();
+    let blind = |store: &Store| store.thread_detail(thread).unwrap()[0].bcc.clone();
+    assert!(blind(&store).is_empty(), "the old shape was not planted");
+    assert_eq!(store.search("priya", 10).unwrap().len(), 0);
+
+    store.reindex_bodies(&blobs).unwrap();
+
+    assert_eq!(
+        blind(&store),
+        vec!["Priya Nair".to_string(), "board@example.org".to_string()]
+    );
+    assert_eq!(
+        store.search("priya", 10).unwrap().len(),
+        1,
+        "a blind-copied address is found"
+    );
+    assert!(store.has_written_to(account, "priya@example.net").unwrap());
+    store.fts_integrity_check().unwrap();
+}

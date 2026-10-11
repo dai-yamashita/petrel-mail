@@ -30,10 +30,45 @@ impl Store {
                 payloads.insert(id, Arc::from(json));
             }
         }
+        // Each folder's UIDVALIDITY as it stands, once, for the numbers
+        // captured at queue time below.
+        let validity_now: HashMap<String, Option<u32>> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT path, uidvalidity FROM folders WHERE account_id = ?1")?;
+            let rows = stmt.query_map(params![account_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?.map(|v| v as u32),
+                ))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        // Whether a number captured under the UIDVALIDITY `then` still names
+        // its message in `path`. Not when the folder has been renumbered
+        // since: the number is some other message's now (fifth audit #168).
+        // Nor when it was captured before validities were kept, in a folder
+        // that has one now: that one may be what the sync recorded after a
+        // renumbering the number predates, and paired with it the number
+        // passed the server's check and moved whichever message held it
+        // (review r1, R1-1). Either is asked for by Message-ID, as a number
+        // never learned is. A folder never numbered, or gone from the store,
+        // has nothing to check against: its number goes as it is, with the
+        // validity it was captured under for the server's SELECT to check.
+        let still_names = |then: Option<u32>, path: &str| {
+            let now = validity_now.get(path).copied().flatten();
+            match (then, now) {
+                (Some(then), Some(now)) => then == now,
+                (None, Some(_)) => false,
+                (_, None) => true,
+            }
+        };
         let empty: Arc<str> = Arc::from("{}");
+        // Each number with its folder's UIDVALIDITY, in the same read: see
+        // `folder_at` for why the pair can be trusted.
         let mut stmt = self.conn.prepare(
             "SELECT a.id, a.kind, am.message_id, p.uid, f.path,
-                    m.message_id_hdr
+                    m.message_id_hdr, f.uidvalidity
              FROM actions a
              JOIN action_messages am ON am.action_id = a.id
              JOIN messages m ON m.id = am.message_id
@@ -51,6 +86,7 @@ impl Store {
                 payload_json: empty.clone(),
                 message_id: r.get(2)?,
                 uid: r.get::<_, Option<i64>>(3)?.map(|u| u as u32),
+                uid_validity: r.get::<_, Option<i64>>(6)?.map(|v| v as u32),
                 folder_path: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 msgid: r.get::<_, Option<String>>(5)?,
                 candidate_paths: Vec::new(),
@@ -97,8 +133,11 @@ impl Store {
                     )
                     .optional()?
                     .unwrap_or(false);
-                if !quarantined {
+                // Nor when the number may name another message now: see
+                // `still_names`.
+                if !quarantined && still_names(prior.source_validity, path) {
                     row.uid = Some(uid);
+                    row.uid_validity = prior.source_validity;
                     row.folder_path = path.clone();
                 }
             }
@@ -173,10 +212,12 @@ impl Store {
                         .prior
                         .iter()
                         .find(|p| p.message_id == row.message_id)
-                        .and_then(|p| Some((p.source_path.clone()?, p.source_uid)))
+                        .and_then(|p| {
+                            Some((p.source_path.clone()?, p.source_uid, p.source_validity))
+                        })
                 });
             let mut pinned = false;
-            if let Some((path, uid)) = source {
+            if let Some((path, uid, then)) = source {
                 let still_there: bool = self
                     .conn
                     .query_row(
@@ -189,6 +230,10 @@ impl Store {
                     .optional()?
                     .unwrap_or(false);
                 if !still_there {
+                    // A number that may name some other message there now
+                    // moved that one instead (fifth audit #168). It is asked
+                    // for by Message-ID: see `still_names`.
+                    let uid = uid.filter(|_| still_names(then, &path));
                     // A source with no number is still the folder the change
                     // is about: the drain asks it for the number, and a
                     // folder that does not hold the message has nothing to
@@ -199,6 +244,7 @@ impl Store {
                         Vec::new()
                     };
                     row.uid = uid;
+                    row.uid_validity = then;
                     row.folder_path = path;
                     pinned = true;
                 }
@@ -849,8 +895,17 @@ impl Store {
                 // the placement could not take a flag change from the server,
                 // was never pruned when the server dropped the message, and
                 // disagreed with STATUS every cycle until a refetch healed it.
+                //
+                // Known means known under the folder's numbering as it stands.
+                // After a renumbering the re-map has mended, the captured UID
+                // is another message's under the new UIDVALIDITY, and every
+                // later change to this one was addressed at it (review r1,
+                // R1-4); so is one captured before validities were kept, as
+                // `pending_actions` reads it. Such a placement goes back
+                // without a number, which the drain asks the folder for.
+                let same_numbering = p.source_validity == self.folder_validity(*f)?;
                 match (p.source_folder, p.source_uid) {
-                    (Some(folder), Some(uid)) if folder == *f => {
+                    (Some(folder), Some(uid)) if folder == *f && same_numbering => {
                         self.place_message_at(p.message_id, *f, uid)?
                     }
                     _ => self.place_message(p.message_id, *f)?,
@@ -1139,6 +1194,7 @@ impl Store {
                         tag_ids: Vec::new(),
                         source_path: None,
                         source_uid: None,
+                        source_validity: None,
                         source_folder: None,
                         snoozed_until,
                     },
@@ -1198,8 +1254,10 @@ impl Store {
             } else {
                 " AND p.uid IS NOT NULL"
             };
+            // The folder's UIDVALIDITY with the number: the two only mean a
+            // message together, and the action may wait hours to be sent.
             let sql = format!(
-                "SELECT p.message_id, f.path, p.uid, (f.role = 'inbox'), p.folder_id
+                "SELECT p.message_id, f.path, p.uid, (f.role = 'inbox'), p.folder_id, f.uidvalidity
                  FROM placements p
                  JOIN folders f ON f.id = p.folder_id
                  JOIN messages m ON m.id = p.message_id
@@ -1214,15 +1272,17 @@ impl Store {
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<i64>>(2)?,
                     r.get::<_, i64>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
                 ))
             })?;
             for row in rows {
-                let (id, path, uid, folder) = row?;
+                let (id, path, uid, folder, validity) = row?;
                 if let Some(p) = by_id.get_mut(&id)
                     && p.source_path.is_none()
                 {
                     p.source_path = Some(path);
                     p.source_uid = uid.map(|u| u as u32);
+                    p.source_validity = validity.map(|v| v as u32);
                     p.source_folder = Some(folder);
                 }
             }
@@ -1252,6 +1312,42 @@ impl Store {
             params![message_id, add, remove],
         )?;
         Ok(())
+    }
+
+    /// One server copy of a message deleted forever, confirmed expunged: its
+    /// placement goes, and the row is a tombstone again, as Delete forever
+    /// left it, in case recovery's re-fetch revived it meanwhile.
+    ///
+    /// Only that copy's placement. One row stands for every copy of a
+    /// message, a Sent copy and an inbox copy of one sent to yourself, and
+    /// the others' placements are the record of copies the server still
+    /// holds. Dropped with this one, the folder held a message fewer than the
+    /// server, the reconcile fetched the copy it was "missing", and the
+    /// message deleted forever was back (review r1, R1-5).
+    pub fn settle_expunged_copy(
+        &self,
+        message_id: i64,
+        account_id: i64,
+        folder_path: &str,
+    ) -> Result<()> {
+        let unit = self.atomic()?;
+        self.conn.execute(
+            "DELETE FROM placements
+             WHERE message_id = ?1
+               AND folder_id = (SELECT id FROM folders
+                                 WHERE account_id = ?2 AND path = ?3)",
+            params![message_id, account_id, folder_path],
+        )?;
+        self.conn.execute(
+            "UPDATE messages SET deleted_at_ms = (strftime('%s','now') * 1000)
+             WHERE id = ?1 AND deleted_at_ms IS NULL",
+            params![message_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM fts_content WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        unit.done()
     }
 
     /// Tombstones one message the way delete-forever does: out of search at

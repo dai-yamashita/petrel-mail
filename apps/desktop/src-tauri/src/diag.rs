@@ -177,6 +177,26 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
     base.join("Petrel")
 }
 
+/// Every line logged while the tests run, for the tests that check what the
+/// log may and may not say.
+///
+/// They read here rather than the file. A test run's data directory is
+/// wherever `PETREL_DATA_DIR` points, or, unset, a directory CI never creates,
+/// so every write failed and a test reading the file read nothing. On a
+/// developer's machine it would have been their own sync.log.
+#[cfg(test)]
+pub(crate) static TEST_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// What has been logged so far in this test run, one line per entry. Only the
+/// scripted-server tests read it.
+#[cfg(all(test, feature = "dev-plaintext-imap"))]
+pub(crate) fn test_log_text() -> String {
+    TEST_LOG
+        .lock()
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_default()
+}
+
 /// Appends a line to a log file in the data directory.
 ///
 /// Under LaunchServices — which is the only way the app gets real keyboard
@@ -185,6 +205,10 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
 /// worth printing during a sync is worth writing here.
 pub(crate) fn log_sync(msg: &str) {
     eprintln!("[sync] {msg}");
+    #[cfg(test)]
+    if let Ok(mut lines) = TEST_LOG.lock() {
+        lines.push(msg.to_string());
+    }
     let path = data_dir().join("sync.log");
     rotate_if_large(&path, LOG_LIMIT_BYTES);
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -227,6 +251,16 @@ enum Provider {
     Other,
 }
 
+/// Which of an account's two servers a failure came from, for advice that
+/// names the right one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Server {
+    /// IMAP, where mail is read.
+    Incoming,
+    /// SMTP, where it is sent from.
+    Outgoing,
+}
+
 /// Turns a protocol error into something a person can act on.
 ///
 /// The raw text is Rust's Debug rendering of an IMAP response — `code: None,
@@ -240,6 +274,13 @@ enum Provider {
 /// Google app password. Advice for the wrong provider is worse than none —
 /// it sends a person to fix something that was never broken.
 pub(crate) fn friendly_sync_error_for(host: &str, raw: &str) -> String {
+    friendly_error_for(Server::Incoming, host, raw)
+}
+
+/// `friendly_sync_error_for`, told which server failed. Onboarding and Sign
+/// in again test both, and the outgoing one was told to check whether the
+/// network blocks IMAP.
+pub(crate) fn friendly_error_for(server: Server, host: &str, raw: &str) -> String {
     let r = raw.to_ascii_uppercase();
     // Before the password's advice: refused at sign-in, these too read as a
     // refusal, but the password was right and the advice is not about it.
@@ -280,10 +321,29 @@ pub(crate) fn friendly_sync_error_for(host: &str, raw: &str) -> String {
     if r.contains("DNS") || r.contains("NAME OR SERVICE") || r.contains("RESOLVE") {
         return "That server name could not be looked up. Check the host.".into();
     }
-    if r.contains("CONNECTION REFUSED") || r.contains("TIMED OUT") || r.contains("TIMEOUT") {
-        return "The server did not answer. Check the host and port, and whether \
-                something on this network blocks IMAP."
-            .into();
+    // Windows words both differently: a refused port is "the target machine
+    // actively refused it" (os error 10061), and a silent one "the connected
+    // host has failed to respond" (10060). Matched by those words, or the
+    // advice was the system's sentence instead of what to check.
+    if r.contains("CONNECTION REFUSED")
+        || r.contains("ACTIVELY REFUSED")
+        || r.contains("TIMED OUT")
+        || r.contains("TIMEOUT")
+        || r.contains("FAILED TO RESPOND")
+    {
+        return match server {
+            Server::Incoming => {
+                "The server did not answer. Check the host and port, and whether \
+                 something on this network blocks IMAP."
+            }
+            // Sending is what networks block most: port 25 often, and some
+            // hotel and office networks every SMTP port.
+            Server::Outgoing => {
+                "The server did not answer. Check the host and port, and whether \
+                 something on this network blocks outgoing mail (SMTP)."
+            }
+        }
+        .into();
     }
     if r.contains("CERTIFICATE") || r.contains("TLS") || r.contains("HANDSHAKE") {
         return "The encrypted connection could not be established, so Petrel \
@@ -438,7 +498,8 @@ mod address_tests {
 #[cfg(test)]
 mod sync_error_tests {
     use super::{
-        friendly_sync_error_for, is_imap_parse_error, is_password_refusal, is_sign_in_refusal,
+        Server, friendly_error_for, friendly_sync_error_for, is_imap_parse_error,
+        is_password_refusal, is_sign_in_refusal,
     };
 
     /// Advice for the wrong provider is worse than none.
@@ -609,6 +670,29 @@ mod sync_error_tests {
         // than a reassuring guess.
         let odd = friendly_sync_error_for("imap.example.com", "something nobody has seen before");
         assert_eq!(odd, "something nobody has seen before");
+    }
+
+    /// A port nothing listens on, or a server that never answers, gets the
+    /// same advice on every system, in the system's own words for it. Windows
+    /// says neither "connection refused" nor "timed out", and its users were
+    /// shown the system's sentence instead.
+    #[test]
+    fn a_refused_or_silent_server_gets_advice_in_every_systems_words() {
+        for raw in [
+            "connect: Connection refused (os error 61)",
+            "connect: Connection refused (os error 111)",
+            "connect: No connection could be made because the target machine actively refused it. (os error 10061)",
+            "connect: Operation timed out (os error 60)",
+            "connect: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond. (os error 10060)",
+        ] {
+            let incoming = friendly_error_for(Server::Incoming, "mail.example.com", raw);
+            assert!(incoming.contains("blocks IMAP"), "{raw} → {incoming}");
+            let outgoing = friendly_error_for(Server::Outgoing, "mail.example.com", raw);
+            assert!(
+                outgoing.contains("outgoing mail (SMTP)"),
+                "{raw} → {outgoing}"
+            );
+        }
     }
 }
 

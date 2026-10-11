@@ -54,6 +54,20 @@ export function Onboarding({
     if (step.kind === 'ask') addressRef.current?.focus();
   }, [step.kind]);
 
+  // A sign-in belongs to the screen it was started from. Leaving that screen
+  // (Back, the manual form, or closing the dialog) abandons it, so a test
+  // that answers afterwards stores nothing. It used to add the account
+  // anyway: Back jumped on to "Getting your mail", and a closed dialog added
+  // it unseen, with its password in the keychain.
+  const attempt = useRef(0);
+  useEffect(
+    () => () => {
+      attempt.current += 1;
+      setTesting('idle');
+    },
+    [step.kind],
+  );
+
   const lookUp = async () => {
     const a = address.trim();
     if (!a.includes('@')) return;
@@ -98,6 +112,8 @@ export function Onboarding({
 
   /** Test, then store, then sync. Storing never happens without the test. */
   const signIn = async (setup: AccountSetup) => {
+    const mine = ++attempt.current;
+    const abandoned = () => attempt.current !== mine;
     setError(null);
     // One server at a time, each named while it runs. Some providers take
     // several seconds per login, and a single spinner over both reads as
@@ -105,16 +121,21 @@ export function Onboarding({
     try {
       setTesting('imap');
       await api.testAccount(setup, 'imap');
+      if (abandoned()) return;
       setTesting('smtp');
       await api.testAccount(setup, 'smtp');
+      if (abandoned()) return;
       setTesting('ok');
     } catch (e) {
+      if (abandoned()) return;
       // The command's message already says which server and why; an
       // "Error:" prefix from the bridge on top of "Could not sign in —" reads
       // as a stutter.
       setTesting(String(e).replace(/^Error:\s*/, ''));
       return;
     }
+    // From here the account is being stored, which takes a moment and is
+    // not taken back.
     try {
       const id = await api.addAccount(setup);
       setAdded({ id, email: setup.email });
@@ -157,10 +178,14 @@ export function Onboarding({
             <p className="onb-quiet">{t('onb-nothing-sent')}</p>
             {error && <p className="onb-error">{error}</p>}
             <div className="onb-acts">
+              {/* The address first, as Continue needs it: the manual form has
+                  no field for one, and without it the account was stored as
+                  the placeholder, you@example.com, and sent from it. */}
               <button
                 type="button"
                 className="linkish"
-                onClick={() => void goManual(address.trim() || 'you@example.com', null)}
+                disabled={!address.includes('@')}
+                onClick={() => void goManual(address.trim(), null)}
               >
                 {t('onb-manual')}
               </button>

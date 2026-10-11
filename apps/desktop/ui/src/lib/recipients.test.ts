@@ -62,6 +62,106 @@ describe('splitRecipients with quoted names', () => {
 
   it('does not lose the rest of the field to an unclosed quote', () => {
     expect(splitRecipients('"Dana <dana@example.com>')).toEqual(['"Dana <dana@example.com>']);
+    // A quote that never closes protects nothing: the separators after it
+    // still separate. It made one red chip of every recipient after it.
+    expect(splitRecipients('"Wu, Dana <dana@example.com>, alex@example.com')).toEqual([
+      '"Wu',
+      'Dana <dana@example.com>',
+      'alex@example.com',
+    ]);
+  });
+});
+
+describe('splitRecipients with an unclosed <', () => {
+  // Typed and never closed. Every recipient after it was swallowed into one
+  // red chip with it: removing the chip removed them too, and Send refused
+  // the lot (review r3, R3-5).
+  it('lets the recipients after it go free', () => {
+    expect(splitRecipients('Dana <dana@example.com, bob@example.com')).toEqual([
+      'Dana <dana@example.com',
+      'bob@example.com',
+    ]);
+  });
+
+  it('closes at the next >, not at one after another <', () => {
+    expect(splitRecipients('Dana <dana@example.com, Bob <bob@example.com>; cy@example.com')).toEqual([
+      'Dana <dana@example.com',
+      'Bob <bob@example.com>',
+      'cy@example.com',
+    ]);
+  });
+
+  it('still keeps what a closed one holds together', () => {
+    expect(splitRecipients('Dana <dana,wu@example.com>, Bob <bob@example.com')).toEqual([
+      'Dana <dana,wu@example.com>',
+      'Bob <bob@example.com',
+    ]);
+    expect(splitRecipients('Dana <"wu,dana"@example.com>, "Lee, Al <al@example.com>')).toEqual([
+      'Dana <"wu,dana"@example.com>',
+      '"Lee',
+      'Al <al@example.com>',
+    ]);
+  });
+
+  it('marks what it leaves unsendable, so nothing goes', () => {
+    expect(firstUnsendable({ to: 'Dana <dana@example.com, bob@example.com', cc: '' })).toBe(
+      'Dana <dana@example.com',
+    );
+  });
+});
+
+describe('splitRecipients with a pasted column', () => {
+  // A column copied from a spreadsheet, one address per line. It used to come
+  // out as one entry, which the field drew as a single red chip and Send
+  // refused as "Not an address".
+  it('makes one recipient of each line', () => {
+    expect(splitRecipients('ann@example.com\nbob@example.com\ncy@example.com\n')).toEqual([
+      'ann@example.com', 'bob@example.com', 'cy@example.com',
+    ]);
+  });
+
+  it('takes Windows line ends and blank lines in its stride', () => {
+    expect(splitRecipients('ann@example.com\r\n\r\nbob@example.com\r\n')).toEqual([
+      'ann@example.com', 'bob@example.com',
+    ]);
+  });
+
+  it('mixes lines with the separators people type', () => {
+    expect(splitRecipients('ann@example.com, bob@example.com\ncy@example.com; dee@example.com')).toEqual([
+      'ann@example.com', 'bob@example.com', 'cy@example.com', 'dee@example.com',
+    ]);
+  });
+
+  it('keeps a quoted name with a comma whole, a line of its own or not', () => {
+    expect(splitRecipients('"Wu, Dana" <dana@example.com>\nsam@example.com')).toEqual([
+      '"Wu, Dana" <dana@example.com>',
+      'sam@example.com',
+    ]);
+  });
+
+  it('never splits inside the angle brackets', () => {
+    expect(splitRecipients('Dana Wu <dana,wu@example.com>; sam@example.com')).toEqual([
+      'Dana Wu <dana,wu@example.com>',
+      'sam@example.com',
+    ]);
+  });
+
+  // The send path's own cases (send.rs, `split_recipients`): the chips on
+  // screen and the envelope have to agree on every one.
+  it('splits as the send path does', () => {
+    expect(splitRecipients('"Wu; Dana" <dana@example.com>; alex@example.com')).toEqual([
+      '"Wu; Dana" <dana@example.com>',
+      'alex@example.com',
+    ]);
+    expect(splitRecipients('Dana <"wu,dana"@example.com>, alex@example.com')).toEqual([
+      'Dana <"wu,dana"@example.com>',
+      'alex@example.com',
+    ]);
+    expect(splitRecipients('  ann@example.com ,, ;\n bob@example.com , ')).toEqual([
+      'ann@example.com',
+      'bob@example.com',
+    ]);
+    expect(splitRecipients('')).toEqual([]);
   });
 });
 
@@ -100,5 +200,9 @@ describe('firstUnsendable', () => {
     expect(firstUnsendable({ to: 'sam@example.com', cc: 'Dana Wu' })).toBe('Dana Wu');
     // A trailing comma is not an entry.
     expect(firstUnsendable({ to: 'sam@example.com,', cc: '' })).toBeNull();
+  });
+
+  it('lets a column of addresses go, one recipient a line', () => {
+    expect(firstUnsendable({ to: 'ann@example.com\nbob@example.com', cc: '', bcc: 'cy@example.com\n' })).toBeNull();
   });
 });

@@ -14,15 +14,16 @@ goes through a service in the middle.
 - Type your email address and Petrel works out the server settings. It knows 18
   providers by name, and falls back to looking them up.
 - Gmail and iCloud work with app passwords.
-- Servers that list their Sent and Junk folders without marking them as such still
-  get them used as Sent and Spam, so sent copies are filed and reporting spam has
+- Servers that list a top-level Sent or Junk folder without marking it as such still
+  get it used as Sent and Spam, so sent copies are filed and reporting spam has
   somewhere to go.
 - When a password stops working, Petrel asks you to sign in again rather than
   retrying every few minutes. An account's password and server settings can be
   changed in Settings.
 - Messages are grouped into conversations. On Gmail it uses Gmail's own conversation
   ids, so the grouping matches what you see in the web app.
-- New mail appears as it arrives. Petrel does not wait for a timer.
+- New mail appears as it arrives, on servers that offer IDLE, as nearly all do.
+  Others are checked every two minutes.
 - An All Mail mailbox lists every conversation outside Spam and Trash, as Gmail's
   does.
 
@@ -65,6 +66,7 @@ goes through a service in the middle.
 - A send that a crash interrupts is held for you to look at when Petrel comes back,
   never silently lost and never left stuck.
 - If you write "attached" and there is no attachment, Petrel says so before sending.
+  It knows the English words only.
 - Addresses complete as you type, based on who you write to most and most recently.
 
 ### Organising
@@ -94,8 +96,8 @@ goes through a service in the middle.
 
 - Keyboard shortcuts for everything, with a list you can search. Press ⌘K to run any
   command by name.
-- Notifications for new mail in every account, with a pause button for 30 minutes,
-  an hour, or until tomorrow. It silences Petrel only.
+- Notifications for new mail in every account, with a pause button for an hour or
+  until tomorrow. It silences Petrel only.
 - Import mbox files and `.eml` files. Export any folder to mbox.
 - Updates are signed, and only install when you ask. Petrel never checks on its own.
 - Works with a keyboard alone. Every control is labelled for a screen reader.
@@ -116,9 +118,11 @@ Worth knowing before you install:
 
 - macOS only.
 - Outlook.com and Microsoft 365 mailboxes need Microsoft's own sign-in, which Petrel
-  does not have yet. They cannot be added in this version.
-- Gmail and Microsoft 365 are reached over IMAP, not their own APIs. This works, but
-  Gmail prefers its API and may tighten IMAP access later.
+  does not have yet, so most of them cannot be used in this version. Petrel says so
+  when you add one, and lets you try a password, which some work accounts still
+  accept.
+- Gmail is reached over IMAP, not its own API. This works, but Gmail prefers its API
+  and may tighten IMAP access later.
 - Notifications have no buttons on them yet.
 
 ### Requirements

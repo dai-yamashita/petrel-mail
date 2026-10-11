@@ -40,7 +40,7 @@ by default.
 - Autodiscovery for 18 providers
 - Gmail and iCloud
 - Conversation threading
-- Instant arrival, no polling
+- Instant arrival on servers with IDLE, a two-minute check elsewhere
 
 **Reading**
 - HTML sandboxed. No scripts, no network.
@@ -54,7 +54,7 @@ by default.
 - Signatures
 - Drafts, local and server
 - Undo send
-- Missing-attachment warning
+- Missing-attachment warning (English words)
 
 **Organizing**
 - Search: `from:alice has:attachment before:2026-01-01`

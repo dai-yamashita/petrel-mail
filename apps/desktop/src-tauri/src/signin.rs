@@ -44,8 +44,9 @@ pub(crate) enum SignIn {
 pub(crate) struct Held {
     /// Drafts whose push is waiting.
     pub(crate) drafts: std::collections::BTreeSet<i64>,
-    /// Server copies still to remove, by folder path and UID.
-    pub(crate) drops: Vec<(String, u32)>,
+    /// Server copies still to remove, by folder path, UID and the
+    /// UIDVALIDITY the UID was learned under.
+    pub(crate) drops: Vec<crate::sync::drafts::ServerCopy>,
 }
 
 /// How long a refused account waits before asking the server again. An
@@ -180,7 +181,7 @@ impl AppState {
     }
 
     /// Server copies whose removal waits for the account to sign in.
-    pub(crate) fn hold_drops(&self, account: i64, copies: Vec<(String, u32)>) {
+    pub(crate) fn hold_drops(&self, account: i64, copies: Vec<crate::sync::drafts::ServerCopy>) {
         let mut all = self.held.lock().unwrap_or_else(|p| p.into_inner());
         let drops = &mut all.entry(account).or_default().drops;
         for copy in copies {

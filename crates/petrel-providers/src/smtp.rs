@@ -1173,7 +1173,10 @@ async fn starttls_stream(cfg: &SmtpConfig) -> std::result::Result<TlsStream, Ope
             stage: "starttls",
             detail: e.to_string(),
         })?;
-    crate::imap::tls_upgrade(&cfg.host, tcp)
+    // Under the connect deadline, as the implicit-TLS path on 465 is: a
+    // server that agreed to STARTTLS and then never answered the handshake
+    // left the send in Transmitting for good.
+    crate::imap::tls_upgrade(&cfg.host, tcp, connect_timeout())
         .await
         .map_err(|e| OpenError::Failed {
             stage: "starttls",
