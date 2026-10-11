@@ -152,6 +152,8 @@ on purpose.
 ## Security
 
 Your mail and your passwords are the two things worth attacking here. If you
-find a way at either, please report it privately rather than opening an issue:
-[SECURITY.md](SECURITY.md) explains how, what is in scope, and what stands
-between a stranger's message and your mail.
+find a way at either, please report it privately rather than opening an issue,
+through GitHub's
+[private vulnerability reporting](https://github.com/donth77/petrel-mail/security/advisories/new).
+[SECURITY.md](SECURITY.md) says what is in scope, and what stands between a
+stranger's message and your mail.
