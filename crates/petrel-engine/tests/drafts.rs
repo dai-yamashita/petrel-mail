@@ -336,6 +336,32 @@ mod outbox {
         s.schedule_send(id, Some(now_ms() - 86_400_000)).unwrap();
         assert_eq!(s.due_sends(account, now_ms()).unwrap().len(), 1);
     }
+
+    /// A search started in Drafts answers with what the Drafts list shows.
+    /// Post waiting to go was found there too, so the list said nothing and
+    /// the search beside it found the message (docs/24 #34).
+    #[test]
+    fn a_search_in_drafts_leaves_out_what_is_waiting_to_send() {
+        let (s, account) = store();
+        s.ensure_folder(account, "drafts", "Drafts").unwrap();
+        let id = s
+            .save_draft(account, None, "a@example.com", "Quarterly", "zebraword", "")
+            .unwrap();
+        let found = |q: &str| s.search_threads(q, 10).unwrap().len();
+        assert_eq!(
+            found("in:drafts zebraword"),
+            1,
+            "a draft is found in Drafts"
+        );
+
+        s.schedule_send(id, Some(now_ms() + 600_000)).unwrap();
+        assert_eq!(
+            found("in:drafts zebraword"),
+            listed(&s, "drafts").len(),
+            "the search agrees with the list"
+        );
+        assert_eq!(found("zebraword"), 1, "and is still found by its words");
+    }
 }
 
 /// A draft keeps both halves, because the one that sends it may have no editor.
@@ -720,6 +746,202 @@ fn drafts_list_sorts_by_sender_among_inbox_mail() {
         .unwrap();
     let names: Vec<&str> = rows.iter().map(|r| r.from_display.as_str()).collect();
     assert_eq!(names, ["Amy", "Ben", "Cam"]);
+}
+
+#[test]
+fn drafts_keep_their_sort_once_their_copies_come_back() {
+    // Drafts list message by message, keyed by `-id`. Once a draft's pushed
+    // copy has been fetched back, its row names a conversation, and the page
+    // was put back in order by that instead: no key matched it, so every
+    // sort came back newest first (docs/24 #14).
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("p.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    let drafts = store.ensure_folder(account, "drafts", "Drafts").unwrap();
+    let env = petrel_engine::store::DraftEnvelope::default();
+    for (uid, subject) in [(1u32, "Alpha"), (2, "Zeta")] {
+        let id = store
+            .save_draft_full(
+                account,
+                None,
+                "a@example.com",
+                "",
+                subject,
+                "words",
+                "",
+                &env,
+            )
+            .unwrap();
+        let mid = format!("draft-{uid}@petrel.test");
+        store.set_draft_msgid(id, &mid).unwrap();
+        let copy = format!(
+            "From: me@example.com\r\nTo: a@example.com\r\nSubject: {subject}\r\n\
+             Date: Tue, 18 Aug 2026 14:0{uid}:00 +0000\r\nMessage-ID: <{mid}>\r\n\
+             MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nwords\r\n"
+        );
+        store
+            .ingest_raw(&blobs, account, Some(drafts), Some(uid), copy.as_bytes())
+            .unwrap();
+        // Saved a moment apart, so oldest first has an answer.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let view = ListView::parse("drafts");
+    let listed = |key, ascending| -> Vec<String> {
+        store
+            .list_threads(&view, 0, 50, Sort { key, ascending })
+            .unwrap()
+            .into_iter()
+            .map(|r| r.subject)
+            .collect()
+    };
+    let rows = store.list_threads(&view, 0, 50, Sort::default()).unwrap();
+    assert!(
+        rows.iter().all(|r| r.thread_id > 0),
+        "the copies gave both drafts a conversation"
+    );
+    assert_eq!(
+        listed(SortKey::Date, false),
+        ["Zeta", "Alpha"],
+        "newest first"
+    );
+    assert_eq!(
+        listed(SortKey::Date, true),
+        ["Alpha", "Zeta"],
+        "oldest first"
+    );
+    assert_eq!(listed(SortKey::Subject, true), ["Alpha", "Zeta"], "A to Z");
+    assert_eq!(listed(SortKey::Subject, false), ["Zeta", "Alpha"], "Z to A");
+
+    // And a page at a time, the way the window asks.
+    let oldest = Sort {
+        key: SortKey::Date,
+        ascending: true,
+    };
+    let first = store.list_threads(&view, 0, 1, oldest).unwrap();
+    let next = store
+        .list_threads_after(&view, 1, oldest, first[0].date_ms, first[0].thread_id)
+        .unwrap();
+    assert_eq!(first[0].subject, "Alpha");
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].subject, "Zeta");
+}
+
+#[test]
+fn drafts_page_by_the_draft_both_ways_once_their_copies_come_back() {
+    // Review r2, R2-1, the other half of docs/24 #14. Once a draft's copy
+    // has come back it names its conversation, and two can name the same one:
+    // two answers to one message. The rows keep the conversation, because the
+    // marks act on it, so the window pages Drafts by what the walk keys them
+    // by instead: after `(date, -id)`. Every draft, once and in order, a page
+    // of one at a time, each sort both ways. Paged after the conversation,
+    // newest first gave the cursor's own row again.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("p.db")).unwrap();
+    let blobs = petrel_engine::blob::BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let account = store.ensure_test_account().unwrap();
+    let inbox = store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let drafts = store.ensure_folder(account, "drafts", "Drafts").unwrap();
+    store
+        .ingest_raw(
+            &blobs,
+            account,
+            Some(inbox),
+            Some(1),
+            b"From: Dana Wu <dana@example.com>\r\nTo: me@example.com\r\nSubject: Plans\r\n\
+              Date: Tue, 18 Aug 2026 13:00:00 +0000\r\nMessage-ID: <plans@example.com>\r\n\
+              MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nPlans?\r\n",
+        )
+        .unwrap();
+    // Two answers to it, and one of its own, each pushed and come back.
+    for (uid, subject, to, answers) in [
+        (1u32, "Re: Plans", "dana@example.com", true),
+        (2, "Re: Plans", "sam@example.com", true),
+        (3, "Lunch", "alex@example.com", false),
+    ] {
+        let parent = answers.then(|| "<plans@example.com>".to_string());
+        let env = petrel_engine::store::DraftEnvelope {
+            in_reply_to: parent.clone(),
+            references: parent.clone().into_iter().collect(),
+            ..Default::default()
+        };
+        let id = store
+            .save_draft_full(account, None, to, "", subject, "words", "", &env)
+            .unwrap();
+        let mid = format!("draft-{uid}@petrel.test");
+        store.set_draft_msgid(id, &mid).unwrap();
+        let threading = parent
+            .map(|p| format!("In-Reply-To: {p}\r\nReferences: {p}\r\n"))
+            .unwrap_or_default();
+        let copy = format!(
+            "From: me@example.com\r\nTo: {to}\r\nSubject: {subject}\r\n\
+             Date: Tue, 18 Aug 2026 14:0{uid}:00 +0000\r\nMessage-ID: <{mid}>\r\n{threading}\
+             MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nwords\r\n"
+        );
+        store
+            .ingest_raw(&blobs, account, Some(drafts), Some(uid), copy.as_bytes())
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // And one never pushed, with no conversation at all.
+    store
+        .save_draft(account, None, "priya@example.com", "Notes", "words", "")
+        .unwrap();
+
+    let view = ListView::parse("drafts");
+    let all = store.list_threads(&view, 0, 50, Sort::default()).unwrap();
+    assert_eq!(all.len(), 4, "{all:?}");
+    let answers: Vec<i64> = all
+        .iter()
+        .filter(|r| r.subject == "Re: Plans")
+        .map(|r| r.thread_id)
+        .collect();
+    assert!(
+        answers.len() == 2 && answers[0] > 0 && answers[0] == answers[1],
+        "the two answers share a conversation, so the conversation is no key: {answers:?}"
+    );
+
+    for key in [SortKey::Date, SortKey::Subject, SortKey::Sender] {
+        for ascending in [false, true] {
+            let sort = Sort { key, ascending };
+            let whole: Vec<i64> = store
+                .list_threads(&view, 0, 50, sort)
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            let mut paged = Vec::new();
+            let mut page = store.list_threads(&view, 0, 1, sort).unwrap();
+            while let Some(last) = page.pop() {
+                paged.push(last.id);
+                assert!(paged.len() <= whole.len(), "{sort:?} repeats: {paged:?}");
+                // What the window sends: the row's date and the draft's key,
+                // and by sender or subject what the row was listed under.
+                let shown = match key {
+                    SortKey::Date => None,
+                    SortKey::Sender => Some(last.sort_value.clone().unwrap_or_else(|| {
+                        if last.from_display.is_empty() {
+                            last.from_addr.clone()
+                        } else {
+                            last.from_display.clone()
+                        }
+                    })),
+                    SortKey::Subject => Some(last.sort_value.clone().unwrap_or(last.subject)),
+                };
+                page = store
+                    .list_threads_after_shown(
+                        &view,
+                        1,
+                        sort,
+                        last.date_ms,
+                        -last.id,
+                        shown.as_deref(),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(paged, whole, "{sort:?}");
+        }
+    }
 }
 
 #[test]

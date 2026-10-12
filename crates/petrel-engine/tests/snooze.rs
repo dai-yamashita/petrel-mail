@@ -120,3 +120,37 @@ fn a_snooze_is_never_queued_for_delivery() {
     assert!(store.pending_actions(account).unwrap().is_empty());
     assert!(!store.message_has_pending(ids[0]).unwrap());
 }
+
+/// Thrown away while it waits, a conversation is in the Trash and nowhere
+/// else. Snoozed listed and counted it until its time came, and the window
+/// brought the row back on every refresh (docs/24 #16). Starred and the tags
+/// already leave the bins out.
+#[test]
+fn a_snoozed_conversation_thrown_away_leaves_snoozed() {
+    let (store, account, ids) = seeded();
+    store.ensure_folder(account, "trash", "Trash").unwrap();
+    snooze(&store, account, ids[0], now_ms() + 60_000);
+    let tid = store.thread_of(ids[0]).unwrap().unwrap_or(-ids[0]);
+    store
+        .apply_thread_action(
+            account,
+            tid,
+            ActionKind::Trash,
+            None,
+            PlacementPolicy::Exclusive,
+        )
+        .unwrap();
+
+    // Listed, counted, and asked after by itself, as the window refreshes
+    // the row it has open.
+    let snoozed = (
+        subjects(&store, &ListView::Snoozed).len(),
+        store.conversations_in(&ListView::Snoozed).unwrap(),
+        store
+            .thread_in_view(&ListView::Snoozed, tid)
+            .unwrap()
+            .is_some(),
+    );
+    assert_eq!(snoozed, (0, 0, false), "Snoozed: listed, counted, found");
+    assert_eq!(subjects(&store, &ListView::parse("trash")), ["m0"]);
+}

@@ -13,6 +13,7 @@ import { TagMenu } from './TagMenu';
 import { FolderMenu } from './FolderMenu';
 import { NameDialog } from './NameDialog';
 import { acceptsDrop } from '../lib/dnd';
+import { followPress } from '../lib/press';
 import type { InsertPoint } from '../lib/useDrag';
 import {
   buildFolderTree,
@@ -21,6 +22,7 @@ import {
   nestableRolePaths,
   type FolderNode,
   nestableRolePath,
+  reportedDelimiter,
   underAnchor,
 } from '../lib/folders';
 import { MAILBOX_KEYS, MAILBOX_LOOK, defaultCount, type CountMode } from '../lib/mailboxes';
@@ -224,26 +226,19 @@ export function Rail({
   /** How this server nests, so a subfolder is joined to its parent with the
    *  character the server will read as nesting rather than as part of a name. */
   const delim = folderDelimiter(folders);
+  /** What nests when drawing: the delimiter the server reported, or both
+   *  separators until it has — the rule the engine acts on, so a folder drawn
+   *  inside the Trash is one Empty Trash empties. */
+  const nest = reportedDelimiter(folders);
   const askFolderName = (parent: string | null) => {
     setFolderParent(parent);
     setNamingDialog('folder');
   };
 
-  // Pointer drag, with the listeners on the window rather than the handle: a
-  // fast drag outruns a 6px target, and losing the pointer mid-resize leaves
-  // the rail stuck at whatever width the last event happened to land on.
-  const startDrag = (e: React.PointerEvent) => {
-    e.preventDefault();
-    const move = (ev: PointerEvent) => onResize(ev.clientX);
-    const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-      document.body.classList.remove('resizing');
-    };
-    document.body.classList.add('resizing');
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
-  };
+  // The same press as the list/reader divider's, by the same rule: a context
+  // click on the edge used to leave the rail resizing with the pointer until
+  // the next click. `followPress` says why.
+  const startDrag = (e: React.PointerEvent) => followPress(e, onResize);
 
   /* The hierarchy the paths already spell, drawn as one. A mailbox tree
      like Archive/Yearly/2023 is how people actually file, and a flat list
@@ -261,18 +256,21 @@ export function Rail({
   // gave, which is the order a drag rearranged; buildFolderTree keeps it.
   const own = folders.filter((x) => !x.role);
   const under = (f: (typeof own)[number], anchor: string | undefined) =>
-    underAnchor(f.path, anchor) && f.path !== anchor;
+    underAnchor(f.path, anchor, nest) && f.path !== anchor;
   // Every folder wearing the trash role, not only the first: an account with
   // both `Deleted Messages` and `Trash` marked as trash had everything binned
   // under `Trash/` drawn in Folders, under a "Trash" the tree made up.
   const trashPaths = nestableRolePaths(folders, 'trash');
-  const inTrash = (path: string) => trashPaths.some((a) => underAnchor(path, a));
+  const inTrash = (path: string) => trashPaths.some((a) => underAnchor(path, a, nest));
   const tree = buildFolderTree(
-    own.filter((f) => !underAnchor(f.path, archivePath) && !inTrash(f.path)),
+    own.filter((f) => !underAnchor(f.path, archivePath, nest) && !inTrash(f.path)),
+    0,
+    nest,
   );
   const archiveTree = buildFolderTree(
     own.filter((f) => under(f, archivePath)),
     archivePath?.length ?? 0,
+    nest,
   );
   // One subtree per trash anchor, each with its own prefix taken off, joined
   // under the one Trash row.
@@ -280,6 +278,7 @@ export function Rail({
     buildFolderTree(
       own.filter((f) => under(f, a)),
       a.length,
+      nest,
     ),
   );
   /* Every row with children starts folded, on every launch.
@@ -975,7 +974,7 @@ export function Rail({
             // would be drawn nowhere.
             setFolded((prev) => ({
               ...prev,
-              ...Object.fromEntries(folderAncestors(path).map((p) => [p, false])),
+              ...Object.fromEntries(folderAncestors(path, nest).map((p) => [p, false])),
             }));
             setReveal(`folder:${id}`);
           });

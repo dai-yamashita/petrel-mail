@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Thread } from './api';
+import { listsPerMessage } from './leaves-view';
 import { LIST_PAGE } from './list-page';
 import { wireSort, type Sort } from './sort';
 
@@ -19,6 +20,21 @@ export type ThreadFetchers = {
   threadInView?: (view: string, threadId: number) => Promise<Thread | null>;
 };
 
+/** What tells the window's rows apart, and what the engine's walk pages by:
+ *  the conversation, or in Drafts, where a row is a message, the message, as
+ *  `-id` (`listing.rs`).
+ *
+ *  A draft whose copy has come back from the server names its conversation,
+ *  and two can name the same one, a reply and a forward of one message say.
+ *  The row keeps it, because the marks act on the conversation
+ *  (`actsOnOneMessage`); the window keys by the draft. Keyed by the
+ *  conversation, the next page newest first began with the row the last one
+ *  ended on, and a draft sharing its conversation with one already loaded
+ *  was dropped as a repeat. */
+export function rowKey(view: string): (t: Thread) => number {
+  return listsPerMessage(view) ? (t) => -t.id : (t) => t.thread_id;
+}
+
 /** First listing page — offset zero, no keyset cursor. */
 export function firstPageCall(view: string, sort: Sort): Parameters<ThreadFetchers['threads']> {
   const wire = wireSort(sort);
@@ -35,7 +51,7 @@ export function firstPageCall(view: string, sort: Sort): Parameters<ThreadFetche
  *  page started from where it sorts now skipped the rows between. */
 export function loadMoreCall(view: string, sort: Sort, last: Thread): Parameters<ThreadFetchers['threads']> {
   const wire = wireSort(sort);
-  const at = [view, 0, LIST_PAGE, wire.key, wire.ascending, last.date_ms, last.thread_id] as const;
+  const at = [view, 0, LIST_PAGE, wire.key, wire.ascending, last.date_ms, rowKey(view)(last)] as const;
   if (sort.key === 'sender') return [...at, last.sort_value ?? (last.from_display || last.from_addr || '')];
   if (sort.key === 'subject') return [...at, last.sort_value ?? (last.subject || '')];
   return [...at];
@@ -62,22 +78,25 @@ export function replaceLoadHasMore(query: string, rowCount: number): boolean {
  *  whatever it now sorts by, for as long as it is open. Put after the page,
  *  the row being read went off the screen, J and K went on from there, and
  *  once its new date was written in, the next page was asked for after it.
- *  Further down than the first page, it is in the tail already, in order. */
+ *  Further down than the first page, it is in the tail already, in order.
+ *
+ *  `key` is what tells two rows apart (`rowKey`). */
 export function mergeHead(
   prev: Thread[],
   incoming: Thread[],
   order: { byDate: boolean; ascending: boolean } = { byDate: false, ascending: false },
   keep: number | null = null,
+  key: (t: Thread) => number = (t) => t.thread_id,
 ): Thread[] {
   if (incoming.length < LIST_PAGE) return incoming;
-  const covered = new Set(incoming.map((t) => t.thread_id));
+  const covered = new Set(incoming.map(key));
   const edge = incoming[incoming.length - 1].date_ms;
   const insidePage = (t: Thread) =>
     order.byDate && (order.ascending ? t.date_ms < edge : t.date_ms > edge);
   const at =
     keep == null || covered.has(keep) ? -1 : prev.findIndex((t) => t.thread_id === keep);
   const held = at >= 0 && (at < incoming.length || insidePage(prev[at])) ? prev[at] : undefined;
-  const rest = prev.filter((t) => t !== held && !covered.has(t.thread_id) && !insidePage(t));
+  const rest = prev.filter((t) => t !== held && !covered.has(key(t)) && !insidePage(t));
   const merged = [...incoming, ...rest];
   if (!held) return merged;
   // After the nearest row above it that this refresh left where it was.
@@ -127,12 +146,15 @@ export function renumbered(prev: Thread[], next: Thread[]): Map<number, number> 
   return moved;
 }
 
+/** Adds a page below the rows loaded, leaving out any row already there, by
+ *  `key` (`rowKey`). */
 export function appendPage(
   prev: Thread[],
   incoming: Thread[],
+  key: (t: Thread) => number = (t) => t.thread_id,
 ): { items: Thread[]; reachedEnd: boolean } {
-  const seen = new Set(prev.map((t) => t.thread_id));
-  const append = incoming.filter((t) => !seen.has(t.thread_id));
+  const seen = new Set(prev.map(key));
+  const append = incoming.filter((t) => !seen.has(key(t)));
   return { items: [...prev, ...append], reachedEnd: incoming.length < LIST_PAGE };
 }
 
@@ -232,6 +254,7 @@ export async function refreshHead(
         rows,
         { byDate: sort.key === 'date', ascending: sort.ascending },
         askAfter ? open : null,
+        rowKey(view),
       ),
     );
     // A full page leaves the next one where the last page left it; the rows
@@ -271,7 +294,7 @@ export async function pageMore(
   try {
     const rows = await fetchers.threads(...loadMoreCall(view, sort, last));
     if (!wanted()) return;
-    const { items: next, reachedEnd } = appendPage(sink.items(), rows);
+    const { items: next, reachedEnd } = appendPage(sink.items(), rows, rowKey(view));
     sink.setItems(next);
     if (rows.length > 0) sink.setPageEnd(rows[rows.length - 1]);
     if (reachedEnd) sink.setHasMore(false);

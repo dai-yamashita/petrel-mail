@@ -30,6 +30,10 @@
   color: var(--ink2);
   font-size: 13px;
   line-height: 1.5;
+  /* What a detail quotes can be one unbroken word wider than the card: the
+     look-alike question names a link's user name, whose length the sender
+     chooses, and it ran out over the window. */
+  overflow-wrap: anywhere;
 }
 
 .confirm-foot {

@@ -40,7 +40,7 @@ by default.
 - Autodiscovery for 18 providers
 - Gmail and iCloud
 - Conversation threading
-- Instant arrival, no polling
+- Instant arrival on servers with IDLE, a two-minute check elsewhere
 
 **Reading**
 - HTML sandboxed. No scripts, no network.
@@ -54,7 +54,7 @@ by default.
 - Signatures
 - Drafts, local and server
 - Undo send
-- Missing-attachment warning
+- Missing-attachment warning (English words)
 
 **Organizing**
 - Search: `from:alice has:attachment before:2026-01-01`
@@ -152,6 +152,8 @@ on purpose.
 ## Security
 
 Your mail and your passwords are the two things worth attacking here. If you
-find a way at either, please report it privately rather than opening an issue:
-[SECURITY.md](SECURITY.md) explains how, what is in scope, and what stands
-between a stranger's message and your mail.
+find a way at either, please report it privately rather than opening an issue,
+through GitHub's
+[private vulnerability reporting](https://github.com/donth77/petrel-mail/security/advisories/new).
+[SECURITY.md](SECURITY.md) says what is in scope, and what stands between a
+stranger's message and your mail.

@@ -423,7 +423,9 @@ fn page_walk(view: &ListView, account: i64) -> Option<PageWalk> {
                 "FROM messages INDEXED BY idx_messages_snoozed
                  WHERE deleted_at_ms IS NULL AND account_id = {account}
                    AND snoozed_until_ms IS NOT NULL
-                   AND snoozed_until_ms > (strftime('%s','now') * 1000)"
+                   AND snoozed_until_ms > (strftime('%s','now') * 1000)
+                   AND {binned}",
+                binned = not_binned("messages"),
             ),
             aliased: false,
         }),
@@ -962,7 +964,13 @@ impl Store {
         // accident became a list that ignored the sort it was given.
         let rank: std::collections::HashMap<i64, usize> =
             keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
-        out.sort_by_key(|r| rank.get(&r.thread_id).copied().unwrap_or(usize::MAX));
+        // In Drafts the key is the message, `-id`. A draft whose server copy
+        // has been fetched names a conversation, and ranked by that it matched
+        // no key, so every sort came back newest first (docs/24 #14).
+        out.sort_by_key(|r| {
+            let k = if per_message { -r.id } else { r.thread_id };
+            rank.get(&k).copied().unwrap_or(usize::MAX)
+        });
         Ok(out)
     }
 
@@ -1210,8 +1218,12 @@ impl Store {
             ListView::Snoozed => self.count_on_partial_index(
                 account,
                 "idx_messages_snoozed",
-                "snoozed_until_ms IS NOT NULL
-                 AND snoozed_until_ms > (strftime('%s','now') * 1000)",
+                &format!(
+                    "snoozed_until_ms IS NOT NULL
+                     AND snoozed_until_ms > (strftime('%s','now') * 1000)
+                     AND {binned}",
+                    binned = not_binned("messages"),
+                ),
                 total,
             )?,
             // What the Outbox lists (`outbox()`): messages, not conversations,

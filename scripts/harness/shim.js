@@ -574,7 +574,10 @@
           var bk = before[1];
           var at = -1;
           for (var i = 0; i < out.length; i += 1) {
-            if (out[i].date_ms === bd && out[i].thread_id === bk) {
+            // The engine's key for a row: the conversation, or in Drafts,
+            // which lists messages, the draft itself, as -id.
+            var key = view === 'drafts' ? -out[i].id : out[i].thread_id;
+            if (out[i].date_ms === bd && key === bk) {
               at = i;
               break;
             }

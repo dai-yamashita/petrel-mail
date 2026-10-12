@@ -24,11 +24,11 @@ pub fn popout_compose(draft_id: i64, app: tauri::AppHandle) -> Result<(), String
         return Ok(());
     }
 
-    WebviewWindowBuilder::new(
+    crate::without_link_preview(WebviewWindowBuilder::new(
         &app,
         &label,
         WebviewUrl::App(format!("index.html?compose={draft_id}").into()),
-    )
+    ))
     .title("Petrel")
     .inner_size(720.0, 620.0)
     .min_inner_size(420.0, 360.0)
@@ -57,11 +57,11 @@ pub fn popout_message(thread_id: i64, app: tauri::AppHandle) -> Result<(), Strin
         return Ok(());
     }
 
-    WebviewWindowBuilder::new(
+    crate::without_link_preview(WebviewWindowBuilder::new(
         &app,
         &label,
         WebviewUrl::App(format!("index.html?message={thread_id}").into()),
-    )
+    ))
     .title("Petrel")
     .inner_size(780.0, 700.0)
     .min_inner_size(420.0, 360.0)
@@ -144,4 +144,74 @@ pub fn set_dock_badge(count: Option<i64>, app: tauri::AppHandle) -> Result<(), S
     // shows.
     crate::diag::log_sync(&format!("dock badge: {shown:?}"));
     main.set_badge_count(shown).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every window turns WebKit's link previews off. One built without
+    /// `without_link_preview` would bring back the force click that opened a
+    /// message's link in the system's preview, past Petrel's link handling.
+    ///
+    /// Every way Tauri has of starting a window or a webview is looked for,
+    /// not only the one the app uses today: a window begun another way would
+    /// pass a check that knew only one spelling.
+    #[test]
+    fn every_window_is_built_without_link_previews() {
+        // Split so this file does not count as a builder of its own.
+        let builders = [
+            ["WebviewWindowBuilder", "::new("].concat(),
+            ["WebviewWindowBuilder", "::from_config("].concat(),
+            ["WebviewWindow", "::builder("].concat(),
+            ["WebviewBuilder", "::new("].concat(),
+            ["WebviewBuilder", "::from_config("].concat(),
+        ];
+        let mut files = Vec::new();
+        sources(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut found = 0;
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for builder in &builders {
+                for (at, _) in text.match_indices(builder.as_str()) {
+                    found += 1;
+                    let before = text[..at].trim_end().trim_end_matches("tauri::");
+                    assert!(
+                        before.ends_with("without_link_preview("),
+                        "{} starts a webview without without_link_preview",
+                        file.display()
+                    );
+                }
+            }
+        }
+        // The main window, the minimal one, print, source and both pop-outs.
+        assert!(found >= 6, "found only {found} window builders");
+
+        // A window named in the config is built by Tauri, never by this code,
+        // so it would keep link previews on whatever the code does.
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        let windows = &config["app"]["windows"];
+        assert!(
+            windows.is_null() || windows.as_array().is_some_and(|w| w.is_empty()),
+            "tauri.conf.json names windows, which are built without without_link_preview"
+        );
+    }
 }

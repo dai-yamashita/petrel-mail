@@ -3,7 +3,7 @@
 use crate::config::{
     forget_password, imap_config, imap_config_from_env, keychain_entry, remember_password,
 };
-use crate::diag::friendly_sync_error_for;
+use crate::diag::{Server, friendly_error_for};
 use crate::signin::SignIn;
 use crate::state::{AppState, note_ui_touch};
 use crate::sync::spawn_real_sync;
@@ -63,31 +63,27 @@ pub async fn test_account(setup: AccountSetup, which: Option<String>) -> Result<
 async fn test_account_inner(setup: AccountSetup, which: Option<String>) -> Result<(), String> {
     check_setup(&setup, which.as_deref())
         .await
-        .map_err(|f| f.as_typed())
+        .map_err(|f| f.for_a_person())
 }
 
 /// Which half of a connection test failed, and the server's own words.
 struct SetupFailure {
     half: &'static str,
+    /// Which server that is, so the advice names it.
+    server: Server,
     host: String,
     raw: String,
 }
 
 impl SetupFailure {
-    /// Which server, then its reason as it came: what the onboarding form
-    /// has always shown.
-    fn as_typed(&self) -> String {
-        format!("{} — {}", self.half, self.raw)
-    }
-
-    /// Which server, then what to do about it, for the "Sign in again"
-    /// form: the same plain advice the banner gives, which the person who
-    /// opened that form has usually just read.
+    /// Which server, then what to do about it: the same plain advice the
+    /// banner gives. Onboarding showed the reason as it came, and a wrong
+    /// password read "sign-in refused: code: None, info: Some(…)".
     fn for_a_person(&self) -> String {
         format!(
             "{} — {}",
             self.half,
-            friendly_sync_error_for(&self.host, &self.raw)
+            friendly_error_for(self.server, &self.host, &self.raw)
         )
     }
 }
@@ -106,7 +102,8 @@ async fn check_setup(setup: &AccountSetup, which: Option<&str>) -> Result<(), Se
         petrel_providers::imap::login_check(&imap)
             .await
             .map_err(|e| SetupFailure {
-                half: "Incoming (IMAP)",
+                half: crate::diag::advice("advice-half-imap"),
+                server: Server::Incoming,
                 host: setup.imap_host.clone(),
                 raw: e.to_string(),
             })?;
@@ -121,12 +118,94 @@ async fn check_setup(setup: &AccountSetup, which: Option<&str>) -> Result<(), Se
         petrel_providers::smtp::login_check(&smtp)
             .await
             .map_err(|e| SetupFailure {
-                half: "Outgoing (SMTP)",
+                half: crate::diag::advice("advice-half-smtp"),
+                server: Server::Outgoing,
                 host: setup.smtp_host.clone(),
                 raw: e.to_string(),
             })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod setup_wording_tests {
+    use super::{AccountSetup, test_account_inner};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// docs/25 #102. Onboarding showed a failed test in the library's words,
+    /// a wrong password as "sign-in refused: code: None, info: Some(…)". It
+    /// now says what to do, as Sign in again does. Here the port speaks IMAP
+    /// in the clear where the form asked for TLS, as 143 does, so the
+    /// handshake reads the greeting as a broken TLS record.
+    #[test]
+    fn a_failed_test_says_what_to_do_rather_than_what_the_library_saw() {
+        let said = tauri::async_runtime::block_on(async {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let _ = sock.write_all(b"* OK IMAP4rev1 ready\r\n").await;
+                    let _ = sock.read(&mut [0u8; 1024]).await;
+                }
+            });
+            let setup = AccountSetup {
+                email: "me@example.com".into(),
+                username: "me@example.com".into(),
+                password: "pw".into(),
+                imap_host: "127.0.0.1".into(),
+                imap_port: port,
+                smtp_host: "127.0.0.1".into(),
+                smtp_port: 587,
+                provider: String::new(),
+            };
+            test_account_inner(setup, Some("imap".into()))
+                .await
+                .unwrap_err()
+        });
+        println!("onboarding says: {said}");
+        assert!(said.starts_with("Incoming (IMAP) — "), "{said}");
+        assert!(
+            !said.contains("tls:") && !said.contains("InvalidContentType"),
+            "the library's words reached the form: {said}"
+        );
+    }
+
+    /// Review r2, R2-5. The outgoing half shared the incoming half's advice,
+    /// and a refused SMTP port was told to check whether the network blocks
+    /// IMAP. Networks that block one usually block sending: port 25 often,
+    /// and some hotel and office networks every SMTP port.
+    #[test]
+    fn a_refused_outgoing_port_is_told_about_sending() {
+        let said = tauri::async_runtime::block_on(async {
+            // A port nothing listens on: bound, then let go.
+            let port = {
+                let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let setup = AccountSetup {
+                email: "me@example.com".into(),
+                username: "me@example.com".into(),
+                password: "pw".into(),
+                imap_host: "127.0.0.1".into(),
+                imap_port: 993,
+                smtp_host: "127.0.0.1".into(),
+                smtp_port: port,
+                provider: String::new(),
+            };
+            test_account_inner(setup, Some("smtp".into()))
+                .await
+                .unwrap_err()
+        });
+        println!("onboarding says: {said}");
+        let (half, advice) = said.split_once(" — ").expect("which half, then the advice");
+        assert_eq!(half, "Outgoing (SMTP)");
+        assert!(
+            advice.contains("outgoing mail (SMTP)") && !advice.contains("IMAP"),
+            "{said}"
+        );
+    }
 }
 
 /// The servers half of a setup, as the account row stores it.

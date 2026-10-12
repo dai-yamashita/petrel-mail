@@ -157,6 +157,12 @@ pub struct PriorState {
     pub source_path: Option<String>,
     #[serde(default)]
     pub source_uid: Option<u32>,
+    /// The UIDVALIDITY `source_uid` was learned under. A folder the server
+    /// renumbered while the action waited has given that number to another
+    /// message, and the drain must not act on it. Defaulted: old queue rows
+    /// lack it.
+    #[serde(default)]
+    pub source_validity: Option<u32>,
     /// The folder `source_uid` belongs to, so undo can put the placement back
     /// with its UID rather than without one. A placement without its UID
     /// cannot take a flag change from the server and is never pruned when

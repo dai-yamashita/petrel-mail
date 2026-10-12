@@ -6,6 +6,11 @@ import { App } from './App';
 import { ComposeWindow } from './ComposeWindow';
 import { MessageWindow } from './MessageWindow';
 import { SettingsProvider } from './lib/settings';
+import { limitNativeMenu } from './lib/native-menu';
+
+// Every window, the pop-outs included: each would otherwise offer WebKit's
+// lone Reload over its controls, which restarts the window.
+limitNativeMenu();
 
 // A popped-out window is the same bundle with one query parameter, not a second
 // app. Both still want the settings provider — theme, accent and reading size

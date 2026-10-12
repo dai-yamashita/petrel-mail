@@ -651,3 +651,140 @@ fn bench_search_grammar() {
         );
     }
 }
+
+/// Mail arriving, and server copies matched by Message-ID, at scale.
+///
+/// Every arrival first asks whether its bytes are stored already, and every
+/// server copy known only by its Message-ID asks which row carries that id:
+/// the All Mail walk's strides, the Gmail label sweep, a renumbered folder.
+/// The benches above build their stores with `insert_messages`, which asks
+/// neither, so when both lookups started reading the whole account nothing
+/// here noticed (docs/26 #169). At 25,000 messages, claiming 300 server copies
+/// took 1.5 seconds, with the store locked throughout, where an index answers
+/// in under a millisecond.
+///
+/// The bulk of the mailbox is inserted as above, into one account. A stride's
+/// worth of mail then arrives in it through `ingest_raw`, arrives again the
+/// way a refetch does, and is claimed the way the All Mail walk claims a
+/// stride. A second account, empty, takes the same steps alongside: it shares
+/// every table, so what tells the two apart is only what is read per account.
+///
+/// **The budgets.** The walk claims a stride under the store's lock, and
+/// every click in the window waits behind it, so the claim is held to 50ms.
+/// It measured about 1ms at ten thousand messages and at a hundred thousand,
+/// and 1.2 seconds at ten thousand while the lookups read the account. A
+/// refetch stores nothing new, and has to cost about what it costs in the
+/// empty account: twice, plus a quarter of a millisecond for the noise in a
+/// number this small. Reading the account cost three times that at ten
+/// thousand messages, and more the bigger it grew.
+///
+/// An arrival is printed, and held to nothing. It asks what a refetch asks,
+/// then writes its blob and waits for the disk to say the blob is down, and
+/// that wait is most of its time: about 5ms with the lookup by index, and
+/// about 7ms while it read the account. A budget on it measures the disk,
+/// not the lookup: 25ms passed with the lookup reading the account as well
+/// as with the fix (docs/26 review r2, R2-6). The refetch is the same lookup
+/// without the write.
+///
+/// `cargo test --release -p petrel-engine --test store_spike -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_ingest_and_claim() {
+    use petrel_engine::blob::BlobStore;
+    use std::time::Instant;
+
+    let n: usize = std::env::var("PETREL_BENCH_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("bench.db")).unwrap();
+    let blobs = BlobStore::open(&dir.path().join("blobs")).unwrap();
+    let full = store.ensure_test_account().unwrap();
+    let empty = store.ensure_test_account().unwrap();
+    let inbox = |store: &Store, account| store.ensure_folder(account, "inbox", "INBOX").unwrap();
+    let folders = [(full, inbox(&store, full)), (empty, inbox(&store, empty))];
+
+    let mut generator = MailboxGen::new(42, n);
+    loop {
+        let batch: Vec<NewMessage> = generator
+            .by_ref()
+            .take(1000)
+            .map(|g| to_new(full, g))
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        store.insert_messages(&batch).unwrap();
+    }
+
+    // What the All Mail walk lists and claims at a time. Each account gets
+    // messages of its own: the same bytes twice would find the blob the
+    // other one wrote.
+    const STRIDE: usize = 500;
+    let arriving: Vec<[Vec<u8>; 2]> = MailboxGen::new(7, STRIDE)
+        .enumerate()
+        .map(|(i, g)| [g.to_rfc822(i), g.to_rfc822(STRIDE + i)])
+        .collect();
+    println!("--- ingest and claim bench: {n} messages, a stride of {STRIDE} ---");
+
+    // Interleaved, so whatever the machine is doing meanwhile falls on both.
+    let mut ingest = |label: &str, new: bool| {
+        let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        for (i, pair) in arriving.iter().enumerate() {
+            for (k, (account, folder)) in folders.iter().enumerate() {
+                let t = Instant::now();
+                let got = store
+                    .ingest_raw(
+                        &blobs,
+                        *account,
+                        Some(*folder),
+                        Some(i as u32 + 1),
+                        &pair[k],
+                    )
+                    .unwrap();
+                times[k].push(t.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(got.was_new, new, "{label}: message {i}");
+            }
+        }
+        let [in_full, in_empty] = times.map(|mut t| {
+            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (t[STRIDE / 2], t[STRIDE * 95 / 100])
+        });
+        println!(
+            "{label:<8} p50 {:7.2}ms  p95 {:7.2}ms  (an empty account: p50 {:7.2}ms  p95 {:7.2}ms)",
+            in_full.0, in_full.1, in_empty.0, in_empty.1
+        );
+        (in_full.0, in_empty.0)
+    };
+    ingest("arrival", true);
+    let (refetch, refetch_empty) = ingest("refetch", false);
+
+    let listed: Vec<(u32, Option<String>)> = (0..STRIDE)
+        .map(|i| (i as u32 + 1, Some(format!("demo-{i}@petrel.example"))))
+        .collect();
+    let mut times: Vec<f64> = (0..5)
+        .map(|_| {
+            let t = Instant::now();
+            let claims = store.claims_by_message_id(full, &listed).unwrap();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            assert!(
+                claims.iter().all(|(_, row)| row.is_some()),
+                "every listed copy is a message the account holds"
+            );
+            ms
+        })
+        .collect();
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let claim = times[2];
+    println!("claim    a stride of {STRIDE}: {claim:.2}ms (median of 5)");
+
+    assert!(
+        claim < 50.0,
+        "claiming a stride held the store for {claim:.2}ms >= 50ms"
+    );
+    assert!(
+        refetch <= refetch_empty * 2.0 + 0.25,
+        "a refetch took {refetch:.2}ms where an empty account takes {refetch_empty:.2}ms"
+    );
+}

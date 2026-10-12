@@ -36,6 +36,11 @@ pub enum ImapError {
     /// no other failure is.
     #[error("sign-in refused: {0}")]
     SignInRefused(String),
+    /// The folder a stored UID belongs to has been renumbered since that UID
+    /// was learned (`select_numbered`). Nothing was done: the number now
+    /// names some other message, or none.
+    #[error("the folder was renumbered (UIDVALIDITY {expected} is now {now}); nothing was done")]
+    Renumbered { expected: u32, now: u32 },
 }
 
 impl ImapError {
@@ -44,6 +49,13 @@ impl ImapError {
     /// included.
     pub fn is_sign_in_refused(&self) -> bool {
         matches!(self, ImapError::SignInRefused(_))
+    }
+
+    /// Whether a command by UID was refused because the folder has been
+    /// renumbered since the UID was learned: a reason to learn it again, not
+    /// to retry it as it stands.
+    pub fn is_renumbered(&self) -> bool {
+        matches!(self, ImapError::Renumbered { .. })
     }
 }
 
@@ -225,7 +237,7 @@ fn tls_config() -> Arc<ClientConfig> {
 
 async fn tls_stream(host: &str, port: u16) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let tcp = connect_tcp(host, port).await?;
-    tls_upgrade(host, tcp).await
+    tls_upgrade(host, tcp, connect_timeout()).await
 }
 
 /// Opens the socket a connection runs on.
@@ -261,16 +273,28 @@ async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream> {
 /// the submission port. One function for both, because an upgrade that
 /// validated certificates less strictly than the implicit path would be a
 /// downgrade with extra steps.
+///
+/// `limit` bounds the handshake, and the caller passes its connect deadline.
+/// The read deadline is wrapped round the socket only after this returns, so
+/// a peer that took the connection and never answered the ClientHello — a
+/// wedged proxy, a TLS front end with no back end, a captive portal — held
+/// the sync, the drain (whose guard every account shares) and a send for as
+/// long as the process lived. TCP keepalive does not end it: the peer is
+/// alive, only silent.
 pub(crate) async fn tls_upgrade(
     host: &str,
     tcp: TcpStream,
+    limit: Duration,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let connector = TlsConnector::from(tls_config());
     let name = ServerName::try_from(host.to_string()).map_err(|e| ImapError::Tls(e.to_string()))?;
-    connector
-        .connect(name, tcp)
-        .await
-        .map_err(|e| ImapError::Tls(e.to_string()))
+    match tokio::time::timeout(limit, connector.connect(name, tcp)).await {
+        Ok(handshake) => handshake.map_err(|e| ImapError::Tls(e.to_string())),
+        Err(_) => Err(ImapError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("the TLS handshake timed out after {}s", limit.as_secs()),
+        ))),
+    }
 }
 
 /// How long a connect may take before the host is called unreachable.
@@ -1676,7 +1700,15 @@ fn attr_flags<'a>(attrs: &'a [AttributeValue<'a>]) -> impl Iterator<Item = Flag<
         .map(|f| Flag::from(f.as_ref()))
 }
 
-/// Gmail's labels on a FETCH item.
+/// Gmail's labels on a FETCH item, as a person reads them.
+///
+/// A label travels the way a mailbox name does — modified UTF-7 inside a
+/// quoted string whose escapes the parser leaves in — so `R&D` arrives as
+/// `R&-D`, `Ärger` as `&AMQ-rger` and `say "hi"` with its backslashes. Read
+/// raw, none of them matched the tag of that name, and the sweep removed the
+/// tag from every message it swept: every Japanese, Chinese or Korean tag on
+/// a Gmail account, minutes after it was applied. System labels (`\Inbox`)
+/// pass through unchanged.
 fn attr_labels(attrs: &[AttributeValue<'_>]) -> Vec<String> {
     attrs
         .iter()
@@ -1685,7 +1717,7 @@ fn attr_labels(attrs: &[AttributeValue<'_>]) -> Vec<String> {
             _ => None,
         })
         .flatten()
-        .map(|l| l.to_string())
+        .map(|l| display_name(l))
         .collect()
 }
 
@@ -2110,15 +2142,19 @@ where
         })
         .unwrap_or(false);
 
+    // HIGHESTMODSEQ is a status item only CONDSTORE defines (RFC 7162). A
+    // server without it may refuse a STATUS that names it, and a strict one
+    // answers BAD: every folder failed, every cycle, and nothing synced.
+    // GreenMail is one such server.
+    let items = if condstore {
+        "(MESSAGES UIDNEXT UIDVALIDITY HIGHESTMODSEQ)"
+    } else {
+        "(MESSAGES UIDNEXT UIDVALIDITY)"
+    };
+
     let mut out = Vec::with_capacity(passes.len());
     for (index, pass) in passes.iter().enumerate() {
-        let status = match session
-            .status(
-                wire_name(&pass.path),
-                "(MESSAGES UIDNEXT UIDVALIDITY HIGHESTMODSEQ)",
-            )
-            .await
-        {
+        let status = match session.status(wire_name(&pass.path), items).await {
             Ok(s) => s,
             Err(e) => {
                 let e: ImapError = e.into();
@@ -2729,20 +2765,49 @@ where
     Ok(n)
 }
 
+/// Opens the folder a stored UID belongs to, for a command that acts on it.
+///
+/// A UID names a message only under the UIDVALIDITY it was learned with
+/// (RFC 3501 §2.3.1.1). A change queued while the account could not reach
+/// the server carries the number it had then, and a server that renumbered
+/// the folder meanwhile has given that number to another message: the
+/// archive moved that one, and Delete forever erased it. So the numbering
+/// is compared first, and a folder renumbered since is refused with nothing
+/// done, until the number is learned again. A caller that never knew the
+/// validity, or a server that does not say it, cannot be checked, as before.
+async fn select_numbered<S>(
+    session: &mut Session<S>,
+    folder: &str,
+    validity: Option<u32>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    let mailbox = session.select(wire_name(folder)).await?;
+    match (validity, mailbox.uid_validity) {
+        (Some(expected), Some(now)) if expected != now => {
+            Err(ImapError::Renumbered { expected, now })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Applies a flag change to one message, by UID.
 ///
 /// `add` decides between +FLAGS and -FLAGS. Silent (.SILENT) because we already
 /// know what we asked for and do not want the server echoing every flag back
-/// for every message in a drain.
+/// for every message in a drain. `validity` is the UIDVALIDITY `uid` was
+/// learned under; see `select_numbered`.
 pub async fn store_flag(
     cfg: &ImapConfig,
     folder: &str,
     uid: u32,
+    validity: Option<u32>,
     flag: &str,
     add: bool,
 ) -> Result<()> {
     let client = Client::new(connect(cfg).await?);
-    store_flag_session(client, cfg, folder, uid, flag, add).await
+    store_flag_session(client, cfg, folder, uid, validity, flag, add).await
 }
 
 async fn store_flag_session<S>(
@@ -2750,6 +2815,7 @@ async fn store_flag_session<S>(
     cfg: &ImapConfig,
     folder: &str,
     uid: u32,
+    validity: Option<u32>,
     flag: &str,
     add: bool,
 ) -> Result<()>
@@ -2757,7 +2823,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
     let mut session = sign_in(client, cfg).await?;
-    session.select(wire_name(folder)).await?;
+    select_numbered(&mut session, folder, validity).await?;
     let op = if add {
         "+FLAGS.SILENT"
     } else {
@@ -2778,11 +2844,13 @@ where
 /// what the drain now asks for.
 pub const STORE_FLAG_BATCH: usize = 100;
 
-/// Same as [`store_flag`], for many UIDs on one connection.
+/// Same as [`store_flag`], for many UIDs on one connection, all learned
+/// under the one `validity`.
 pub async fn store_flags(
     cfg: &ImapConfig,
     folder: &str,
     uids: &[u32],
+    validity: Option<u32>,
     flag: &str,
     add: bool,
 ) -> Result<()> {
@@ -2790,10 +2858,10 @@ pub async fn store_flags(
         return Ok(());
     }
     if uids.len() == 1 {
-        return store_flag(cfg, folder, uids[0], flag, add).await;
+        return store_flag(cfg, folder, uids[0], validity, flag, add).await;
     }
     let client = Client::new(connect(cfg).await?);
-    store_flags_session(client, cfg, folder, uids, flag, add).await
+    store_flags_session(client, cfg, folder, uids, validity, flag, add).await
 }
 
 async fn store_flags_session<S>(
@@ -2801,6 +2869,7 @@ async fn store_flags_session<S>(
     cfg: &ImapConfig,
     folder: &str,
     uids: &[u32],
+    validity: Option<u32>,
     flag: &str,
     add: bool,
 ) -> Result<()>
@@ -2808,7 +2877,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
     let mut session = sign_in(client, cfg).await?;
-    session.select(wire_name(folder)).await?;
+    select_numbered(&mut session, folder, validity).await?;
     let op = if add {
         "+FLAGS.SILENT"
     } else {
@@ -2843,16 +2912,18 @@ fn quote_imap(value: &str) -> String {
 /// `X-GM-LABELS` is Gmail's own extension and the only way to write a label
 /// over IMAP: a label is not a flag and not a folder, so neither `STORE FLAGS`
 /// nor a copy would express it. On any other server this does not exist, which
-/// is why the caller decides whether to call it.
+/// is why the caller decides whether to call it. `validity` as for
+/// [`store_flag`].
 pub async fn store_gmail_labels(
     cfg: &ImapConfig,
     folder: &str,
     uid: u32,
+    validity: Option<u32>,
     label: &str,
     add: bool,
 ) -> Result<()> {
     let client = Client::new(connect(cfg).await?);
-    store_labels_session(client, cfg, folder, uid, label, add).await
+    store_labels_session(client, cfg, folder, uid, validity, label, add).await
 }
 
 async fn store_labels_session<S>(
@@ -2860,6 +2931,7 @@ async fn store_labels_session<S>(
     cfg: &ImapConfig,
     folder: &str,
     uid: u32,
+    validity: Option<u32>,
     label: &str,
     add: bool,
 ) -> Result<()>
@@ -2867,11 +2939,17 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
     let mut session = sign_in(client, cfg).await?;
-    session.select(wire_name(folder)).await?;
+    select_numbered(&mut session, folder, validity).await?;
     let op = if add { "+X-GM-LABELS" } else { "-X-GM-LABELS" };
     {
+        // In the label's wire form, as `attr_labels` reads it back: raw, a
+        // non-ASCII tag went out as 8-bit bytes in a quoted string, and `&`
+        // as the start of a shift sequence.
         let mut updates = session
-            .uid_store(uid.to_string(), format!("{op} ({})", quote_imap(label)))
+            .uid_store(
+                uid.to_string(),
+                format!("{op} ({})", quote_imap(&wire_name(label))),
+            )
             .await?;
         while updates.next().await.is_some() {}
     }
@@ -2923,14 +3001,18 @@ where
 /// job, and a great deal better than taking unrelated mail with it. Petrel
 /// does not hide a message for its \Deleted flag, so until then a sync can
 /// bring it back. The caller is told which happened.
+///
+/// `validity` is the UIDVALIDITY `uid` was learned under. Nothing is erased
+/// in a folder renumbered since: see `select_numbered`.
 pub async fn expunge_uid(
     cfg: &ImapConfig,
     folder: &str,
     uid: u32,
+    validity: Option<u32>,
     server_has_uidplus: bool,
 ) -> Result<bool> {
     let client = Client::new(connect(cfg).await?);
-    expunge_uid_session(client, cfg, folder, uid, server_has_uidplus).await
+    expunge_uid_session(client, cfg, folder, uid, validity, server_has_uidplus).await
 }
 
 async fn expunge_uid_session<S>(
@@ -2938,6 +3020,7 @@ async fn expunge_uid_session<S>(
     cfg: &ImapConfig,
     folder: &str,
     uid: u32,
+    validity: Option<u32>,
     server_has_uidplus: bool,
 ) -> Result<bool>
 where
@@ -2945,7 +3028,7 @@ where
 {
     let mut session = sign_in(client, cfg).await?;
     let (_, server_has_uidplus) = confirm_move_caps(&mut session, true, server_has_uidplus).await;
-    session.select(wire_name(folder)).await?;
+    select_numbered(&mut session, folder, validity).await?;
     {
         let mut updates = session
             .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
@@ -3147,10 +3230,15 @@ pub struct Stored<'a> {
 /// mailbox, other clients' included. Without UIDPLUS the source copy is
 /// marked \Deleted and left for the server's next compaction, as
 /// `expunge_uid` does, and the caller is told so (`Ok(false)`).
+///
+/// `validity` is the UIDVALIDITY `uid` was learned under in `from`. Nothing
+/// moves out of a folder renumbered since: see `select_numbered`.
+#[allow(clippy::too_many_arguments)]
 pub async fn move_uid(
     cfg: &ImapConfig,
     from: &str,
     uid: u32,
+    validity: Option<u32>,
     to: &str,
     server_has_move: bool,
     server_has_uidplus: bool,
@@ -3162,6 +3250,7 @@ pub async fn move_uid(
         cfg,
         from,
         uid,
+        validity,
         to,
         server_has_move,
         server_has_uidplus,
@@ -3176,6 +3265,7 @@ async fn move_uid_session<S>(
     cfg: &ImapConfig,
     from: &str,
     uid: u32,
+    validity: Option<u32>,
     to: &str,
     server_has_move: bool,
     server_has_uidplus: bool,
@@ -3188,7 +3278,7 @@ where
     let (server_has_move, server_has_uidplus) =
         confirm_move_caps(&mut session, server_has_move, server_has_uidplus).await;
     if server_has_move {
-        session.select(wire_name(from)).await?;
+        select_numbered(&mut session, from, validity).await?;
         session.uid_mv(uid.to_string(), wire_name(to)).await?;
         sign_out(&mut session).await?;
         return Ok(true);
@@ -3218,7 +3308,7 @@ where
             match exact_message_id_hits(&mut session, stored.message_id).await {
                 Ok(hits) if hits.is_empty() => false,
                 Ok(hits) => {
-                    session.select(wire_name(from)).await?;
+                    select_numbered(&mut session, from, validity).await?;
                     in_source = true;
                     match source_copy(&mut session, uid).await {
                         Ok(Some(source)) => hits
@@ -3237,7 +3327,7 @@ where
         None => false,
     };
     if !in_source {
-        session.select(wire_name(from)).await?;
+        select_numbered(&mut session, from, validity).await?;
     }
     if !already_there {
         session.uid_copy(uid.to_string(), wire_name(to)).await?;
@@ -3498,12 +3588,30 @@ const SEARCH_RANGE: u32 = 50_000;
 /// Every UID the folder currently holds — the ground truth a placement sweep
 /// compares against.
 pub async fn uids_in_folder(cfg: &ImapConfig, folder: &str) -> Result<Vec<u32>> {
+    Ok(folder_uids(cfg, folder).await?.uids)
+}
+
+/// A folder's UIDs, and the numbering they belong to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderUids {
+    pub uids: Vec<u32>,
+    /// The UIDVALIDITY the SELECT reported. UIDs mean something only under
+    /// the numbering they were read in: compared with UIDs stored under
+    /// another, every one of them looks missing.
+    pub uid_validity: Option<u32>,
+}
+
+/// `uids_in_folder`, with the UIDVALIDITY they are numbered under.
+pub async fn folder_uids(cfg: &ImapConfig, folder: &str) -> Result<FolderUids> {
     let client = Client::new(connect(cfg).await?);
     let mut session = sign_in(client, cfg).await?;
     let mailbox = session.select(wire_name(folder)).await?;
-    let found = uids_below(&mut session, mailbox.uid_next).await?;
+    let uids = uids_below(&mut session, mailbox.uid_next).await?;
     sign_out(&mut session).await?;
-    Ok(found)
+    Ok(FolderUids {
+        uids,
+        uid_validity: mailbox.uid_validity,
+    })
 }
 
 /// Every UID in the selected mailbox, bounded by what the search covered.

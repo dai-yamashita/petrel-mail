@@ -53,8 +53,13 @@ type Props = {
   open: boolean;
   /** True on Gmail, where what IMAP calls folders are labels. */
   labelsNotFolders?: boolean;
-  /** Move is a single choice that closes; tag is a set you toggle. */
-  mode: 'folder' | 'tag' | 'snooze';
+  /** Folder mode: the delimiter the server reported, so a row's name and
+   *  what a fold hides follow the tree the rows were drawn from. */
+  delim?: string;
+  /** Move is a single choice that closes; tag is a set you toggle. Snooze and
+   *  Send later are a choice of times, for a conversation or for the message
+   *  being written. */
+  mode: 'folder' | 'tag' | 'snooze' | 'send-later';
   options: PickerOption[];
   subject: string | null;
   onClose: () => void;
@@ -86,12 +91,13 @@ function glyphOf(o: { anchor?: 'archive' | 'trash'; icon?: LucideIcon }) {
  * that does not exist yet" is the same intent as "file this", and making it a
  * different gesture is what pushes people back to the mouse.
  */
-export function Picker({ open, mode, options, subject, onClose, onChoose, onCreate , labelsNotFolders }: Props) {
+export function Picker({ open, mode, options, subject, onClose, onChoose, onCreate , labelsNotFolders, delim }: Props) {
   const [query, setQuery] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
 
   // A picker that remembers last time's filter is a picker that shows you the
-  // wrong list the moment you open it again.
+  // wrong list the moment you open it again. The field reads `query` too (see
+  // the provider below), so clearing it clears the words on screen as well.
   useEffect(() => {
     if (open) setQuery('');
   }, [open]);
@@ -119,7 +125,7 @@ export function Picker({ open, mode, options, subject, onClose, onChoose, onCrea
       .sort((a, b) => scoreMatch(b.hits, b.o.label) - scoreMatch(a.hits, a.o.label));
   }, [options, query]);
   const browsing = query.trim().length === 0;
-  const fold = useFolderFold(options);
+  const fold = useFolderFold(options, delim);
   // Folding only means anything while the tree is on screen. A search is
   // already a filter, and hiding matches inside a folded parent would drop
   // rows that matched for a reason that is no longer visible.
@@ -128,9 +134,9 @@ export function Picker({ open, mode, options, subject, onClose, onChoose, onCrea
   // Offer creation only when the text is not already a name in the list —
   // otherwise the last row invites you to make a duplicate of what you can see.
   const typed = query.trim();
-  // Snooze offers fixed times; there is nothing to create.
+  // Snooze and Send later offer fixed times; there is nothing to create.
   const canCreate =
-    mode !== 'snooze' &&
+    (mode === 'folder' || mode === 'tag') &&
     typed.length > 0 &&
     !options.some((o) => o.label.toLowerCase() === typed.toLowerCase());
 
@@ -140,8 +146,17 @@ export function Picker({ open, mode, options, subject, onClose, onChoose, onCrea
       onClose={onClose}
       backdrop={<div className="palette-backdrop" />}
       className="picker"
+      // Send later borrows Snooze's times, and used to borrow its words too:
+      // a dialog titled Snooze, offering to "bring this back", over a message
+      // being scheduled.
       aria-label={t(
-        mode === 'folder' ? 'picker-folder-title' : mode === 'tag' ? 'picker-tag-title' : 'picker-snooze-title',
+        mode === 'folder'
+          ? 'picker-folder-title'
+          : mode === 'tag'
+            ? 'picker-tag-title'
+            : mode === 'send-later'
+              ? 'picker-send-later-title'
+              : 'picker-snooze-title',
       )}
     >
       {/* `open` is pinned, exactly as the palette pins it. Left to itself the
@@ -150,8 +165,15 @@ export function Picker({ open, mode, options, subject, onClose, onChoose, onCrea
           does in Chromium — so the list stayed `display: none`: four tag rows
           in the DOM, none of them drawn, a dialog with a search box and nothing
           to search. The list is the whole point of this dialog; it is never
-          closed while the dialog is. */}
-      <ComboboxProvider open setValue={setQuery} resetValueOnHide>
+          closed while the dialog is.
+
+          Which is also why the field's text is ours. Ariakit clears its own
+          copy when the list hides, and a pinned list never hides, so the words
+          typed last time stayed in the field over a list that had been reset.
+          The next name was appended to them, and Enter on "Cont" + "Receipts"
+          made a folder called ContReceipts on the server and filed the mail
+          into it. */}
+      <ComboboxProvider open value={query} setValue={setQuery}>
         <div className="picker-head">
           <Icon icon={mode === 'folder' ? FolderClosed : mode === 'tag' ? TagIcon : Clock} size={14} />
           <Combobox
@@ -160,9 +182,21 @@ export function Picker({ open, mode, options, subject, onClose, onChoose, onCrea
             autoFocus
             className="picker-input"
             placeholder={t(
-              mode === 'folder' ? 'picker-folder-hint' : mode === 'tag' ? 'picker-tag-hint' : 'picker-snooze-hint',
+              mode === 'folder'
+                ? 'picker-folder-hint'
+                : mode === 'tag'
+                  ? 'picker-tag-hint'
+                  : mode === 'send-later'
+                    ? 'picker-send-later-hint'
+                    : 'picker-snooze-hint',
             )}
             onKeyDown={(e) => {
+              // Nothing, once the dialog is closing. Choosing a time closes
+              // Snooze and Send later, and the picker draws Move's list as it
+              // goes, with the filter still typed; Ariakit answers Enter by
+              // pressing the active row, so the same Enter arrived here after
+              // that, matched no folder, and made a tag of the filter.
+              if (!open) return;
               // ↵ with nothing matching means "make it" — the create row is the
               // active item in that case, so only the empty-list case is special.
               if (e.key === 'Enter' && matches.length === 0 && canCreate) {
@@ -205,7 +239,7 @@ export function Picker({ open, mode, options, subject, onClose, onChoose, onCrea
                   </button>
                 )}
                 <Icon icon={glyphOf(o)} size={13} />
-                <span className="clip">{splitPath(o.label).leaf}</span>
+                <span className="clip">{splitPath(o.label, delim).leaf}</span>
               </div>
             ) : (
             <ComboboxItem
@@ -244,7 +278,7 @@ export function Picker({ open, mode, options, subject, onClose, onChoose, onCrea
                 )}
                 </>
               )}
-              {mode === 'snooze' ? (
+              {mode === 'snooze' || mode === 'send-later' ? (
                 <Icon icon={Clock} size={13} />
               ) : mode === 'tag' ? (
                 <span className={`picker-check${o.on ? ' on' : ''}`} aria-hidden="true">
@@ -267,9 +301,9 @@ export function Picker({ open, mode, options, subject, onClose, onChoose, onCrea
                 // Its own name only. The indentation is already saying where
                 // it sits, and repeating the parents beside it is the noise
                 // the indentation was drawn to remove.
-                <span className="clip">{splitPath(o.label).leaf}</span>
+                <span className="clip">{splitPath(o.label, delim).leaf}</span>
               ) : (
-                <PathLabel path={o.label} hits={hits} />
+                <PathLabel path={o.label} hits={hits} delim={delim} />
               )}
               {o.detail && <span className="picker-when mono">{o.detail}</span>}
             </ComboboxItem>
@@ -303,7 +337,9 @@ export function Picker({ open, mode, options, subject, onClose, onChoose, onCrea
                 : 'picker-folder-foot'
               : mode === 'tag'
                 ? 'picker-tag-foot'
-                : 'picker-snooze-foot',
+                : mode === 'send-later'
+                  ? 'picker-send-later-foot'
+                  : 'picker-snooze-foot',
           )}
         </div>
       </ComboboxProvider>

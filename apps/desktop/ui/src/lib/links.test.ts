@@ -1,5 +1,31 @@
-import { describe, expect, it } from 'vitest';
-import { classifyLink, homographRisk, unicodeHost } from './links';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  classifyLink,
+  homographRisk,
+  linkReadout,
+  linkRisk,
+  unicodeHost,
+  useMessageLinks,
+  type HomographRisk,
+} from './links';
+
+// The click path below runs `useMessageLinks` outside React. Its one effect is
+// run at once, which is all it does: put a listener on the window. And the
+// browser it would hand a link to is a list.
+const opened = vi.hoisted(() => [] as string[]);
+vi.mock('./api', () => ({
+  api: {
+    openExternal: async (url: string) => {
+      opened.push(url);
+    },
+  },
+}));
+vi.mock('react', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('react')>()),
+  useEffect: (effect: () => void) => {
+    effect();
+  },
+}));
 
 describe('classifyLink', () => {
   it('sends web links to the browser', () => {
@@ -112,6 +138,125 @@ describe('homographRisk, given what the message frame really sends', () => {
     expect(homographRisk('https://xn--mnchen-3ya.de/')).toBeNull();
     expect(homographRisk('https://xn--d1acpjx3f.xn--p1ai/')).toBeNull();
     expect(homographRisk('https://xn--e1afmkfd.com/')).toBeNull();
+  });
+});
+
+describe('linkRisk', () => {
+  // Everything before the @ is a user name, and the link goes to what follows
+  // it. Spelled as another site, it is the disguise, so it is asked about.
+  it('asks about a user name posing as the site', () => {
+    expect(
+      linkRisk(
+        'https://www.paypal.com.account-security.session-checkpoint.verification-center@evil.example/signin',
+      ),
+    ).toEqual({
+      asTyped: 'www.paypal.com.account-security.session-checkpoint.verification-center',
+      asPunycode: 'evil.example',
+      reason: 'userinfo',
+    });
+    expect(linkRisk('https://www.paypal.com@evil.example/')?.asPunycode).toBe('evil.example');
+  });
+
+  it('asks about a password too, and quotes the name as the link spells it', () => {
+    expect(linkRisk('https://paypal.com:secure@evil.example/')?.asTyped).toBe('paypal.com:secure');
+    // Percent-encoded as the frame hands it over, so nothing in it can
+    // reorder the sentence it is quoted in.
+    expect(linkRisk('https://accounts.google.com%2Fsignin@evil.example/')?.asTyped).toBe(
+      'accounts.google.com%2Fsignin',
+    );
+  });
+
+  it('names the host in the form DNS uses, whatever it is spelled in', () => {
+    expect(linkRisk('https://paypal.com@xn--pple-43d.com/')).toEqual({
+      asTyped: 'paypal.com',
+      asPunycode: 'xn--pple-43d.com',
+      reason: 'userinfo',
+    });
+  });
+
+  it('still asks about a look-alike host, and nothing else', () => {
+    expect(linkRisk('https://xn--pple-id-1fg.example/login')?.reason).toBe('mixed-script');
+    expect(linkRisk('https://example.com/a?b=1')).toBeNull();
+    // An @ after the host is part of the path, not a user name.
+    expect(linkRisk('https://example.com/people/@dana')).toBeNull();
+    expect(linkRisk('not a url')).toBeNull();
+  });
+});
+
+describe('linkReadout', () => {
+  it('leaves the user name out, so the host comes first', () => {
+    expect(
+      linkReadout(
+        'https://www.paypal.com.account-security.session-checkpoint.verification-center@evil.example/signin',
+      ),
+    ).toBe('https://evil.example/signin');
+    expect(linkReadout('https://user:pw@evil.example:8443/a?b=1#c')).toBe('https://evil.example:8443/a?b=1#c');
+  });
+
+  it('shows every other link exactly as it is', () => {
+    for (const href of [
+      'https://example.com/a/very/long/path',
+      'https://xn--pple-id-1fg.example/login',
+      'https://example.com/people/@dana',
+      'mailto:sam@example.com',
+      'not a url',
+    ]) {
+      expect(linkReadout(href), href).toBe(href);
+    }
+  });
+});
+
+describe('a click on a link in a message', () => {
+  // The path the main window and the pop-out share: the frame posts the
+  // anchor's href, and `useMessageLinks` opens it or asks first.
+  let asked: HomographRisk[];
+  let answer: (() => void) | null;
+  beforeEach(() => {
+    vi.stubGlobal('window', new EventTarget());
+    opened.length = 0;
+    asked = [];
+    answer = null;
+    useMessageLinks(
+      () => {},
+      (risk, open) => {
+        asked.push(risk);
+        answer = open;
+      },
+    );
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const click = (href: string) => {
+    window.dispatchEvent(new MessageEvent('message', { data: { petrelOpen: href } }));
+  };
+
+  it('asks before opening a link whose user name poses as the site', () => {
+    const href =
+      'https://www.paypal.com.account-security.session-checkpoint.verification-center@evil.example/signin';
+    click(href);
+    expect(opened).toEqual([]);
+    expect(asked.map((r) => [r.reason, r.asPunycode])).toEqual([['userinfo', 'evil.example']]);
+    // "Open anyway" opens exactly what was clicked.
+    answer?.();
+    expect(opened).toEqual([href]);
+  });
+
+  it('asks about the short form as well', () => {
+    click('https://www.paypal.com@evil.example/signin');
+    expect(opened).toEqual([]);
+    expect(asked).toHaveLength(1);
+  });
+
+  it('still opens an ordinary link at once', () => {
+    click('https://example.com/a/very/long/path');
+    expect(asked).toEqual([]);
+    expect(opened).toEqual(['https://example.com/a/very/long/path']);
+  });
+
+  it('still asks about a look-alike host', () => {
+    click('https://xn--pple-id-1fg.example/login');
+    expect(opened).toEqual([]);
+    expect(asked.map((r) => r.reason)).toEqual(['mixed-script']);
   });
 });
 

@@ -146,9 +146,29 @@ pub async fn resolve_draft_conflict(
     take_server: bool,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    use crate::config::imap_config_for;
+    settle_draft_conflict(
+        &state,
+        id,
+        other_id,
+        take_server,
+        crate::config::imap_config_for,
+    )
+    .await
+}
 
-    let (account, cfg, drafts_path, our_uid, other_uid) = {
+/// `resolve_draft_conflict`, given where the account's server comes from:
+/// the keychain's password in the app, a scripted server in the tests.
+pub(crate) async fn settle_draft_conflict<F>(
+    state: &Arc<AppState>,
+    id: i64,
+    other_id: i64,
+    take_server: bool,
+    server: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&petrel_engine::store::Store, i64) -> Option<petrel_providers::imap::ImapConfig>,
+{
+    let (account, cfg, drafts_path, drafts_validity, our_uid, other_uid) = {
         let store = state.store()?;
         // The draft's account. Expunging its server copy under whichever
         // account the rail happens to show destroys a stranger's draft.
@@ -156,19 +176,28 @@ pub async fn resolve_draft_conflict(
             .account_of_message(id)
             .map_err(|e| e.to_string())?
             .ok_or("that draft is no longer here")?;
-        let cfg = imap_config_for(&store, account);
-        let drafts_path = store
-            .folder_for_role(account, "drafts")
-            .ok()
-            .flatten()
-            .and_then(|fid| store.folder_path(fid).ok().flatten());
+        let cfg = server(&store, account);
+        // Both numbers are in Drafts, and go with the UIDVALIDITY they belong
+        // to, read under the same guard: Drafts renumbered before the sync
+        // noticed has given them to other drafts, and the server refuses
+        // them then (review r1, R1-7).
+        let drafts = store.folder_for_role(account, "drafts").ok().flatten();
+        let drafts_path = drafts.and_then(|fid| store.folder_path(fid).ok().flatten());
+        let drafts_validity = drafts.and_then(|fid| store.folder_validity(fid).ok().flatten());
         let (_, our_uid) = store.draft_sync_state(id).map_err(|e| e.to_string())?;
         let other_uid = store
             .draft_conflict(id)
             .map_err(|e| e.to_string())?
             .filter(|(oid, _)| *oid == other_id)
             .and_then(|(_, uid)| uid);
-        (account, cfg, drafts_path, our_uid, other_uid)
+        (
+            account,
+            cfg,
+            drafts_path,
+            drafts_validity,
+            our_uid,
+            other_uid,
+        )
     };
 
     if take_server {
@@ -204,6 +233,7 @@ pub async fn resolve_draft_conflict(
                 cfg,
                 path,
                 uid,
+                drafts_validity,
                 state.caps(account).has_uidplus,
             )
             .await;
@@ -223,11 +253,12 @@ pub async fn resolve_draft_conflict(
                 cfg,
                 path,
                 uid as u32,
+                drafts_validity,
                 state.caps(account).has_uidplus,
             )
             .await;
         }
-        crate::sync::drafts::schedule_draft_push(Arc::clone(&state), id);
+        crate::sync::drafts::schedule_draft_push(Arc::clone(state), id);
         crate::diag::log_sync(&format!("draft {id}: kept the local version"));
     }
     Ok(())
@@ -557,12 +588,15 @@ fn embed_remote_pictures_with(
 /// what the reader showed. Paragraphs that already have an empty one between
 /// them, as Outlook writes its blank lines, keep just that one; lines written
 /// as `<div>`s, as Gmail and Apple Mail write them, had no gap and get none.
+/// Nor do paragraphs whose own style takes the gap away, as Petrel's sent
+/// mail does (`flush_sides`).
 ///
 /// Runs on sanitized HTML, which is serialized: tags are lowercase, balanced,
 /// and paragraphs never nest, so a paragraph ends at the first `</p>`.
 fn paragraph_breaks_as_blank_lines(html: &str) -> String {
-    // Each paragraph's span, and whether it holds any words.
-    let mut paragraphs: Vec<(usize, usize, bool)> = Vec::new();
+    // Each paragraph's span, whether it holds any words, and whether its
+    // style leaves no space above it and below it.
+    let mut paragraphs: Vec<(usize, usize, bool, (bool, bool))> = Vec::new();
     let mut from = 0;
     while let Some(rel) = html[from..].find("<p") {
         let start = from + rel;
@@ -575,16 +609,19 @@ fn paragraph_breaks_as_blank_lines(html: &str) -> String {
             break;
         };
         let end = close + "</p>".len();
-        let inner = &html[start..close];
-        let inner = inner.find('>').map_or("", |gt| &inner[gt + 1..]);
-        paragraphs.push((start, end, has_words(inner)));
+        let (open, inner) = html[start..close].split_once('>').unwrap_or(("", ""));
+        paragraphs.push((start, end, has_words(inner), flush_sides(open)));
         from = end;
     }
     let mut out = String::with_capacity(html.len() + paragraphs.len() * 7);
     let mut copied = 0;
     for pair in paragraphs.windows(2) {
-        let ((_, end, worded), (next, _, next_worded)) = (pair[0], pair[1]);
-        if worded && next_worded && html[end..next].trim().is_empty() {
+        let ((_, end, worded, (_, flush_below)), (next, _, next_worded, (flush_above, _))) =
+            (pair[0], pair[1]);
+        // The reader's gap is the larger of the two margins that meet here,
+        // and the padding on either side of them.
+        let gap = !(flush_below && flush_above);
+        if worded && next_worded && gap && html[end..next].trim().is_empty() {
             out.push_str(&html[copied..end]);
             out.push_str("<p></p>");
             copied = end;
@@ -592,6 +629,80 @@ fn paragraph_breaks_as_blank_lines(html: &str) -> String {
     }
     out.push_str(&html[copied..]);
     out
+}
+
+/// Whether a paragraph's inline style leaves no space above it, and none
+/// below it: its margin and its padding on that side both draw nothing.
+///
+/// Petrel sends every paragraph with `margin:0` (`zero_paragraph_margins` in
+/// petrel-providers), which the sanitizer writes back as `margin: 0`, so the
+/// reader shows its own mail as lines. Padding counts as well, because it
+/// does not collapse: an email template zeroes the margin and spaces its
+/// paragraphs with `padding-bottom`, and the reader shows that gap. A
+/// paragraph's margin is the reader's gap until its style says otherwise; its
+/// padding is nothing until its style says otherwise. Declarations are read
+/// in order and the last one wins, as in CSS.
+fn flush_sides(open_tag: &str) -> (bool, bool) {
+    let Some((_, style)) = open_tag.split_once(" style=\"") else {
+        return (false, false);
+    };
+    let style = style.split('"').next().unwrap_or("");
+    let (mut margin, mut padding) = ((false, false), (true, true));
+    for declaration in style.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let sides: Vec<&str> = value.split_whitespace().collect();
+        let first = sides.first().copied();
+        // One or two values give the top's to the bottom too; three or four
+        // name the bottom third.
+        let both = (
+            draws_nothing(first),
+            draws_nothing(sides.get(2).copied().or(first)),
+        );
+        match property.trim() {
+            "margin" => margin = both,
+            "margin-top" => margin.0 = draws_nothing(first),
+            "margin-bottom" => margin.1 = draws_nothing(first),
+            "padding" => padding = both,
+            "padding-top" => padding.0 = draws_nothing(first),
+            "padding-bottom" => padding.1 = draws_nothing(first),
+            _ => {}
+        }
+    }
+    (margin.0 && padding.0, margin.1 && padding.1)
+}
+
+/// Whether a CSS length draws nothing: under half a pixel, which a screen
+/// cannot show. Outlook writes its lines as `margin-bottom: .0001pt`. A unit
+/// not known here counts only at zero.
+fn draws_nothing(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let value = value.to_ascii_lowercase();
+    let unit_at = value
+        .find(|c: char| c.is_ascii_alphabetic() || c == '%')
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(unit_at);
+    let Ok(number) = number.parse::<f32>() else {
+        return false;
+    };
+    // CSS's own sizes for the absolute units, and the reader's 16px text
+    // for the ones that follow the font.
+    let pixels = match unit {
+        "" | "px" => 1.0,
+        "pt" => 96.0 / 72.0,
+        "pc" => 16.0,
+        "in" => 96.0,
+        "cm" => 96.0 / 2.54,
+        "mm" => 96.0 / 25.4,
+        "q" => 96.0 / 101.6,
+        "em" | "rem" => 16.0,
+        "ex" | "ch" => 8.0,
+        _ => return number == 0.0,
+    };
+    (number * pixels).abs() < 0.5
 }
 
 /// Whether a paragraph's markup holds anything but tags, spaces and
@@ -1036,6 +1147,126 @@ mod quote_layout_tests {
     fn a_written_blank_line_is_not_doubled() {
         let outlook = "<p>Hi</p><p>&nbsp;</p><p>Thanks</p><p><br></p><p>Sam</p>";
         assert_eq!(paragraph_breaks_as_blank_lines(outlook), outlook);
+    }
+
+    /// docs/24 #19. Petrel sends every paragraph with no margin, so the reader
+    /// shows its mail as lines, and a quote of it is lines too. A blank line
+    /// between each pair double-spaced every reply to your own mail, and the
+    /// round after that quoted the blank lines as well.
+    #[test]
+    fn petrels_own_lines_stay_lines_in_a_quote() {
+        let sent = petrel_providers::smtp::Outgoing {
+            from_addr: "sam@example.com".into(),
+            from_name: "Sam".into(),
+            to: vec!["dana@example.com".into()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Friday".into(),
+            body_text: "Line one\nLine two\nLine three".into(),
+            body_html: Some("<p>Line one</p><p>Line two</p><p>Line three</p>".into()),
+            in_reply_to: None,
+            references: vec![],
+            attachments: vec![],
+        };
+        let (_, raw) = sent.render("example.com");
+        let parsed = petrel_mime::parse_message(&raw).unwrap();
+        let shown = petrel_mime::sanitize_html(parsed.body_html.as_deref().unwrap(), false).html;
+        assert!(shown.contains("Line three"), "{shown}");
+        assert_eq!(
+            paragraph_breaks_as_blank_lines(&shown),
+            shown,
+            "the lines the reader shows together stay together in the quote"
+        );
+    }
+
+    /// The gap a reader shows between two paragraphs is the larger of the
+    /// first one's bottom margin and the second one's top margin, so a style
+    /// takes it away only when both are zero.
+    #[test]
+    fn a_gap_the_reader_shows_is_still_a_blank_line() {
+        for (html, quoted) in [
+            // Beside an ordinary paragraph, whose margin is the gap.
+            (
+                r#"<p style="margin: 0">One.</p><p>Two.</p>"#,
+                r#"<p style="margin: 0">One.</p><p></p><p>Two.</p>"#,
+            ),
+            // A margin below, set after the zero: the later one wins, as in CSS.
+            (
+                r#"<p style="margin: 0; margin-bottom: 12px">One.</p><p style="margin: 0">Two.</p>"#,
+                r#"<p style="margin: 0; margin-bottom: 12px">One.</p><p></p><p style="margin: 0">Two.</p>"#,
+            ),
+            // The shorthand's third value is the bottom.
+            (
+                r#"<p style="margin: 0 0 1em">One.</p><p style="margin: 0">Two.</p>"#,
+                r#"<p style="margin: 0 0 1em">One.</p><p></p><p style="margin: 0">Two.</p>"#,
+            ),
+        ] {
+            assert_eq!(paragraph_breaks_as_blank_lines(html), quoted);
+        }
+        // Zero in any unit, and the sides left alone, is still no gap.
+        let tight = r#"<p style="margin: 0px auto">One.</p><p style="margin-top: 0; margin-bottom: 0in">Two.</p>"#;
+        assert_eq!(paragraph_breaks_as_blank_lines(tight), tight);
+    }
+
+    /// Review r2, R2-2. A paragraph meets the next flush only where its
+    /// margin and its padding are both nothing, since padding does not
+    /// collapse: an email template zeroes the margin and spaces its paragraphs
+    /// with padding, and the reader shows that gap. And a length under half a
+    /// pixel draws nothing: Outlook's `margin-bottom: .0001pt` is no gap.
+    /// Read through the parser and the sanitizer, as a quote is.
+    #[test]
+    fn padding_is_a_gap_and_a_hair_is_none() {
+        for (who, body, gap) in [
+            (
+                "template, spaced by the padding shorthand",
+                "<p style=\"margin:0;padding:0 0 16px 0\">One.</p>\n\
+                 <p style=\"margin:0;padding:0 0 16px 0\">Two.</p>",
+                true,
+            ),
+            (
+                "template, spaced by padding-bottom",
+                "<p style=\"margin:0;padding-bottom:16px;line-height:24px\">One.</p>\n\
+                 <p style=\"margin:0;padding-bottom:16px;line-height:24px\">Two.</p>",
+                true,
+            ),
+            (
+                "padding above the second",
+                "<p style=\"margin:0\">One.</p><p style=\"margin:0;padding-top:12px\">Two.</p>",
+                true,
+            ),
+            (
+                "Outlook, margin 0in then .0001pt",
+                "<p class=MsoNormal style='margin:0in;margin-bottom:.0001pt'>One<o:p></o:p></p>\n\
+                 <p class=MsoNormal style='margin:0in;margin-bottom:.0001pt'>Two<o:p></o:p></p>",
+                false,
+            ),
+            (
+                "a hair of padding",
+                "<p style=\"margin:0;padding:0.2px 0\">One.</p><p style=\"margin:0\">Two.</p>",
+                false,
+            ),
+            (
+                "Apple's lines",
+                "<p style=\"margin: 0px; font: 12px Helvetica; min-height: 14px;\">One</p>\n\
+                 <p style=\"margin: 0px; font: 12px Helvetica; min-height: 14px;\">Two</p>",
+                false,
+            ),
+        ] {
+            let raw = format!(
+                "From: a@example.com\r\nTo: b@example.com\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+                 Content-Type: text/html; charset=utf-8\r\n\r\n<html><body>{body}</body></html>\r\n"
+            );
+            let parsed = petrel_mime::parse_message(raw.as_bytes()).unwrap();
+            let shown =
+                petrel_mime::sanitize_html(parsed.body_html.as_deref().unwrap(), false).html;
+            let quoted = paragraph_breaks_as_blank_lines(&shown);
+            assert_eq!(
+                quoted.contains("<p></p>"),
+                gap,
+                "{who}: the reader shows {}a gap, and the quote says otherwise: {shown}",
+                if gap { "" } else { "no " }
+            );
+        }
     }
 
     /// Gmail and Apple Mail write lines as divs, with no gap to put back.

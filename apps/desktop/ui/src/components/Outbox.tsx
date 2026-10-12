@@ -3,6 +3,7 @@ import { AlertTriangle, Clock, Paperclip, WifiOff } from 'lucide-react';
 import { api, type OutboxRow, type SignIn } from '../lib/api';
 import { Icon } from './Icon';
 import { t } from '../lib/strings';
+import { heldReason } from '../lib/outbox-reason';
 import { outboxRefusal } from '../lib/outbox-refusal';
 import { signinRefusal } from '../lib/signin-refusal';
 
@@ -46,6 +47,7 @@ function reason(error: string | null): string {
 function Row({
   row,
   now,
+  undoByZ,
   signin,
   onSignIn,
   onChange,
@@ -55,6 +57,8 @@ function Row({
 }: {
   row: OutboxRow;
   now: number;
+  /** Whether Z pulls this row back: true only for the send the bar counts. */
+  undoByZ: boolean;
   /** Set while the account cannot sign in: nothing goes until it can. */
   signin?: SignIn | null;
   onSignIn?: () => void;
@@ -152,7 +156,8 @@ function Row({
         {waiting && !held && offline && t('outbox-offline')}
         {waiting && !held && !offline && t('outbox-retrying', { when: until(row.next_ms ?? now, now) })}
         {rejected &&
-          t(noSuchUser ? 'outbox-rejected-user' : 'outbox-rejected', { reason: reason(row.error) })}
+          (heldReason(row.error) ??
+            t(noSuchUser ? 'outbox-rejected-user' : 'outbox-rejected', { reason: reason(row.error) }))}
         {unknown && (
           <>
             {t('outbox-unknown-1')}
@@ -177,11 +182,13 @@ function Row({
         )}
         {pending && (
           <>
-            {/* Z is the bar's only while it counts; held, it is the last
-                action's again (docs/24 #9), and the key is not offered. */}
+            {/* Z is the bar's, and pulls back only the send the bar counts.
+                Beside any other row (one scheduled for later, one sent from
+                a pop-out, one held for sign-in) Z undid the last thing done
+                instead, an archive say, and the send stood (docs/25 #110). */}
             <button type="button" className="reply" onClick={edit}>
               {t('outbox-undo')}
-              {!held && (
+              {undoByZ && !held && (
                 <>
                   {' '}
                   <span className="kbd">Z</span>
@@ -254,6 +261,7 @@ function Row({
 }
 
 export function Outbox({
+  zKey,
   signin,
   onSignIn,
   onDiscard,
@@ -261,6 +269,8 @@ export function Outbox({
   onEdit,
   onRefused,
 }: {
+  /** The send Z pulls back: the one the bar counts down, if it is counting. */
+  zKey?: number | null;
   /** Why the account cannot sign in, if it cannot: its unsent mail waits. */
   signin?: SignIn | null;
   onSignIn?: () => void;
@@ -312,6 +322,7 @@ export function Outbox({
           key={r.id}
           row={r}
           now={now}
+          undoByZ={r.id === zKey}
           signin={signin}
           onSignIn={onSignIn}
           onChange={() => setTick((n) => n + 1)}

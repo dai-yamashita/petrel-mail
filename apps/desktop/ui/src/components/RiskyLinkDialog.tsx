@@ -27,7 +27,9 @@ export function RiskyLinkDialog({
       <div className="confirm" role="alertdialog">
         <div className="confirm-title">{t('link-risk-title')}</div>
         <p className="confirm-detail">
-          {t('link-risk-body', {
+          {/* A user name posing as the site is explained as one: the other
+              wording, about letters from other alphabets, would be untrue. */}
+          {t(risky?.risk.reason === 'userinfo' ? 'link-risk-userinfo' : 'link-risk-body', {
             typed: risky?.risk.asTyped ?? '',
             real: risky?.risk.asPunycode ?? '',
           })}

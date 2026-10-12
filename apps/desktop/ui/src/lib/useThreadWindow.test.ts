@@ -686,3 +686,80 @@ describe('pageMore', () => {
     expect(failures).toEqual([]);
   });
 });
+
+/* Drafts, where a row is a message and not a conversation (review r2, R2-1).
+ *
+ * The engine walks Drafts one draft at a time, keyed by `-id`, and pages
+ * after a cursor that is a position in that walk (`listing.rs`). A draft
+ * whose copy has come back from the server names its conversation, and two
+ * can name the same one: a reply and a forward of one message, say. Keyed by
+ * the conversation, the next page newest first started with the row the last
+ * one ended on, and a draft sharing its conversation with one already loaded
+ * was dropped as a repeat. */
+describe('Drafts, a page at a time', () => {
+  /** The engine's Drafts walk: by date, then by `-id`, the cursor compared
+   *  as a position in that order, the way the walk compares it. */
+  function draftsWalk(all: Thread[]): ThreadFetchers['threads'] {
+    return (_view, _offset, limit, _sort, ascending = false, beforeDateMs, beforeKey) => {
+      const order = all.slice().sort((a, b) =>
+        ascending ? a.date_ms - b.date_ms || b.id - a.id : b.date_ms - a.date_ms || a.id - b.id,
+      );
+      const past = (t: Thread) => {
+        if (beforeDateMs === undefined || beforeKey === undefined) return true;
+        const k = -t.id;
+        return ascending
+          ? t.date_ms > beforeDateMs || (t.date_ms === beforeDateMs && k > beforeKey)
+          : t.date_ms < beforeDateMs || (t.date_ms === beforeDateMs && k < beforeKey);
+      };
+      return Promise.resolve(order.filter(past).slice(0, limit));
+    };
+  }
+
+  // A page and a half of drafts. Every other one has come back from the
+  // server and names a conversation of its own, and two, a page apart, name
+  // the same one.
+  const drafts = Array.from({ length: LIST_PAGE + 50 }, (_, i) =>
+    thread({ id: 1000 + i, thread_id: i % 2 === 0 ? 5000 + i : -(1000 + i), date_ms: 50_000 - i }),
+  );
+  drafts[10] = { ...drafts[10], thread_id: 7777 };
+  drafts[LIST_PAGE + 20] = { ...drafts[LIST_PAGE + 20], thread_id: 7777 };
+  // The row page one ends on, newest first, has come back too.
+  drafts[LIST_PAGE - 1] = { ...drafts[LIST_PAGE - 1], thread_id: 6000 };
+
+  async function walk(ascending: boolean): Promise<Thread[]> {
+    const sort = { key: 'date' as const, ascending };
+    const fetchers: ThreadFetchers = { threads: draftsWalk(drafts), search: async () => [] };
+    const first = await runReplaceLoad(fetchers, '', 'drafts', sort);
+    const { sink, rows } = recordingSink(first.items);
+    await pageMore(fetchers, 'drafts', sort, first.items[first.items.length - 1], () => true, sink);
+    return rows();
+  }
+
+  it('lists every draft once, newest first', async () => {
+    const rows = await walk(false);
+    expect(rows.map((t) => t.id)).toEqual(drafts.map((t) => t.id));
+  });
+
+  it('lists every draft once, oldest first', async () => {
+    const rows = await walk(true);
+    expect(rows.map((t) => t.id)).toEqual(drafts.map((t) => t.id).reverse());
+  });
+
+  it('asks for the next page after the draft, not its conversation', () => {
+    const last = drafts[LIST_PAGE - 1];
+    expect(loadMoreCall('drafts', DEFAULT_SORT, last)).toEqual([
+      'drafts', 0, LIST_PAGE, 'date', false, last.date_ms, -last.id,
+    ]);
+    // Everywhere else a row is its conversation, and so is the cursor.
+    expect(loadMoreCall('inbox', DEFAULT_SORT, last)[6]).toBe(last.thread_id);
+  });
+
+  it('keeps a draft below the page when a refresh lists another of its conversation', async () => {
+    const { sink, rows } = recordingSink(drafts);
+    await refreshHead(
+      { threads: async () => drafts.slice(0, LIST_PAGE), search: async () => [] },
+      'drafts', DEFAULT_SORT, () => true, sink,
+    );
+    expect(rows().map((t) => t.id)).toEqual(drafts.map((t) => t.id));
+  });
+});

@@ -17,6 +17,7 @@ import { Storage } from './settings/Storage';
 import { Updates } from './settings/Updates';
 import { Icon } from './Icon';
 import { clickAway } from '../lib/dialog';
+import type { Identity } from '../lib/api';
 import { t, type StringId } from '../lib/strings';
 
 type PaneId =
@@ -59,6 +60,8 @@ type Props = {
   /** A plain status line. Not the "not built" channel — routing a
    *  successful export through that reported it as a missing feature. */
   onMessage: (text: string) => void;
+  /** A name or signature changed in Identities, for the account given. */
+  onIdentityChange?: (accountId: number, identity: Identity) => void;
 };
 
 export function Settings({
@@ -68,6 +71,7 @@ export function Settings({
   onMessage,
   onAddAccount,
   onAccountRemoved,
+  onIdentityChange,
 }: Props) {
   const [pane, setPane] = useState<PaneId>(requested ?? 'appearance');
 
@@ -81,7 +85,7 @@ export function Settings({
         onMessage={onMessage}
       />
     ),
-    identities: <Identities onMessage={onMessage} />,
+    identities: <Identities onMessage={onMessage} onChange={onIdentityChange} />,
     composing: <Composing />,
     notifications: <Notifications />,
     appearance: <Appearance />,

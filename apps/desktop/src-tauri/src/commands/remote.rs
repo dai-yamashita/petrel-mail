@@ -1,6 +1,7 @@
 //! A message's reach outward: remote content, sender trust, and unsubscribing.
 
 use crate::state::{AppState, now_ms};
+use petrel_engine::store::Store;
 use std::sync::Arc;
 use tauri::State;
 
@@ -23,11 +24,21 @@ pub(crate) struct RemoteStatus {
 #[tauri::command(async)]
 pub fn remote_status(message_id: i64, state: State<Arc<AppState>>) -> Result<RemoteStatus, String> {
     let store = state.store_read()?;
+    status_of(&store, message_id)
+}
+
+/// Judged in the message's own account, as the reader judges it
+/// (`Store::remote_content_allowed`), not in the account on screen: a pop-out
+/// stays open across ⌘2.
+fn status_of(store: &Store, message_id: i64) -> Result<RemoteStatus, String> {
     let from = store
         .message_sender(message_id)
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
-    let Some(account) = store.active_account().map_err(|e| e.to_string())? else {
+    let Some(account) = store
+        .account_of_message(message_id)
+        .map_err(|e| e.to_string())?
+    else {
         return Ok(RemoteStatus {
             from_addr: from,
             allowed: false,
@@ -62,8 +73,18 @@ pub fn show_remote_once(message_id: i64, state: State<Arc<AppState>>) -> Result<
 #[tauri::command(async)]
 pub fn trust_sender(message_id: i64, state: State<Arc<AppState>>) -> Result<String, String> {
     let store = state.store()?;
-    let Some(account) = store.active_account().map_err(|e| e.to_string())? else {
-        return Err("no account".into());
+    trust(&store, message_id)
+}
+
+/// In the account the message came to. Trusted in the account on screen,
+/// "Always show images" in a pop-out left open across ⌘2 showed nothing,
+/// and the other account trusted a stranger.
+fn trust(store: &Store, message_id: i64) -> Result<String, String> {
+    let Some(account) = store
+        .account_of_message(message_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Err("that message is no longer here".into());
     };
     let from = store
         .message_sender(message_id)
@@ -150,14 +171,32 @@ pub async fn authentication_info(
 ) -> Result<Option<AuthInfo>, String> {
     super::off_runtime(state, move |state| {
         let raw = raw_message_of(&state, message_id)?;
-        Ok(petrel_mime::authentication(&raw).map(|a| AuthInfo {
-            verified: a.identity_verified(),
-            domain: a.domain.clone(),
-            authserv: a.authserv.clone(),
-            spf: word(a.spf),
-            dkim: word(a.dkim),
-            dmarc: word(a.dmarc),
-        }))
+        // Whose mailbox this came from: a verdict is shown only when the
+        // server that wrote it is that account's own provider. Anybody can
+        // write the header; see `authserv_trusted`.
+        let host = {
+            let store = state.store_read_open()?;
+            store
+                .account_of_message(message_id)
+                .ok()
+                .flatten()
+                .and_then(|account| store.account_servers(account).ok().flatten())
+                .map(|servers| servers.imap_host)
+        };
+        let trusted = |a: &petrel_mime::Authentication| {
+            host.as_deref()
+                .is_some_and(|h| petrel_mime::authserv_trusted(a.authserv.as_deref(), h))
+        };
+        Ok(petrel_mime::authentication(&raw)
+            .filter(trusted)
+            .map(|a| AuthInfo {
+                verified: a.identity_verified(),
+                domain: a.domain.clone(),
+                authserv: a.authserv.clone(),
+                spf: word(a.spf),
+                dkim: word(a.dkim),
+                dmarc: word(a.dmarc),
+            }))
     })
     .await
 }
@@ -407,6 +446,61 @@ pub(crate) fn fetch_picture(url: &str, cap: u64) -> Result<(String, Vec<u8>), St
         .read_to_vec()
         .map_err(|e| e.to_string())?;
     Ok((kind.to_string(), bytes))
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::{status_of, trust};
+    use petrel_engine::store::AccountServers;
+
+    /// docs/25 #97. "Always show images" in a pop-out, after ⌘2 in the main
+    /// window, trusted the sender in the account on screen: the message it
+    /// was pressed on stayed blocked, and the other account trusted a
+    /// stranger.
+    #[test]
+    fn a_sender_is_trusted_in_the_account_the_message_came_to() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::state::test_state(dir.path());
+        let first = state.account_id;
+        let mut store = state.store().unwrap();
+        store
+            .sync_folders(first, &[("INBOX".into(), Some("inbox".into()))])
+            .unwrap();
+        let inbox = store.folder_for_role(first, "inbox").unwrap();
+        let raw = b"From: News <news@example.org>\r\nTo: test@example.com\r\n\
+                    Subject: Spring\r\nMessage-ID: <spring@example.org>\r\n\
+                    MIME-Version: 1.0\r\nContent-Type: text/html\r\n\r\n\
+                    <p>Hello</p>\r\n";
+        let message = store
+            .ingest_raw(&state.blobs, first, inbox, Some(1), raw)
+            .unwrap()
+            .message_id;
+        let second = store
+            .add_account(
+                "imap",
+                "other@example.com",
+                "Other",
+                &AccountServers::default(),
+            )
+            .unwrap();
+        store.set_active_account(second).unwrap();
+
+        let before = status_of(&store, message).unwrap().allowed;
+        assert_eq!(trust(&store, message).unwrap(), "news@example.org");
+        let in_first = store.sender_trusted(first, "news@example.org").unwrap();
+        let in_second = store.sender_trusted(second, "news@example.org").unwrap();
+        let shown = store.remote_content_allowed(message).unwrap();
+        let after = status_of(&store, message).unwrap().allowed;
+        println!(
+            "trusted in the message's account {in_first}, in the one on screen {in_second}; \
+             the reader shows its pictures {shown}; banner allowed {before} then {after}"
+        );
+        assert!(!before);
+        assert!(in_first, "trusted where the message is");
+        assert!(!in_second, "the account on screen trusts nobody new");
+        assert!(shown, "the reader shows what was asked for");
+        assert!(after, "and the banner agrees with it");
+    }
 }
 
 #[cfg(test)]

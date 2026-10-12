@@ -2,9 +2,8 @@
 
 use crate::commands::clean_header;
 use crate::diag::log_sync;
-use crate::state::active_account;
 use crate::state::{AppState, note_ui_touch, now_ms};
-use petrel_engine::store::DraftEnvelope;
+use petrel_engine::store::{DraftEnvelope, Store};
 use petrel_mime::ical::{IcalTime, Invitation};
 use std::sync::Arc;
 use tauri::State;
@@ -74,19 +73,37 @@ fn load_invitation(state: &Arc<AppState>, message_id: i64) -> Result<Invitation,
     petrel_mime::ical::invitation_in(&raw).ok_or_else(|| "no calendar part".into())
 }
 
+/// The account an invitation came to, which is the one that answers it: its
+/// address finds the attendee line, and its outbox sends the reply.
+///
+/// Not the account on screen. A pop-out stays open across ⌘2, and Accept
+/// there answered as the other account, from its server and with its address
+/// as the attendee, so the organizer could not match the reply.
+fn invited_account(store: &Store, message_id: i64) -> Result<i64, String> {
+    store
+        .account_of_message(message_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "that message is no longer here".to_string())
+}
+
 /// The invitation a message carries, if any.
 #[tauri::command(async)]
 pub fn invitation(
     message_id: i64,
     state: State<Arc<AppState>>,
 ) -> Result<Option<InvitationView>, String> {
-    note_ui_touch(&state);
-    let Ok(inv) = load_invitation(&state, message_id) else {
+    card(&state, message_id)
+}
+
+/// `invitation`, on the state itself so a test can ask it.
+fn card(state: &Arc<AppState>, message_id: i64) -> Result<Option<InvitationView>, String> {
+    note_ui_touch(state);
+    let Ok(inv) = load_invitation(state, message_id) else {
         return Ok(None);
     };
     let (my_email, responded) = {
         let store = state.store()?;
-        let account = active_account(&store)?;
+        let account = invited_account(&store, message_id)?;
         let email = store
             .accounts()
             .map_err(|e| e.to_string())?
@@ -149,21 +166,39 @@ pub fn respond_invitation(
     notify: Option<bool>,
     state: State<Arc<AppState>>,
 ) -> Result<(), String> {
-    note_ui_touch(&state);
-    let (partstat, verb) = match response.as_str() {
+    respond(
+        &state,
+        message_id,
+        &response,
+        notify,
+        super::compose::stage_file,
+    )
+}
+
+/// `respond_invitation`, with the staging of the reply's file passed in so a
+/// test can keep it out of the data directory.
+fn respond(
+    state: &Arc<AppState>,
+    message_id: i64,
+    response: &str,
+    notify: Option<bool>,
+    stage: impl FnOnce(&str, &[u8]) -> Result<String, String>,
+) -> Result<(), String> {
+    note_ui_touch(state);
+    let (partstat, verb) = match response {
         "accepted" => ("ACCEPTED", "Accepted"),
         "tentative" => ("TENTATIVE", "Tentatively accepted"),
         "declined" => ("DECLINED", "Declined"),
         other => return Err(format!("not a response: {other}")),
     };
-    let inv = load_invitation(&state, message_id)?;
+    let inv = load_invitation(state, message_id)?;
     if inv.method.as_deref() != Some("REQUEST") {
         return Err("this event asks for no answer".into());
     }
     if notify == Some(false) {
         state
             .store()?
-            .set_invite_response(message_id, &response)
+            .set_invite_response(message_id, response)
             .map_err(|e| e.to_string())?;
         log_sync(&format!(
             "invitation {message_id} answered {partstat}; no reply sent"
@@ -180,13 +215,13 @@ pub fn respond_invitation(
 
     let (account, me, my_name, in_reply_to) = {
         let store = state.store()?;
-        let account = active_account(&store)?;
+        let account = invited_account(&store, message_id)?;
         let summary = store
             .accounts()
             .map_err(|e| e.to_string())?
             .into_iter()
             .find(|a| a.id == account)
-            .ok_or("no active account")?;
+            .ok_or("no such account")?;
         let name = store
             .identity(account)
             .map(|i| i.display_name)
@@ -199,7 +234,7 @@ pub fn respond_invitation(
     // Staged like any attachment, under the name it travels by. The send
     // names a file after itself, and the timestamp this used to put in front
     // went out with it: the organizer received 1726…-invite-reply.ics.
-    let path = super::compose::stage_file("invite.ics", ics.as_bytes())?;
+    let path = stage("invite.ics", ics.as_bytes())?;
 
     // The summary is text an organiser wrote, and it reaches this subject
     // with no window in between: pressing Accept on a crafted invitation was
@@ -224,7 +259,7 @@ pub fn respond_invitation(
             .schedule_send(id, reply_send_at(now_ms()))
             .map_err(|e| e.to_string())?;
         store
-            .set_invite_response(message_id, &response)
+            .set_invite_response(message_id, response)
             .map_err(|e| e.to_string())?;
         id
     };
@@ -451,6 +486,102 @@ mod tests {
         assert!(
             !head.lines().any(|l| l.starts_with("Bcc:")),
             "an injected header survived: {head}"
+        );
+    }
+
+    /// docs/25 #97. An invitation open in a pop-out, and ⌘2 in the main
+    /// window: the card and Accept both took the account on screen. The reply
+    /// went from that account's server with its address as the attendee,
+    /// which the organizer's calendar could not match.
+    #[test]
+    fn an_invitation_is_answered_as_the_account_it_came_to() {
+        use petrel_engine::store::AccountServers;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::state::test_state(dir.path());
+        let invited = state.account_id;
+        let ics = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "METHOD:REQUEST",
+            "BEGIN:VEVENT",
+            "UID:plan-1@example.com",
+            "DTSTART:20260922T150000Z",
+            "DTEND:20260922T160000Z",
+            "ORGANIZER;CN=Dana Wu:mailto:dana@example.com",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:test@example.com",
+            "SUMMARY:Planning",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ]
+        .join("\r\n");
+        let raw = format!(
+            "From: Dana Wu <dana@example.com>\r\nTo: test@example.com\r\n\
+             Subject: Invitation: Planning\r\nMessage-ID: <plan-1@example.com>\r\n\
+             Date: Mon, 21 Sep 2026 10:00:00 +0000\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+             --b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlanning.\r\n\
+             --b\r\nContent-Type: text/calendar; charset=utf-8; method=REQUEST\r\n\r\n\
+             {ics}\r\n--b--\r\n"
+        );
+        let (other, message) = {
+            let mut store = state.store().unwrap();
+            store
+                .sync_folders(invited, &[("INBOX".into(), Some("inbox".into()))])
+                .unwrap();
+            let inbox = store.folder_for_role(invited, "inbox").unwrap();
+            let message = store
+                .ingest_raw(&state.blobs, invited, inbox, Some(1), raw.as_bytes())
+                .unwrap()
+                .message_id;
+            let other = store
+                .add_account(
+                    "imap",
+                    "other@example.com",
+                    "Other",
+                    &AccountServers::default(),
+                )
+                .unwrap();
+            // The main window moves to the other account.
+            store.set_active_account(other).unwrap();
+            (other, message)
+        };
+
+        let shown = card(&state, message).unwrap().expect("a card");
+        let staged = dir.path().join("invite.ics");
+        respond(&state, message, "accepted", None, |_, bytes| {
+            std::fs::write(&staged, bytes).map_err(|e| e.to_string())?;
+            Ok(staged.to_string_lossy().into_owned())
+        })
+        .unwrap();
+        let reply = std::fs::read_to_string(&staged).unwrap();
+        let attendee = reply
+            .lines()
+            .find(|l| l.starts_with("ATTENDEE"))
+            .unwrap_or_default()
+            .to_string();
+        let (from_invited, from_other) = {
+            let store = state.store().unwrap();
+            (
+                store.outbox(invited).unwrap().len(),
+                store.outbox(other).unwrap().len(),
+            )
+        };
+        println!(
+            "card: can_respond {}, my_partstat {:?}; replies queued: {from_invited} from the \
+             invited account, {from_other} from the one on screen; {attendee}",
+            shown.can_respond, shown.my_partstat
+        );
+        assert!(shown.can_respond, "the account it came to is invited");
+        assert_eq!(shown.my_partstat.as_deref(), Some("NEEDS-ACTION"));
+        assert_eq!(
+            (from_invited, from_other),
+            (1, 0),
+            "nothing goes from the account on screen"
+        );
+        assert!(
+            attendee.ends_with(":mailto:test@example.com"),
+            "answered as {attendee}"
         );
     }
 

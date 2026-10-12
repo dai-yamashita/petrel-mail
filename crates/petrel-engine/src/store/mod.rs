@@ -270,9 +270,31 @@ pub(crate) fn wire_message_id(key: &str) -> Option<&str> {
 /// (`::copy-N`) or a different message under the same id (`::b-…`). Exact
 /// prefix ranges, not LIKE, in which `_` or `%` in a Message-ID is a
 /// wildcard. Binds the Message-ID as `?2`, against the alias `m`.
-const CARRIES_WIRE_ID: &str = "(m.message_id_hdr = ?2
+///
+/// The outer range is for the index. No index serves an OR of an equality
+/// and two ranges, so without it every call read every live row of the
+/// account (docs/26 #169). Each key named is the id followed by nothing or by
+/// `::`, and `:` sorts just below `;`, so all of them lie in one range of
+/// `idx_messages_msgid`.
+const CARRIES_WIRE_ID: &str = "(m.message_id_hdr >= ?2 AND m.message_id_hdr < ?2 || ';'
+  AND (m.message_id_hdr = ?2
       OR (m.message_id_hdr >= ?2 || '::b-' AND m.message_id_hdr < ?2 || '::b.')
-      OR (m.message_id_hdr >= ?2 || '::copy-' AND m.message_id_hdr < ?2 || '::copy.'))";
+      OR (m.message_id_hdr >= ?2 || '::copy-' AND m.message_id_hdr < ?2 || '::copy.')))";
+
+/// The rows that already hold these bytes, which ingest asks before anything
+/// else (see `ingest_raw_keyed`). Binds the account, the blob hash, the
+/// folder, the UID and the bare key, in that order.
+///
+/// `INDEXED BY` is load-bearing. With no statistics in the store, SQLite
+/// chose `idx_messages_gm_thrid` for the account and tested the hash of every
+/// row in it, on every message ingested (docs/26 #169).
+const SAME_BYTES: &str = "SELECT m.id, m.message_id_hdr
+    FROM messages m INDEXED BY idx_messages_blob_hash
+   WHERE m.account_id = ?1 AND m.blob_hash = ?2
+     AND NOT EXISTS (SELECT 1 FROM placements p
+                      WHERE p.message_id = m.id AND p.folder_id = ?3
+                        AND p.uid IS NOT NULL AND p.uid IS NOT ?4)
+   ORDER BY m.deleted_at_ms IS NOT NULL, m.message_id_hdr = ?5 DESC, m.id";
 
 /// Minimal insertable message for the M0 store spike; the MIME pipeline will
 /// replace this with parsed structures.
@@ -455,6 +477,10 @@ pub struct PendingAction {
     /// Absent when the message was never placed in a folder — nothing to
     /// address on the server, so nothing that can be delivered.
     pub uid: Option<u32>,
+    /// The UIDVALIDITY `uid` belongs to, read with it. The drain hands it to
+    /// the server's SELECT, which refuses the command if the folder has been
+    /// renumbered since.
+    pub uid_validity: Option<u32>,
     pub folder_path: String,
     /// The message's Message-ID header, when it has one: the address of last
     /// resort. With no UID, a drain can still ask a server which of its
@@ -583,6 +609,10 @@ pub struct FolderSummary {
     /// Empty for folders the user made; otherwise archive, sent, trash and so on.
     pub role: String,
     pub path: String,
+    /// The hierarchy delimiter the server reported for this folder, once a
+    /// survey has said. The rail nests by it, so what it draws inside a
+    /// folder is what the engine acts on as inside it.
+    pub delim: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -945,12 +975,14 @@ fn match_expr(query: &str, prefix_last: bool) -> Option<String> {
 /// Reference links win; a distinctive subject is a narrow fallback. When a
 /// message links two previously separate threads, they are merged — the common
 /// case where the middle of a conversation arrives after its ends.
+#[allow(clippy::too_many_arguments)]
 fn assign_thread(
     tx: &rusqlite::Transaction<'_>,
     account_id: i64,
     row_id: i64,
     msgid: Option<&str>,
     references: &[String],
+    subject: &str,
     subject_norm: &str,
     date_ms: i64,
 ) -> Result<i64> {
@@ -1002,18 +1034,51 @@ fn assign_thread(
     // Subject fallback, only for subjects distinctive enough to be evidence and
     // only within a window. A wrong merge hides mail inside an unrelated
     // conversation, where nobody thinks to look — worse than an extra thread.
+    //
+    // And only for a pair that looks like a conversation: one of the two a
+    // reply, a correspondent in common besides the account itself, and
+    // neither in the bin. Without that, "Your verification code" from two
+    // different services became one conversation, and a thread-wide Delete
+    // forever on one deleted the other; rules act on the whole thread too, so
+    // a rule for one shop's "Order confirmation" binned another's. The pair
+    // is what mailing lists that strip References still produce — a reply,
+    // to the list, under the post's subject — whichever arrives first.
     if candidates.is_empty() && crate::threading::subject_is_threadable(subject_norm) {
         let window = crate::threading::SUBJECT_THREAD_WINDOW_MS;
-        let mut stmt = tx.prepare_cached(
-            "SELECT thread_id FROM messages
-             WHERE account_id = ?1 AND subject_norm = ?2 AND thread_id IS NOT NULL
-               AND abs(date_ms - ?3) <= ?4
-             ORDER BY abs(date_ms - ?3) LIMIT 1",
+        let reply = crate::threading::has_reply_prefix(subject);
+        let nearest: Vec<(i64, i64, String)> = {
+            let mut stmt = tx.prepare_cached(&format!(
+                "SELECT m.id, m.thread_id, coalesce(m.subject, '') FROM messages m
+                 WHERE m.account_id = ?1 AND m.subject_norm = ?2 AND m.thread_id IS NOT NULL
+                   AND abs(m.date_ms - ?3) <= ?4
+                   AND {}
+                 ORDER BY abs(m.date_ms - ?3) LIMIT 20",
+                not_binned("m")
+            ))?;
+            let rows = stmt.query_map(params![account_id, subject_norm, date_ms, window], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut shared = tx.prepare_cached(
+            "SELECT EXISTS (
+               SELECT 1 FROM message_addresses a
+               JOIN message_addresses b ON b.addr_norm = a.addr_norm
+              WHERE a.message_id = ?1 AND b.message_id = ?2
+                AND a.role IN ('from', 'to', 'cc') AND b.role IN ('from', 'to', 'cc')
+                AND a.addr_norm <> lower(coalesce(
+                      (SELECT email FROM accounts WHERE id = ?3), '')))",
         )?;
-        if let Ok(t) = stmt.query_row(params![account_id, subject_norm, date_ms, window], |r| {
-            r.get::<_, i64>(0)
-        }) {
-            candidates.insert(t);
+        for (other, thread, other_subject) in nearest {
+            if !reply && !crate::threading::has_reply_prefix(&other_subject) {
+                continue;
+            }
+            let in_common: bool =
+                shared.query_row(params![row_id, other, account_id], |r| r.get(0))?;
+            if in_common {
+                candidates.insert(thread);
+                break;
+            }
         }
     }
 
@@ -1214,12 +1279,19 @@ impl CountMode {
 /// whichever the table happened to return first.
 ///
 /// Compared with `substr` rather than LIKE, which ignores ASCII case and
-/// reads `_` and `%` in a folder's own name as wildcards. Both separators,
-/// matching `underAnchor` in the rail, which draws these under the Trash row.
-/// Uncorrelated, so SQLite builds the list once per statement.
+/// reads `_` and `%` in a folder's own name as wildcards. By the delimiter
+/// the server reported for the bin, as `underAnchor` in the rail draws them:
+/// on a `/` server a top-level `Trash.2019` is a folder of its own, and
+/// reading both separators had Empty Trash expunge it. Both only until the
+/// server has said (`folders::child_separators`). Uncorrelated, so SQLite
+/// builds the list once per statement.
 pub(crate) const TRASH_SUBFOLDER_IDS: &str = "SELECT sub.id FROM folders sub
       JOIN folders bin ON bin.account_id = sub.account_id AND bin.role = 'trash'
-     WHERE substr(sub.path, 1, length(bin.path) + 1) IN (bin.path || '/', bin.path || '.')";
+     WHERE substr(sub.path, 1, length(bin.path) + 1) IN (
+           bin.path || coalesce(CASE WHEN json_valid(bin.sync_state_json)
+                                     THEN json_extract(bin.sync_state_json, '$.delim') END, '/'),
+           bin.path || coalesce(CASE WHEN json_valid(bin.sync_state_json)
+                                     THEN json_extract(bin.sync_state_json, '$.delim') END, '.'))";
 
 /// Mail that has been thrown away or judged to be junk.
 ///
@@ -1280,9 +1352,13 @@ impl ListView {
                 "{} AND ({alias}.snoozed_until_ms IS NULL OR {alias}.snoozed_until_ms <= (strftime('%s','now') * 1000))",
                 in_inbox(alias)
             ),
+            // Thrown away while it waits, it is in the bin and not here, as
+            // with Starred (docs/24 #16).
             ListView::Snoozed => {
                 format!(
-                    "{alias}.snoozed_until_ms IS NOT NULL AND {alias}.snoozed_until_ms > (strftime('%s','now') * 1000)"
+                    "{alias}.snoozed_until_ms IS NOT NULL AND {alias}.snoozed_until_ms > (strftime('%s','now') * 1000)
+                     AND {binned}",
+                    binned = not_binned(alias),
                 )
             }
             // A draft with a send time is not a draft any more, it is post. The
@@ -1956,14 +2032,7 @@ impl Store {
         // row whose copy in this folder is another UID: that is a second copy
         // on the server, which the paths below keep apart.
         let same_bytes: Option<(i64, String)> = {
-            let mut stmt = tx.prepare_cached(
-                "SELECT m.id, m.message_id_hdr FROM messages m
-                  WHERE m.account_id = ?1 AND m.blob_hash = ?2
-                    AND NOT EXISTS (SELECT 1 FROM placements p
-                                     WHERE p.message_id = m.id AND p.folder_id = ?3
-                                       AND p.uid IS NOT NULL AND p.uid IS NOT ?4)
-                  ORDER BY m.deleted_at_ms IS NOT NULL, m.message_id_hdr = ?5 DESC, m.id",
-            )?;
+            let mut stmt = tx.prepare_cached(SAME_BYTES)?;
             let rows = stmt.query_map(
                 params![account_id, hash, folder_id, uid.map(i64::from), bare_key],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
@@ -2325,10 +2394,11 @@ impl Store {
             }
         }
 
-        let subject_norm = crate::threading::normalize_subject(match &composer_subject {
+        let subject = match &composer_subject {
             Some(own) => own.as_str(),
             None => parsed.subject.as_deref().unwrap_or(""),
-        });
+        };
+        let subject_norm = crate::threading::normalize_subject(subject);
         // The nearest ancestors, and no more of them. References grows by one
         // id per reply and nothing trims it: a long-running list thread
         // arrived carrying 32,771 of them, and the ancestor lookup binds one
@@ -2347,6 +2417,7 @@ impl Store {
                 id,
                 parsed.message_id.as_deref(),
                 references,
+                subject,
                 &subject_norm,
                 date_ms,
             )?;
@@ -2463,6 +2534,10 @@ impl Store {
     /// extraction reaches only new mail — everything already held keeps
     /// whatever the old code produced. This is the version that says otherwise.
     ///
+    /// 11: Bcc is read, so Sent mail stored before it shows its blind copies
+    /// and is found by their addresses (docs/26 #185); and an HTML-only
+    /// message in a charset decoded here is indexed by its words, not its
+    /// markup (docs/24 #18).
     /// 10: a charset the Encoding Standard cannot place is no longer read as
     /// UTF-8 and replaced. That covers the vendor names Windows mailers send,
     /// CP932 for Japanese, CP949 and UHC for Korean, CP936 and CP950 for
@@ -2478,7 +2553,7 @@ impl Store {
     /// U+FFFD at every `ESC ( B ESC $ B`. A row the extractor now agrees with
     /// is still not written, so a store with none of this costs the read and
     /// no database pages.
-    pub const EXTRACTION_VERSION: i64 = 10;
+    pub const EXTRACTION_VERSION: i64 = 11;
 
     /// The blob backing a message, for the reading pane to fetch and render.
     /// Who sent a message and when — the two facts an attribution line needs.
@@ -3174,5 +3249,80 @@ mod tests {
         assert_eq!(match_expr("[z", true).unwrap(), "\"[z\"");
         assert!(match_expr("[", true).is_none());
         assert_eq!(match_expr("z.com", true).unwrap(), "\"z.com\"*");
+    }
+}
+
+/// The plans of the lookups every arrival and every server copy matched by
+/// Message-ID make, asked of the store's own connection (docs/26 #169).
+///
+/// With no statistics in the store, SQLite answered both from an index that
+/// leads with the account alone, so each one read the whole account: about
+/// 1.5 seconds to claim 300 server copies at 25,000 messages, with the store
+/// locked throughout. A plan is asserted rather than a time, so a planner that
+/// changes its mind is caught on any machine.
+#[cfg(test)]
+mod matching_plans {
+    use super::*;
+
+    fn plan(store: &Store, sql: &str, args: &[&dyn rusqlite::ToSql]) -> String {
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let rows = stmt
+            .query_map(args, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        rows.join("\n")
+    }
+
+    #[test]
+    fn ingest_looks_up_the_same_bytes_by_their_hash() {
+        let store = Store::open_in_memory().unwrap();
+        let p = plan(
+            &store,
+            SAME_BYTES,
+            params![1, "ab12", 1, 7, "x@example.com"],
+        );
+        eprintln!("same_bytes plan:\n{p}");
+        assert!(
+            p.contains("USING INDEX idx_messages_blob_hash (blob_hash=?)"),
+            "ingest must find the bytes by their hash, not walk the account:\n{p}"
+        );
+    }
+
+    /// `sole_holder_of` and `carries_its_message_id_alone` (folders.rs),
+    /// written as they are there around the shared predicate.
+    #[test]
+    fn a_message_id_is_looked_up_by_its_index() {
+        let store = Store::open_in_memory().unwrap();
+        let sole_holder = format!(
+            "SELECT m.id, m.message_id_hdr = ?2 FROM messages m
+              WHERE m.account_id = ?1 AND m.deleted_at_ms IS NULL AND {CARRIES_WIRE_ID}
+              LIMIT 2"
+        );
+        let alone = format!(
+            "SELECT count(*) FROM messages m
+              WHERE m.account_id = ?1 AND m.deleted_at_ms IS NULL AND m.id != ?3
+                AND {CARRIES_WIRE_ID}"
+        );
+        for (name, sql, args) in [
+            ("sole_holder_of", sole_holder, params![1, "x@example.com"]),
+            (
+                "carries_its_message_id_alone",
+                alone,
+                params![1, "x@example.com", 5],
+            ),
+        ] {
+            let p = plan(&store, &sql, args);
+            eprintln!("{name} plan:\n{p}");
+            assert!(
+                p.contains(
+                    "idx_messages_msgid (account_id=? AND message_id_hdr>? AND message_id_hdr<?)"
+                ),
+                "{name} must look the id up, not walk the account:\n{p}"
+            );
+        }
     }
 }

@@ -10,7 +10,16 @@ import { t } from '../../lib/strings';
  * offering it — the failure arrives after the message looks sent, which is the
  * worst moment to find out.
  */
-export function Identities({ onMessage }: { onMessage: (text: string) => void }) {
+export function Identities({
+  onMessage,
+  onChange,
+}: {
+  onMessage: (text: string) => void;
+  /** Each change as it is saved, and the account it is saved to. The window
+   *  starts new messages from its own copy of the identity, which kept the
+   *  old signature until a relaunch or an account switch. */
+  onChange?: (accountId: number, identity: Identity) => void;
+}) {
   const [identity, setIdentity] = useState<Identity | null>(null);
   // The account this pane opened on. Every save goes to it: one read from
   // the rail at the keystroke wrote this account's name and signature over
@@ -43,6 +52,7 @@ export function Identities({ onMessage }: { onMessage: (text: string) => void })
     api
       .setIdentity(accountId, next.display_name, next.signature, next.signature_on_reply)
       .catch((e) => onMessage(t('identity-save-failed', { error: String(e) })));
+    onChange?.(accountId, next);
   };
 
   if (error) {

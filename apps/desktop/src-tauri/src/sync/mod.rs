@@ -6,6 +6,10 @@ mod caps_tests;
 pub(crate) mod drafts;
 pub(crate) mod drain;
 pub(crate) mod reindex;
+#[cfg(all(test, feature = "dev-plaintext-imap"))]
+mod renumber_tests;
+#[cfg(all(test, feature = "dev-plaintext-imap"))]
+mod stateful_imap;
 
 use crate::diag::{friendly_sync_error_for, is_imap_parse_error, is_sign_in_refusal, log_sync};
 use crate::send::{spawn_outbox_clock, spawn_send_worker};
@@ -106,6 +110,8 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                         Ok(n) => log_sync(&format!("{n} folder(s) stored")),
                         Err(e) => log_sync(&format!("folder sync failed: {e}")),
                     }
+                    let _ =
+                        store.set_folder_delimiters(account, &survey_delimiters(&report.folders));
                     stored = store.set_all_mail_folders(account, &all_mail).is_ok();
                     if looks_like_gmail {
                         let _ = store.set_account_kind(account, "gmail");
@@ -118,11 +124,9 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
             }
             Err(e) => {
                 let raw = format!("{e}");
-                if is_imap_parse_error(&raw) {
-                    log_sync("folder discovery FAILED: imap-parse");
-                } else {
-                    log_sync(&format!("folder discovery FAILED: {e}"));
-                }
+                // By kind and code, as every other line: a NO here quotes
+                // folder names, and a parse error the whole unparsed reply.
+                log_sync(&format!("folder discovery FAILED: {}", loggable(&e)));
                 // Refused at the door: the account stands down here, before
                 // the drain, the sync or the bin's expiry ask again. They
                 // used to, a sign-in per queued archive, and twenty-two
@@ -198,7 +202,7 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                 log_sync(&format!("{failures} folder(s) could not be synced"));
             }
             if !targets.is_empty() && failures >= targets.len() {
-                let msg = "no folder could be synced";
+                let msg = crate::diag::NO_FOLDER_SYNCED;
                 log_sync(msg);
                 // The server's own reason, where there is one. "no folder could be
                 // synced" told somebody whose password had been revoked nothing,
@@ -405,9 +409,10 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                                 continue;
                             }
                             log_sync(&format!(
-                                "idle failed after {:.0}s, retrying in {}s: {e}",
+                                "idle failed after {:.0}s, retrying in {}s: {}",
                                 armed.elapsed().as_secs_f32(),
-                                backoff.as_secs()
+                                backoff.as_secs(),
+                                loggable(&e)
                             ));
                             tokio::select! {
                                 _ = tokio::time::sleep(backoff) => {}
@@ -475,7 +480,10 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                     }
                     Err(e) => {
                         // Refused again, or no answer at all: another hour.
-                        log_sync(&format!("account {account}: sign-in still failing: {e}"));
+                        log_sync(&format!(
+                            "account {account}: sign-in still failing: {}",
+                            loggable(&e)
+                        ));
                         state.refused_by(account, &stop);
                         continue;
                     }
@@ -635,7 +643,7 @@ pub(crate) fn spawn_real_sync(state: Arc<AppState>, account: i64, cfg: ImapConfi
                 let raw = report
                     .last_failure
                     .clone()
-                    .unwrap_or_else(|| "no folder could be synced".into());
+                    .unwrap_or_else(|| crate::diag::NO_FOLDER_SYNCED.into());
                 if is_sign_in_refusal(&raw) {
                     state.refused_by(account, &stop);
                 }
@@ -716,6 +724,7 @@ async fn refresh_folders(
             Ok(_) => {}
             Err(e) => log_sync(&format!("folder sync failed: {e}")),
         }
+        let _ = store.set_folder_delimiters(account, &survey_delimiters(&report.folders));
         if gmail {
             let _ = store.set_account_kind(account, "gmail");
         }
@@ -778,6 +787,21 @@ fn survey_rows(
         .collect()
 }
 
+/// Each listed folder's hierarchy delimiter, for `set_folder_delimiters`.
+///
+/// What nests inside what is the server's to say, and the LIST line says it.
+/// Recorded, it is the only separator the store and the rail nest by; until
+/// then they read both `/` and `.`, and a top-level `Trash.2019` on a `/`
+/// server was emptied with the Trash.
+fn survey_delimiters(
+    folders: &[petrel_providers::imap::FolderInfo],
+) -> Vec<(String, Option<String>)> {
+    folders
+        .iter()
+        .map(|f| (f.name.clone(), f.delimiter.clone()))
+        .collect()
+}
+
 /// Waits until this account's server is known to IDLE: false when it is
 /// known not to, or when the account stands down.
 ///
@@ -835,10 +859,11 @@ async fn create_waiting_folders(state: &Arc<AppState>, account: i64, cfg: &ImapC
                 if let Ok(store) = state.store.lock() {
                     let _ = store.confirm_folder_on_server(id);
                 }
-                log_sync(&format!("created {path} on the server"));
+                log_sync(&format!("created folder {id} on the server"));
             }
             Err(e) => log_sync(&format!(
-                "server create {path} failed, next sync retries: {e}"
+                "server create of folder {id} failed, next sync retries: {}",
+                loggable(&e)
             )),
         }
     }
@@ -1315,7 +1340,10 @@ async fn run_sync_cycle(
     let outcomes = match outcomes {
         Ok(o) => o,
         Err(e) => {
-            log_sync(&format!("sync cycle failed before any folder: {e}"));
+            log_sync(&format!(
+                "sync cycle failed before any folder: {}",
+                loggable(&e)
+            ));
             return CycleReport {
                 fresh,
                 failures: targets.len(),
@@ -1447,9 +1475,19 @@ async fn run_sync_cycle(
                     seen.remove(folder_id);
                 }
                 match recover_folder(state, account, cfg, path, *folder_id).await {
-                    Ok(_) => moved = true,
+                    Ok(_) => {
+                        moved = true;
+                        // A change queued against the old numbering was
+                        // refused by the server's SELECT and waits. Its
+                        // number is learned again now, so it goes now,
+                        // rather than at the next sweep minutes away.
+                        state.nudge_drain(account);
+                    }
                     Err(e) => {
-                        log_sync(&format!("folder {folder_id}: recovery failed: {e}"));
+                        log_sync(&format!(
+                            "folder {folder_id}: recovery failed: {}",
+                            loggable(&e)
+                        ));
                         last_failure = Some(e.to_string());
                         failures += 1;
                     }
@@ -1457,11 +1495,7 @@ async fn run_sync_cycle(
             }
             PassOutcome::Failed { detail } => {
                 if verbose {
-                    if is_imap_parse_error(detail) {
-                        log_sync(&format!("folder {folder_id}: FAILED: imap-parse"));
-                    } else {
-                        log_sync(&format!("folder {folder_id}: FAILED: {detail}"));
-                    }
+                    log_sync(&format!("folder {folder_id}: FAILED: {}", loggable(detail)));
                 }
                 last_failure = Some(detail.clone());
                 failures += 1;
@@ -1496,6 +1530,84 @@ async fn run_sync_cycle(
 /// Tells the window the mail moved, so the list on screen looks again.
 pub(crate) fn note_mail_moved(state: &AppState) {
     state.mail_gen.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A failure as sync.log may carry it.
+///
+/// A reply the IMAP parser choked on comes back with the reply quoted in the
+/// error, as bytes and as text: a FETCH line with its subject and addresses.
+/// The cycle has always logged those by their kind alone; backfill, recovery,
+/// the Gmail sweeps and the reconcile wrote them out whole (fifth audit #191).
+///
+/// A refusal quotes what it refused, too. Dovecot answers a move into a
+/// folder it lacks with "Mailbox doesn't exist: <name>" and Gmail with
+/// "Unknown Mailbox: <name>", and a folder's name is the person's own words.
+/// So a NO or a BAD is logged by its kind and its code, `NO [TRYCREATE]`,
+/// never its text (review r1, R1-3). The whole of it still reaches the
+/// window, where the person reads it.
+pub(crate) fn loggable(e: &impl std::fmt::Display) -> String {
+    let text = e.to_string();
+    if is_imap_parse_error(&text) {
+        "imap-parse".into()
+    } else {
+        refusal_by_code(&text).unwrap_or(text)
+    }
+}
+
+/// `text` with a NO or BAD response cut down to its kind and code, or `None`
+/// when it holds neither. Three shapes reach here. async-imap's is
+/// `no response: code: Some(TryCreate), info: Some("…")`, and a code it does
+/// not parse is left at the head of the info, in brackets. The other two are
+/// Petrel's own, for the commands whose replies it reads itself: the
+/// server's tagged reply as sent (`protocol: EXAMINE: NO [NONEXISTENT] …`),
+/// and its status by name (`protocol: UID SEARCH: No …`). What comes before
+/// the response is Petrel's own words, and stays.
+fn refusal_by_code(text: &str) -> Option<String> {
+    // The code as a server writes it: an atom at the head of the text.
+    let bracketed = |s: &str| {
+        let code: String = s
+            .strip_prefix('[')?
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        (!code.is_empty()).then(|| code.to_ascii_uppercase())
+    };
+    let said = |kind: &str, code: Option<String>| match code {
+        Some(code) => format!("{kind} [{code}]"),
+        None => kind.to_string(),
+    };
+    for (marker, kind) in [("no response: ", "NO"), ("bad response: ", "BAD")] {
+        let Some(at) = text.find(marker) else {
+            continue;
+        };
+        let rest = &text[at + marker.len()..];
+        let code = match rest.strip_prefix("code: Some(") {
+            Some(parsed) => Some(
+                parsed
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect::<String>()
+                    .to_ascii_uppercase(),
+            ),
+            None => rest
+                .split_once("info: Some(\"")
+                .and_then(|(_, info)| bracketed(info)),
+        };
+        return Some(format!("{}{}", &text[..at], said(kind, code)));
+    }
+    let (command, reply) = text.strip_prefix("protocol: ")?.split_once(": ")?;
+    let (status, words) = reply.split_once(' ').unwrap_or((reply, ""));
+    let kind = if status.eq_ignore_ascii_case("NO") {
+        "NO"
+    } else if status.eq_ignore_ascii_case("BAD") {
+        "BAD"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "protocol: {command}: {}",
+        said(kind, bracketed(words))
+    ))
 }
 
 /// Drops the placements a pass's search says have left `folder_id`, and
@@ -1802,7 +1914,9 @@ async fn tend_the_bin(state: &Arc<AppState>, account: i64) {
         let Ok(store) = state.store.lock() else {
             return;
         };
-        store.trash_expired(account, days, now).unwrap_or_default()
+        // Each number with its folder's validity, read under this one guard.
+        let due = store.trash_expired(account, days, now).unwrap_or_default();
+        crate::commands::triage::binned(&store, account, due)
     };
     if expired.is_empty() {
         return;
@@ -1839,7 +1953,7 @@ pub(crate) fn account_is_gmail(cfg: &ImapConfig) -> bool {
 /// with the lock released, and take it again only to apply what matched.
 fn apply_rules_to(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
     // ---- what the rules are, and where the mail is ------------------------
-    let (rules, policy, located) = {
+    let (rules, policy, located, gone) = {
         let Ok(store) = state.store.lock() else {
             return;
         };
@@ -1849,6 +1963,19 @@ fn apply_rules_to(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
         if rules.iter().all(|r| !r.enabled || r.conditions.is_empty()) {
             return;
         }
+        // Rules whose folder has since been deleted. Their move is left out
+        // of the plan rather than refused when it is made: planned together,
+        // a refused last move took the others' move and skip-inbox with it,
+        // where each rule on its own had still filed the mail.
+        let gone: HashSet<i64> = rules
+            .iter()
+            .filter(|r| {
+                r.actions
+                    .move_to
+                    .is_some_and(|f| !store.account_owns_folder(account, f).unwrap_or(false))
+            })
+            .map(|r| r.id)
+            .collect();
         let Ok(policy) = store.placement_policy(account) else {
             return;
         };
@@ -1860,19 +1987,21 @@ fn apply_rules_to(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
                 Some((id, hash, thread))
             })
             .collect();
-        (rules, policy, located)
+        (rules, policy, located, gone)
     };
 
     // ---- read, parse and match, with the store free ------------------------
-    // What each matching rule wants done, in the order it must happen.
-    let mut work: Vec<(i64, ActionKind, Option<i64>, String)> = Vec::new();
-    let mut announce: Vec<(String, String)> = Vec::new();
-    // One conversation, one action per rule. Two messages of the same thread
-    // arriving in the same pass each matched, and each queued the whole
+    // Which rules matched each conversation, by their place in `rules`.
+    //
+    // Per conversation, not per message and rule. Two messages of the same
+    // thread arriving in the same pass each matched, and each queued the whole
     // thread's move — telling the server twice to do what it had just been
     // told, and stamping the second action's undo snapshot with the state the
-    // first had already changed.
-    let mut done: HashSet<(i64, i64)> = HashSet::new();
+    // first had already changed. And planned as one: two rules, one moving
+    // and one skipping the inbox, queued Move then Archive, and the Archive
+    // undid the move (`rules::planned_for`).
+    let mut matched: Vec<(i64, std::collections::BTreeSet<usize>)> = Vec::new();
+    let mut announce: Vec<(String, String)> = Vec::new();
     for (_message_id, hash, thread) in located {
         let Ok(raw) = state.blobs.read(&hash) else {
             continue;
@@ -1883,7 +2012,7 @@ fn apply_rules_to(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
         // What a condition can see belongs with the matching, not here.
         let envelope = petrel_engine::rules::Envelope::from_message(&parsed, raw.len() as u64);
         let mut announced = false;
-        for rule in &rules {
+        for (index, rule) in rules.iter().enumerate() {
             if !petrel_engine::rules::matches(rule, &envelope) {
                 continue;
             }
@@ -1903,14 +2032,39 @@ fn apply_rules_to(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
                     .unwrap_or_default();
                 announce.push((who, parsed.subject.clone().unwrap_or_default()));
             }
-            if !done.insert((rule.id, thread)) {
-                continue;
+            match matched.iter_mut().find(|(t, _)| *t == thread) {
+                Some((_, rules)) => {
+                    rules.insert(index);
+                }
+                None => matched.push((thread, std::iter::once(index).collect())),
             }
-            // The order, and the move/skip-inbox interaction, belong with the
-            // rules engine where they can be tested without an AppState.
-            for (kind, target) in petrel_engine::rules::planned_actions(a) {
-                work.push((thread, kind, target, rule.name.clone()));
-            }
+        }
+    }
+    // The order, and the move/skip-inbox interaction, belong with the rules
+    // engine where they can be tested without an AppState.
+    let mut work: Vec<(i64, ActionKind, Option<i64>, i64)> = Vec::new();
+    let mut said_gone: HashSet<i64> = HashSet::new();
+    for (thread, indices) in &matched {
+        let chosen: Vec<&petrel_engine::rules::Rule> = indices.iter().map(|&i| &rules[i]).collect();
+        let actions: Vec<petrel_engine::rules::Actions> = chosen
+            .iter()
+            .map(|r| {
+                let mut a = r.actions.clone();
+                if gone.contains(&r.id) {
+                    a.move_to = None;
+                    // Said out loud, because the rule will go on being wrong
+                    // every time it matches until someone edits it. By its
+                    // id: the name is the person's own words.
+                    if said_gone.insert(r.id) {
+                        log_sync(&format!("rule {}: the folder it moves to is gone", r.id));
+                    }
+                }
+                a
+            })
+            .collect();
+        let actions: Vec<&petrel_engine::rules::Actions> = actions.iter().collect();
+        for (kind, target, from) in petrel_engine::rules::planned_for(&actions) {
+            work.push((*thread, kind, target, chosen[from].id));
         }
     }
     if work.is_empty() && announce.is_empty() {
@@ -1928,13 +2082,14 @@ fn apply_rules_to(state: &Arc<AppState>, account: i64, arrivals: &[i64]) {
         let Ok(store) = state.store.lock() else {
             return;
         };
-        for (thread, kind, target, name) in work {
+        for (thread, kind, target, rule) in work {
             match store.apply_thread_action(account, thread, kind, target, policy) {
                 // A rule naming a folder or tag the user has since deleted is
                 // refused by the store rather than half-performed. Said out
                 // loud here, because the rule will go on being wrong every
-                // time it matches until someone edits it.
-                Err(e) => log_sync(&format!("rule \"{name}\": {e}")),
+                // time it matches until someone edits it. By its id: the name
+                // is the person's own words, as often as not a sender's.
+                Err(e) => log_sync(&format!("rule {rule}: {e}")),
                 Ok(_) => applied += 1,
             }
         }
@@ -2001,7 +2156,7 @@ async fn run_label_sweep(state: &Arc<AppState>, account: i64, cfg: &ImapConfig) 
         }
         // Not fatal: without it, filing falls back to the folder each
         // message arrived from, which is what it was before.
-        Err(e) => log_sync(&format!("label sweep failed: {e}")),
+        Err(e) => log_sync(&format!("label sweep failed: {}", loggable(&e))),
     }
 }
 
@@ -2043,7 +2198,7 @@ async fn number_swept_inbox_placements(state: &Arc<AppState>, account: i64, cfg:
     let listing = match petrel_providers::imap::fetch_id_map_range(cfg, &path, 1, u32::MAX).await {
         Ok(l) => l,
         Err(e) => {
-            log_sync(&format!("inbox identity listing failed: {e}"));
+            log_sync(&format!("inbox identity listing failed: {}", loggable(&e)));
             return;
         }
     };
@@ -2056,7 +2211,10 @@ async fn number_swept_inbox_placements(state: &Arc<AppState>, account: i64, cfg:
             out.rematched, out.dropped
         )),
         Ok(_) => {}
-        Err(e) => log_sync(&format!("inbox placement reconcile failed: {e}")),
+        Err(e) => log_sync(&format!(
+            "inbox placement reconcile failed: {}",
+            loggable(&e)
+        )),
     }
 }
 
@@ -2111,7 +2269,7 @@ async fn run_thrid_sweep(state: &Arc<AppState>, account: i64, cfg: &ImapConfig) 
             }
         }
         // Not fatal: threading falls back to what References could prove.
-        Err(e) => log_sync(&format!("thread sweep failed: {e}")),
+        Err(e) => log_sync(&format!("thread sweep failed: {}", loggable(&e))),
     }
 }
 
@@ -2160,14 +2318,37 @@ async fn reconcile_ghost_placements(
         if i64::from(*server) == local {
             continue;
         }
-        let present: std::collections::HashSet<u32> =
-            match petrel_providers::imap::uids_in_folder(cfg, &path).await {
-                Ok(uids) => uids.into_iter().collect(),
-                Err(e) => {
-                    log_sync(&format!("folder {folder_id}: reconcile sweep failed: {e}"));
-                    continue;
-                }
-            };
+        let listed = match petrel_providers::imap::folder_uids(cfg, &path).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                log_sync(&format!(
+                    "folder {folder_id}: reconcile sweep failed: {}",
+                    loggable(&e)
+                ));
+                continue;
+            }
+        };
+        // Only under the numbering the store's UIDs were read in. This runs
+        // before the cycle that notices a renumbering, and at launch after a
+        // recovery that may have failed: comparing the server's new UIDs
+        // with stored old ones made every placement whose number was not
+        // reused look gone, and they were removed — mail the server still
+        // held, hidden and out of search, and back only 200 at a time. A
+        // changed numbering is the recovery's to mend; this leaves it alone.
+        let held_validity = state
+            .store
+            .lock()
+            .ok()
+            .and_then(|s| s.folder_validity(folder_id).ok().flatten());
+        if let (Some(held), Some(now)) = (held_validity, listed.uid_validity)
+            && held != now
+        {
+            log_sync(&format!(
+                "folder {folder_id}: numbering changed; reconcile left to recovery"
+            ));
+            continue;
+        }
+        let present: std::collections::HashSet<u32> = listed.uids.into_iter().collect();
         // Outward: placements the server no longer backs go.
         let removed = state
             .store
@@ -2218,6 +2399,23 @@ async fn reconcile_ghost_placements(
             &path,
             &missing,
             |uid, flags, raw| {
+                // Compressed before the lock, as every other fetch does: one
+                // large message compressed inside it stalls the whole app.
+                let _ = state.blobs.write(raw);
+                // Read outside the lock and inside a fence. A message that
+                // panics the parser is skipped by the ordinary fetch, which
+                // leaves the folder one short — so this sweep fetched it
+                // again every cycle, and parsing it here, unfenced and under
+                // the store lock, poisoned the lock: every command failed
+                // from then on, at every launch.
+                let Ok(mid) = std::panic::catch_unwind(|| {
+                    petrel_mime::parse_message(raw).and_then(|p| p.message_id)
+                }) else {
+                    log_sync(&format!(
+                        "folder {folder_id}: uid {uid} PANICKED the parser — message skipped; this is a bug worth reporting"
+                    ));
+                    return;
+                };
                 let Ok(mut store) = state.store.lock() else { return };
                 // Two copies of one Message-ID, both live on the server right
                 // now — this sweep only fetches UIDs the server just named.
@@ -2225,19 +2423,24 @@ async fn reconcile_ghost_placements(
                 // throw its content away; a draft edited apart on the server,
                 // or a double-delivered message, is two rows there and stays
                 // two rows here.
-                if let Some(parsed) = petrel_mime::parse_message(raw)
-                    && let Some(mid) = parsed.message_id.as_deref()
+                if let Some(mid) = mid.as_deref()
                     && let Ok(Some(existing)) = store.message_by_msgid(account, mid)
                     && matches!(store.placement_uid(existing, folder_id), Ok(Some(Some(held))) if held != i64::from(uid))
                 {
-                    match store.ingest_raw_second_copy(&state.blobs, account, Some(folder_id), uid, raw) {
-                        Ok(ingested) => {
+                    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        store.ingest_raw_second_copy(&state.blobs, account, Some(folder_id), uid, raw)
+                    }));
+                    match second {
+                        Ok(Ok(ingested)) => {
                             let _ = store.set_message_flags(ingested.message_id, flags);
                             log_sync(&format!(
                                 "folder {folder_id}: uid {uid} is a second live copy of a stored message; kept as its own"
                             ));
                         }
-                        Err(e) => log_sync(&format!("folder {folder_id}: second copy uid {uid} failed: {e}")),
+                        Ok(Err(e)) => log_sync(&format!("folder {folder_id}: second copy uid {uid} failed: {}", loggable(&e))),
+                        Err(_) => log_sync(&format!(
+                            "folder {folder_id}: second copy uid {uid} PANICKED — message skipped; this is a bug worth reporting"
+                        )),
                     }
                     return;
                 }
@@ -2890,5 +3093,215 @@ mod elsewhere_tests {
         state.store().unwrap().set_active_account(other).unwrap();
         announce_elsewhere(&state, other, &arrivals);
         assert!(state.pending_elsewhere.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod loggable_tests {
+    use super::loggable;
+
+    /// Review r1, R1-3. A server's refusal quotes what it refused, and that
+    /// is a folder's name: Dovecot's "Mailbox doesn't exist: <name>", Gmail's
+    /// "Unknown Mailbox: <name>". A real account logged one such line 112
+    /// times (`drain::refusal_tests`). A NO or a BAD is logged by its kind
+    /// and its code, in every shape a refusal reaches the log in.
+    #[test]
+    fn a_refusal_is_logged_by_its_kind_and_code() {
+        for (error, logged) in [
+            // async-imap's, with the code it parsed.
+            (
+                "imap: no response: code: Some(TryCreate), info: Some(\"Mailbox doesn't exist: Larkspur Holdings (0.001 + 0.000 secs).\")",
+                "imap: NO [TRYCREATE]",
+            ),
+            // A code it does not parse stays at the head of the text.
+            (
+                "imap: no response: code: None, info: Some(\"[NONEXISTENT] Unknown Mailbox: Larkspur Holdings (Failure)\")",
+                "imap: NO [NONEXISTENT]",
+            ),
+            // A failed folder's detail, as the sync pass words it.
+            (
+                "no response: code: None, info: Some(\"Mailbox doesn't exist: Larkspur Holdings\")",
+                "NO",
+            ),
+            (
+                "imap: bad response: code: None, info: Some(\"Error in IMAP command CREATE: Invalid mailbox name: Larkspur/\")",
+                "imap: BAD",
+            ),
+            (
+                "protocol: created, but the server refused to subscribe: no response: code: None, info: Some(\"Larkspur Holdings\")",
+                "protocol: created, but the server refused to subscribe: NO",
+            ),
+            // Petrel's own exchanges: the tagged reply as the server sent
+            // it, and its status by name.
+            (
+                "protocol: EXAMINE: NO [NONEXISTENT] Mailbox doesn't exist: Larkspur Holdings",
+                "protocol: EXAMINE: NO [NONEXISTENT]",
+            ),
+            (
+                "protocol: UID SEARCH: No Mailbox doesn't exist: Larkspur Holdings",
+                "protocol: UID SEARCH: NO",
+            ),
+            (
+                "protocol: UID: Bad Error in IMAP command: Larkspur Holdings",
+                "protocol: UID: BAD",
+            ),
+        ] {
+            assert_eq!(loggable(&error), logged, "{error}");
+        }
+    }
+
+    /// What is not a refusal says nothing of the person's mail, and is kept
+    /// whole: "No route to host" is not a NO.
+    #[test]
+    fn anything_else_is_logged_as_it_stands() {
+        for error in [
+            "network: No route to host (os error 65)",
+            "the folder was renumbered (UIDVALIDITY 1 is now 2); nothing was done",
+            "protocol: there is no Message-ID to search for",
+            "protocol: connection closed mid-command",
+            "tls: the TLS handshake did not finish within 30s",
+        ] {
+            assert_eq!(loggable(&error), error);
+        }
+        assert_eq!(
+            loggable(&"imap: parse: Error { input: [42, 32], code: TakeWhile1 } during parsing"),
+            "imap-parse"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rules_on_arrival_tests {
+    use super::apply_rules_to;
+    use petrel_engine::rules::{Actions, Condition, Op};
+
+    fn condition(field: &str, value: &str) -> Condition {
+        Condition {
+            field: field.into(),
+            header: None,
+            op: Op::Contains,
+            value: value.into(),
+        }
+    }
+
+    /// One rule moves the vendor's mail to Vendors, another skips the inbox
+    /// for anything about an invoice. Planned rule by rule, the Archive the
+    /// second queued after the first's Move took the mail out of Vendors, and
+    /// it ended in Archive with nothing to say why.
+    #[test]
+    fn a_move_and_another_rules_skip_inbox_file_the_mail_where_it_was_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_state(dir.path());
+        let account = state.account_id;
+        let (id, vendors) = {
+            let mut store = state.store.lock().unwrap();
+            store
+                .sync_folders(
+                    account,
+                    &[
+                        ("INBOX".into(), Some("inbox".into())),
+                        ("Archive".into(), Some("archive".into())),
+                        ("Vendors".into(), None),
+                    ],
+                )
+                .unwrap();
+            let inbox = store.folder_for_role(account, "inbox").unwrap().unwrap();
+            let vendors = store.ensure_named_folder(account, "Vendors").unwrap();
+            let raw = b"From: Dana <dana@vendor.example>\r\nTo: me@example.com\r\n\
+                Subject: Invoice 12 for September\r\nMessage-ID: <inv12@vendor.example>\r\n\
+                Date: Tue, 18 Aug 2026 14:02:00 +0000\r\n\r\nattached\r\n";
+            let id = store
+                .ingest_raw(&state.blobs, account, Some(inbox), Some(1), raw)
+                .unwrap()
+                .message_id;
+            store
+                .save_rule(
+                    account,
+                    None,
+                    "Vendor mail",
+                    true,
+                    &[condition("from", "vendor.example")],
+                    &Actions {
+                        move_to: Some(vendors),
+                        ..Actions::default()
+                    },
+                )
+                .unwrap();
+            store
+                .save_rule(
+                    account,
+                    None,
+                    "Invoices",
+                    true,
+                    &[condition("subject", "invoice")],
+                    &Actions {
+                        skip_inbox: true,
+                        ..Actions::default()
+                    },
+                )
+                .unwrap();
+            (id, vendors)
+        };
+
+        apply_rules_to(&state, account, &[id]);
+
+        let store = state.store.lock().unwrap();
+        assert_eq!(store.folders_of(id).unwrap(), vec![vendors]);
+        assert_eq!(
+            store.pending_actions(account).unwrap().len(),
+            1,
+            "one move, and no archive after it"
+        );
+    }
+
+    /// A later rule whose folder has since been deleted does not cancel the
+    /// earlier rule's move: planned together, its refused move was the one
+    /// chosen, and the mail went nowhere.
+    #[test]
+    fn a_rule_whose_folder_is_gone_does_not_cancel_another_rules_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_state(dir.path());
+        let account = state.account_id;
+        let (id, vendors) = {
+            let mut store = state.store.lock().unwrap();
+            store
+                .sync_folders(account, &[("INBOX".into(), Some("inbox".into()))])
+                .unwrap();
+            let inbox = store.folder_for_role(account, "inbox").unwrap().unwrap();
+            let vendors = store.ensure_named_folder(account, "Vendors").unwrap();
+            let doomed = store.ensure_named_folder(account, "Old invoices").unwrap();
+            let raw = b"From: Dana <dana@vendor.example>\r\nTo: me@example.com\r\n\
+                Subject: Invoice 13 for October\r\nMessage-ID: <inv13@vendor.example>\r\n\
+                Date: Tue, 18 Aug 2026 14:02:00 +0000\r\n\r\nattached\r\n";
+            let id = store
+                .ingest_raw(&state.blobs, account, Some(inbox), Some(1), raw)
+                .unwrap()
+                .message_id;
+            for (name, field, value, folder) in [
+                ("Vendor mail", "from", "vendor.example", vendors),
+                ("Invoices", "subject", "invoice", doomed),
+            ] {
+                store
+                    .save_rule(
+                        account,
+                        None,
+                        name,
+                        true,
+                        &[condition(field, value)],
+                        &Actions {
+                            move_to: Some(folder),
+                            ..Actions::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            store.remove_folder(doomed).unwrap();
+            (id, vendors)
+        };
+
+        apply_rules_to(&state, account, &[id]);
+
+        let store = state.store.lock().unwrap();
+        assert_eq!(store.folders_of(id).unwrap(), vec![vendors]);
     }
 }

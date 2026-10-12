@@ -63,7 +63,7 @@ async fn a_draft_edit_replaces_its_server_copy() {
     assert_eq!(both.len(), 2);
     let new_uid = *both.iter().find(|u| **u != old_uid).unwrap();
     assert!(
-        expunge_uid(&cfg, "Drafts", old_uid, true)
+        expunge_uid(&cfg, "Drafts", old_uid, None, true)
             .await
             .expect("expunge old"),
         "old copy removed"
@@ -74,7 +74,7 @@ async fn a_draft_edit_replaces_its_server_copy() {
     assert_eq!(after, vec![new_uid], "exactly the new revision remains");
 
     // Discard: the copy goes too.
-    expunge_uid(&cfg, "Drafts", new_uid, true)
+    expunge_uid(&cfg, "Drafts", new_uid, None, true)
         .await
         .expect("cleanup");
     let gone = uids_for_message_id(&cfg, "Drafts", &msgid)

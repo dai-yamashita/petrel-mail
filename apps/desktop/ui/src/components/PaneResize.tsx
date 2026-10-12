@@ -1,4 +1,4 @@
-import type React from 'react';
+import { followPress } from '../lib/press';
 import { t } from '../lib/strings';
 
 /**
@@ -13,22 +13,6 @@ import { t } from '../lib/strings';
  * people cannot change at all.
  */
 export function PaneResize({ onResize }: { onResize: (xOrDelta: number) => void }) {
-  const startDrag = (e: React.PointerEvent) => {
-    e.preventDefault();
-    // Listeners on the window, not the handle: a fast drag outruns a 6px
-    // target, and a pointer lost mid-drag would leave the panes at whatever
-    // width the last event happened to land on.
-    const move = (ev: PointerEvent) => onResize(ev.clientX);
-    const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-      document.body.classList.remove('resizing');
-    };
-    document.body.classList.add('resizing');
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
-  };
-
   return (
     <div
       className="pane-resize"
@@ -36,7 +20,9 @@ export function PaneResize({ onResize }: { onResize: (xOrDelta: number) => void 
       aria-orientation="vertical"
       aria-label={t('pane-resize')}
       tabIndex={0}
-      onPointerDown={startDrag}
+      // A context click here began a resize that no release ever ended, so the
+      // panes followed the pointer until the next click: see `followPress`.
+      onPointerDown={(e) => followPress(e, onResize)}
       onKeyDown={(e) => {
         const step = e.shiftKey ? 32 : 8;
         if (e.key === 'ArrowLeft') {

@@ -97,6 +97,7 @@ async fn a_move_the_caller_knows_nothing_about_asks_and_moves() {
         &cfg(port),
         "INBOX",
         5,
+        None,
         "Archive",
         false,
         false,
@@ -117,7 +118,9 @@ async fn a_move_the_caller_knows_nothing_about_asks_and_moves() {
 async fn an_expunge_the_caller_knows_nothing_about_asks_and_expunges() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let port = server(Arc::clone(&seen), Some("UIDPLUS")).await;
-    let expunged = expunge_uid(&cfg(port), "Trash", 4, false).await.unwrap();
+    let expunged = expunge_uid(&cfg(port), "Trash", 4, None, false)
+        .await
+        .unwrap();
     assert!(expunged, "{:?}", seen.lock().unwrap());
     assert!(said(&seen, "UID EXPUNGE 4"), "{:?}", seen.lock().unwrap());
 }
@@ -141,6 +144,7 @@ async fn a_server_without_move_or_uidplus_still_gets_the_careful_path() {
         &cfg(port),
         "INBOX",
         5,
+        None,
         "Archive",
         false,
         false,
@@ -165,6 +169,7 @@ async fn a_refused_capability_keeps_the_careful_path() {
         &cfg(port),
         "INBOX",
         5,
+        None,
         "Archive",
         false,
         false,
@@ -184,10 +189,12 @@ async fn a_refused_capability_keeps_the_careful_path() {
 async fn a_caller_that_knows_does_not_pay_for_asking() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let port = server(Arc::clone(&seen), Some("MOVE UIDPLUS")).await;
-    move_uid(&cfg(port), "INBOX", 5, "Archive", true, true, None)
+    move_uid(&cfg(port), "INBOX", 5, None, "Archive", true, true, None)
         .await
         .unwrap();
-    expunge_uid(&cfg(port), "Trash", 4, true).await.unwrap();
+    expunge_uid(&cfg(port), "Trash", 4, None, true)
+        .await
+        .unwrap();
     move_all(&cfg(port), "Old", "Trash", true).await.unwrap();
     assert!(!said(&seen, " CAPABILITY"), "{:?}", seen.lock().unwrap());
 }
