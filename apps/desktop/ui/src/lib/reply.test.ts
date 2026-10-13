@@ -13,6 +13,8 @@ const message = (over: Partial<ThreadMessage> = {}): ThreadMessage =>
     unread: false,
     recipients: [],
     recipient_addrs: ['you@example.com', 'dana@example.com'],
+    to_addrs: ['you@example.com', 'dana@example.com'],
+    cc_addrs: [],
     attachments: [],
     ...over,
   }) as ThreadMessage;
@@ -92,6 +94,18 @@ describe('reply all', () => {
     expect(cc).toEqual(['dana@example.com']);
   });
 
+  it('keeps a Cc address in Cc on reply-all, not in To', () => {
+    const m = message({
+      recipient_addrs: ['you@example.com', 'dana@example.com', 'alex@example.com'],
+      to_addrs: ['you@example.com', 'dana@example.com'],
+      cc_addrs: ['alex@example.com'],
+    });
+    const { to, cc } = replyTargets(m, 'you@example.com', true);
+    expect(to).toEqual(['sam@example.com']);
+    expect(cc).toContain('alex@example.com');
+    expect(to).not.toContain('alex@example.com');
+  });
+
   it('degrades to a plain reply when there is nobody else', () => {
     const m = message({ recipient_addrs: ['you@example.com'] });
     expect(replyTargets(m, 'you@example.com', true)).toEqual({
@@ -106,6 +120,8 @@ describe('replying to a message you sent', () => {
     from_addr: 'you@example.com',
     from_display: 'You',
     recipient_addrs: ['sam@example.com', 'dana@example.com'],
+    to_addrs: ['sam@example.com', 'dana@example.com'],
+    cc_addrs: [],
   });
 
   it('writes to the people you wrote to, not to yourself', () => {
