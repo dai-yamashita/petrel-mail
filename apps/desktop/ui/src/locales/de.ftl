@@ -710,6 +710,7 @@ folder-into-itself = Ein Ordner kann nicht in sich selbst verschoben werden.
 folder-trashed = „{ $name }“ in den Papierkorb gelegt. Ziehen Sie ihn wieder heraus, um ihn zurückzuholen, oder löschen Sie ihn über sein Menü endgültig.
 folder-fold = Einklappen
 folder-unfold = Ausklappen
+folder-container-tip = Kein Ordner auf dem Server. Er fasst nur die Ordner darin zusammen.
 folder-delete = Ordner löschen
 folder-mark-all-read = Alle als gelesen markieren
 folder-mark-all-unread = Alle als ungelesen markieren

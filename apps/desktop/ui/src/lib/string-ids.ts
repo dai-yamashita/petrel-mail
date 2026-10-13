@@ -676,6 +676,7 @@ export const STRING_IDS = [
   'folder-trashed',
   'folder-fold',
   'folder-unfold',
+  'folder-container-tip',
   'folder-delete',
   'folder-mark-all-read',
   'folder-mark-all-unread',

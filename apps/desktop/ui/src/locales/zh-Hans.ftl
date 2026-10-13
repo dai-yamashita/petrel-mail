@@ -668,6 +668,7 @@ folder-into-itself = 文件夹不能移到自己里面。
 folder-trashed = 已将“{ $name }”移到废纸篓。拖出来即可恢复，或从它的菜单中彻底删除。
 folder-fold = 收起
 folder-unfold = 展开
+folder-container-tip = 服务器上没有这个文件夹，它只用来归拢其中的文件夹。
 folder-delete = 删除文件夹
 folder-mark-all-read = 全部标为已读
 folder-mark-all-unread = 全部标为未读

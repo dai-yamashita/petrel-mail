@@ -703,6 +703,7 @@ folder-into-itself = 폴더를 자기 자신 안으로 옮길 수 없습니다.
 folder-trashed = “{ $name }”을(를) 휴지통으로 옮겼습니다. 되돌리려면 다시 끌어내고, 완전히 지우려면 메뉴에서 삭제하세요.
 folder-fold = 접기
 folder-unfold = 펼치기
+folder-container-tip = 서버에 있는 폴더가 아닙니다. 안에 있는 폴더를 묶어 보여 줄 뿐입니다.
 folder-delete = 폴더 삭제
 folder-mark-all-read = 모두 읽음으로 표시
 folder-mark-all-unread = 모두 읽지 않음으로 표시

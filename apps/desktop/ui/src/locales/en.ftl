@@ -723,6 +723,7 @@ folder-into-itself = A folder cannot move into itself.
 folder-trashed = Moved “{ $name }” to Trash. Drag it back out to restore, or delete it from its menu for good.
 folder-fold = Collapse
 folder-unfold = Expand
+folder-container-tip = Not a folder on the server. It only groups the folders inside it.
 folder-delete = Delete folder
 folder-mark-all-read = Mark all as read
 folder-mark-all-unread = Mark all as unread
