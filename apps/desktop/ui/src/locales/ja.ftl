@@ -668,6 +668,7 @@ folder-into-itself = フォルダを自分自身の中には移動できませ�
 folder-trashed = 「{ $name }」をゴミ箱に入れました。戻すには外へドラッグし、完全に消すにはメニューから削除してください。
 folder-fold = 折りたたむ
 folder-unfold = 展開
+folder-container-tip = サーバー上のフォルダではありません。中のフォルダをまとめているだけです。
 folder-delete = フォルダを削除
 folder-mark-all-read = すべて既読にする
 folder-mark-all-unread = すべて未読にする

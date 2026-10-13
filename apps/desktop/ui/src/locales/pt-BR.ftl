@@ -711,6 +711,7 @@ folder-into-itself = Uma pasta não pode ser movida para dentro dela mesma.
 folder-trashed = “{ $name }” movida para a lixeira. Arraste de volta para restaurar, ou apague pelo menu dela de vez.
 folder-fold = Recolher
 folder-unfold = Expandir
+folder-container-tip = Não é uma pasta no servidor. Apenas agrupa as pastas dentro dela.
 folder-delete = Excluir pasta
 folder-mark-all-read = Marcar tudo como lido
 folder-mark-all-unread = Marcar tudo como não lido

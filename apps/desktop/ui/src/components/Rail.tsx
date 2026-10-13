@@ -458,7 +458,11 @@ export function Rail({
           {inner}
         </Tip>
       ) : (
-        inner
+        // A rung with no mailbox behind it has no menu and opens nothing, so
+        // it says what it is: otherwise it reads as a folder that is stuck.
+        <Tip key={n.path} label={t('folder-container-tip')} placement="right" when={!dense}>
+          {inner}
+        </Tip>
       );
     return (
       <div key={n.path}>

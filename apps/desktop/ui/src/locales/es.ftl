@@ -731,6 +731,7 @@ folder-into-itself = Una carpeta no puede moverse dentro de sí misma.
 folder-trashed = “{ $name }” movida a la papelera. Arrástrala fuera para restaurarla, o elimínala desde su menú para siempre.
 folder-fold = Contraer
 folder-unfold = Expandir
+folder-container-tip = No es una carpeta del servidor. Solo agrupa las carpetas que contiene.
 folder-delete = Eliminar carpeta
 folder-mark-all-read = Marcar todo como leído
 folder-mark-all-unread = Marcar todo como no leído

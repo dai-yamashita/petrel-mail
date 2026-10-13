@@ -710,6 +710,7 @@ folder-into-itself = Un dossier ne peut pas se déplacer dans lui-même.
 folder-trashed = « { $name } » mis à la corbeille. Faites-le glisser hors de là pour le restaurer, ou supprimez-le depuis son menu définitivement.
 folder-fold = Réduire
 folder-unfold = Déployer
+folder-container-tip = Ce n’est pas un dossier sur le serveur. Il regroupe seulement les dossiers qu’il contient.
 folder-delete = Supprimer le dossier
 folder-mark-all-read = Tout marquer comme lu
 folder-mark-all-unread = Tout marquer comme non lu
