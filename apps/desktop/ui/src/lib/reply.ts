@@ -69,6 +69,16 @@ export function replyTargets(
   const own = message.from_addr.trim().toLowerCase() === mine;
   const asked = replyTo.filter((a) => a.trim() !== '');
   const answering = asked.length > 0 ? asked : [message.from_addr];
+
+  if (own && all) {
+    const roleSplit = message.to_addrs !== undefined;
+    const toSource = roleSplit ? message.to_addrs : (message.recipient_addrs ?? []);
+    const ccSource = roleSplit ? (message.cc_addrs ?? []) : [];
+    const to = toSource.map(take).filter((a): a is string => a !== null);
+    const cc = ccSource.map(take).filter((a): a is string => a !== null);
+    return { to, cc };
+  }
+
   const to = (own ? (message.recipient_addrs ?? []) : answering)
     .map(take)
     .filter((a): a is string => a !== null);

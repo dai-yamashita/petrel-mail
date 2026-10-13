@@ -64,6 +64,8 @@ function messageFromCard(
     unread: card.unread,
     to: [],
     cc: [],
+    to_addrs: [],
+    cc_addrs: [],
     recipients: [],
     recipient_addrs: [],
     attachments: [],

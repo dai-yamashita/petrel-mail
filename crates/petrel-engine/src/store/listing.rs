@@ -1653,6 +1653,8 @@ impl Store {
         ) in rows
         {
             let buckets = addrs.get(&id).cloned().unwrap_or_default();
+            let to_addrs: Vec<String> = buckets.to.iter().map(|(_, a)| a.clone()).collect();
+            let cc_addrs: Vec<String> = buckets.cc.iter().map(|(_, a)| a.clone()).collect();
             let to: Vec<String> = buckets.to.iter().map(|(d, _)| d.clone()).collect();
             let cc: Vec<String> = buckets.cc.iter().map(|(d, _)| d.clone()).collect();
             let bcc: Vec<String> = buckets.bcc.iter().map(|(d, _)| d.clone()).collect();
@@ -1677,6 +1679,8 @@ impl Store {
                 invite_response,
                 to,
                 cc,
+                to_addrs,
+                cc_addrs,
                 bcc,
                 recipients,
                 recipient_addrs,

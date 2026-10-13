@@ -418,8 +418,13 @@ pub struct ThreadMessage {
     pub to: Vec<String>,
     /// Cc, display names. Empty when the message copied nobody.
     pub cc: Vec<String>,
+    /// To, addresses — header order.
+    pub to_addrs: Vec<String>,
+    /// Cc, addresses. Empty when the message copied nobody.
+    pub cc_addrs: Vec<String>,
     /// Bcc, display names: on the sender's own copy, where the header was
-    /// kept. Not in `recipients` or `recipient_addrs`, so no reply reaches them.
+    /// kept. Not in `recipients`, `recipient_addrs`, `to_addrs`, or `cc_addrs`,
+    /// so no reply reaches them.
     pub bcc: Vec<String>,
     /// Display names, To then Cc — "to Sam Ortiz, Dana Wu". Reply-all still
     /// walks this combined list so original To people are not left off.

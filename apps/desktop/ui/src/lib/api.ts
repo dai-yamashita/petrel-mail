@@ -170,8 +170,13 @@ export type ThreadMessage = {
   to: string[];
   /** Cc, display names. Empty when the message copied nobody. */
   cc: string[];
+  /** To, addresses — header order. */
+  to_addrs: string[];
+  /** Cc, addresses. Empty when the message copied nobody. */
+  cc_addrs: string[];
   /** Bcc, display names: on your own sent copies, where the header was kept.
-   *  Never part of `recipients` or `recipient_addrs`, so no reply reaches them. */
+   *  Never part of `recipients`, `recipient_addrs`, `to_addrs`, or `cc_addrs`,
+   *  so no reply reaches them. */
   bcc?: string[];
   recipients: string[];
   recipient_addrs: string[];
@@ -434,6 +439,8 @@ function mockFatMessage(id: number, n: number, base: number): ThreadMessage {
     unread: id === n,
     to: ['Reader'],
     cc: [],
+    to_addrs: ['reader@example.test'],
+    cc_addrs: [],
     recipients: ['Reader'],
     recipient_addrs: ['reader@example.test'],
     attachments: [],
@@ -507,6 +514,8 @@ const MOCK_THREAD_DETAIL = [
     unread: false,
     to: ['Sam Ortiz', 'me'],
     cc: [],
+    to_addrs: ['sam@example.com', 'you@example.com'],
+    cc_addrs: [],
     recipients: ['Sam Ortiz', 'me'],
     recipient_addrs: ['sam@example.com', 'you@example.com'],
     attachments: [],
@@ -525,6 +534,8 @@ const MOCK_THREAD_DETAIL = [
     unread: true,
     to: ['Dana Wu', 'me'],
     cc: [],
+    to_addrs: ['dana@example.com', 'you@example.com'],
+    cc_addrs: [],
     recipients: ['Dana Wu', 'me'],
     recipient_addrs: ['dana@example.com', 'you@example.com'],
     attachments: [
