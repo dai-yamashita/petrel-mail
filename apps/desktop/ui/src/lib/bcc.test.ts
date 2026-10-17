@@ -96,6 +96,8 @@ describe('replying to a message you blind-copied people on', () => {
     bcc: ['Priya Nair'],
     recipients: ['Dana Wu', 'alex@example.com'],
     recipient_addrs: ['dana@example.com', 'alex@example.com'],
+    to_addrs: ['dana@example.com'],
+    cc_addrs: ['alex@example.com'],
     attachments: [],
   } as unknown as ThreadMessage;
 
@@ -103,7 +105,13 @@ describe('replying to a message you blind-copied people on', () => {
     for (const all of [false, true]) {
       const { to, cc } = replyTargets(mine, 'you@example.com', all);
       expect([...to, ...cc].join(' ')).not.toMatch(/priya/i);
-      expect(to).toEqual(['dana@example.com', 'alex@example.com']);
+      if (all) {
+        expect(to).toEqual(['dana@example.com']);
+        expect(cc).toEqual(['alex@example.com']);
+      } else {
+        expect(to).toEqual(['dana@example.com', 'alex@example.com']);
+        expect(cc).toEqual([]);
+      }
     }
   });
 });

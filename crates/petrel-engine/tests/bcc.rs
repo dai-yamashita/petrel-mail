@@ -134,6 +134,18 @@ fn a_sent_copy_shows_its_blind_copies_and_never_offers_them_to_reply_to() {
             "alex@example.com".to_string()
         ]
     );
+    assert_eq!(m.to_addrs, vec!["dana@example.com".to_string()]);
+    assert_eq!(m.cc_addrs, vec!["alex@example.com".to_string()]);
+    for blind in ["priya@example.net", "board@example.org"] {
+        assert!(
+            !m.to_addrs.iter().any(|a| a == blind),
+            "to_addrs must not contain {blind}"
+        );
+        assert!(
+            !m.cc_addrs.iter().any(|a| a == blind),
+            "cc_addrs must not contain {blind}"
+        );
+    }
 }
 
 /// Someone blind-copied is someone written to: they rank as such when an
