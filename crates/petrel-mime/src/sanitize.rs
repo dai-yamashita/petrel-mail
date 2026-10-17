@@ -1278,8 +1278,13 @@ mod tests {
             r#"<p style="color: red; background-image: url('https://evil.example/x?a=1')">a</p>
                <div style="position: fixed; top: 0; z-index: 99999; width: 100%">overlay</div>
                <span style="background: url(https://evil.example/y)">b</span>
-               <b style="width: expression(alert(1))">c</b>"#,
+               <b style="width: expression(alert(1))">c</b>
+               <ul style='list-style: URL("https://evil.example/z")'><li>d</li></ul>"#,
         );
+        // CSS function names are case-insensitive, so `URL(` fetches just as
+        // `url(` does: the spelling ammonia's own CSS filter once let through
+        // (RUSTSEC-2026-0373). `list-style` is allowed and takes an image, so
+        // only the fetch check stands between that one and the network.
         assert!(!out.contains("evil.example"), "css must not fetch: {out}");
         assert!(!out.contains("position"), "no overlay positioning: {out}");
         assert!(!out.contains("z-index"), "{out}");

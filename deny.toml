@@ -32,6 +32,21 @@ yanked = "deny"
 # Tauri and cannot be swapped out from here; flagging them every run
 # would train everyone to ignore the gate that catches the real thing.
 unmaintained = "workspace"
+# zip's extraction advisories: SUID/SGID bits kept (0367), symlinks that
+# point outside the destination (0368), permissions applied through them
+# (0369). zip arrives only as tauri-plugin-updater's Windows unpacker for a
+# zipped installer. Petrel installs through `download_and_install`, which
+# checks the release signature against the key built into the app before
+# anything is unpacked, so an archive that gets that far was signed by
+# whoever cuts releases, who could ship any program anyway; and
+# scripts/release.sh publishes updates for macOS alone, so nothing reaches
+# that unpacker today. The fix is zip 9, which no updater release takes
+# yet: drop these when one does.
+ignore = [
+    { id = "RUSTSEC-2026-0367", reason = "zip via tauri-plugin-updater: signed updates only, none for Windows" },
+    { id = "RUSTSEC-2026-0368", reason = "zip via tauri-plugin-updater: signed updates only, none for Windows" },
+    { id = "RUSTSEC-2026-0369", reason = "zip via tauri-plugin-updater: signed updates only, none for Windows" },
+]
 
 [bans]
 multiple-versions = "warn"
