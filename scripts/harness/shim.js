@@ -70,6 +70,8 @@
         from_addr: sender[1],
         to: ['reader@example.test'],
         cc: [],
+        to_addrs: ['reader@example.test'],
+        cc_addrs: [],
         snippet: 'Synthetic probe message ' + id,
         unread: id === n,
         date_ms: base + id * 60000,
@@ -123,6 +125,8 @@
       from_addr: sender[1],
       to: ['reader@example.test'],
       cc: [],
+      to_addrs: ['reader@example.test'],
+      cc_addrs: [],
       snippet: 'Synthetic probe message ' + messageId,
       unread: messageId === n,
       date_ms: base + messageId * 60000,
@@ -823,6 +827,8 @@
           from_addr: row.from_addr,
           to: ['me'],
           cc: [],
+          to_addrs: ['you@example.com'],
+          cc_addrs: [],
           // Opt-in, as the store gives it for your own sent copy that kept
           // its Bcc header: set window.__PETREL_DETAIL_BCC__ to display names.
           bcc: window.__PETREL_DETAIL_BCC__ || [],
@@ -892,6 +898,8 @@
         from_addr: card.from_addr,
         to: ['me'],
         cc: [],
+        to_addrs: ['you@example.com'],
+        cc_addrs: [],
         // Opt-in, as thread_detail: window.__PETREL_DETAIL_BCC__.
         bcc: window.__PETREL_DETAIL_BCC__ || [],
         snippet: row.snippet,

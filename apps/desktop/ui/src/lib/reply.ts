@@ -70,13 +70,14 @@ export function replyTargets(
   const asked = replyTo.filter((a) => a.trim() !== '');
   const answering = asked.length > 0 ? asked : [message.from_addr];
 
+  // Reply-all to your own message keeps the roles you gave: the people you
+  // wrote to stay in To, the people you copied stay in Cc. When To named only
+  // you, or nobody, the people you copied are who the follow-up is for, so
+  // they move up into To rather than leave it empty.
   if (own && all) {
-    const roleSplit = message.to_addrs !== undefined;
-    const toSource = roleSplit ? message.to_addrs : (message.recipient_addrs ?? []);
-    const ccSource = roleSplit ? (message.cc_addrs ?? []) : [];
-    const to = toSource.map(take).filter((a): a is string => a !== null);
-    const cc = ccSource.map(take).filter((a): a is string => a !== null);
-    return { to, cc };
+    const to = message.to_addrs.map(take).filter((a): a is string => a !== null);
+    const cc = message.cc_addrs.map(take).filter((a): a is string => a !== null);
+    return to.length > 0 ? { to, cc } : { to: cc, cc: [] };
   }
 
   const to = (own ? (message.recipient_addrs ?? []) : answering)
