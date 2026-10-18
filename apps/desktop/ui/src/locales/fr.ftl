@@ -24,6 +24,7 @@ list-conversations = { $count ->
 }
 list-unread = { $count } non lus
 list-selected = { $count } sélectionnées
+list-selected-of = { $count } sur { $total } sélectionnées
 reader-archive = Archiver
 reader-star = Suivre
 reader-more = Plus d’actions
@@ -578,6 +579,7 @@ format-link-apply = Appliquer
 format-font = Police
 format-size = Taille du texte
 list-select-row = Sélectionner cette conversation
+list-select-all = Sélectionner toutes les conversations
 lists-sort-scope = Tri
 sort-scope-mailbox = Par boîte
 sort-scope-everywhere = Partagé

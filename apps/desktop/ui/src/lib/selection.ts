@@ -24,6 +24,22 @@ export function toggle(selected: ReadonlySet<number>, id: number): Set<number> {
 }
 
 /**
+ * How much of the list a selection covers: what the checkbox column's header
+ * box shows. Counted over the rows the list holds, so an id selected and since
+ * gone from it cannot make a partial selection read as all of it — and a row
+ * loaded after everything was ticked arrives unticked and makes it partial.
+ */
+export function coverage(
+  selected: ReadonlySet<number>,
+  rows: readonly { id: number }[],
+): 'none' | 'some' | 'all' {
+  let hit = 0;
+  for (const row of rows) if (selected.has(row.id)) hit += 1;
+  if (hit === 0) return 'none';
+  return hit === rows.length ? 'all' : 'some';
+}
+
+/**
  * Extends a selection from the anchor to `id`, inclusive, in list order.
  *
  * Range rather than "add this one": ⇧J down a list should select what it

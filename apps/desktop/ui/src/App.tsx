@@ -106,6 +106,7 @@ import {
 } from './lib/notify';
 import { Help } from './components/Help';
 import { AboutDialog } from './components/AboutDialog';
+import { SelectAllCheck } from './components/SelectAllCheck';
 import { Settings } from './components/Settings';
 import { RAIL_COLLAPSED, clampList, clampRail, useSettings } from './lib/settings';
 import { stepTextSize } from './lib/text-size';
@@ -3218,6 +3219,21 @@ export function App() {
               same dot. It earns a place again the day a view can hold mail from
               more than one account. */}
           <div className="view-row">
+            {/* The checkbox column's header, with the column: every row the
+                list holds, or none. Clearing drops the anchor as Escape does,
+                so a shift-click afterwards starts a range afresh. */}
+            {settings.checkboxes === 'on' && (
+              <SelectAllCheck
+                rows={items}
+                selected={selected}
+                density={settings.density}
+                onSelectAll={() => setSelected(new Set(items.map((m) => m.id)))}
+                onClear={() => {
+                  setSelected(new Set());
+                  anchorTo(null);
+                }}
+              />
+            )}
             {pinnedState.kind === 'saved' ? (
               // A saved search is titled with its name, and the title renames
               // it. Only while the text is still that search's: edited, this is
@@ -3262,7 +3278,16 @@ export function App() {
             ) : (
               <span className="view-count">
                 {selected.size > 0
-                  ? t('list-selected', { count: fmtCount(selected.size) })
+                  ? // Out of the view's true size while the selection is not
+                    // all of it. The list loads in pages, so selecting all
+                    // takes the rows it holds — said as "36 of 40" rather than
+                    // a bare 36 that reads as everything.
+                    viewTotal != null && viewTotal > selected.size
+                    ? t('list-selected-of', {
+                        count: fmtCount(selected.size),
+                        total: fmtCount(viewTotal),
+                      })
+                    : t('list-selected', { count: fmtCount(selected.size) })
                   : view === 'outbox'
                     ? // "Unread" means nothing for mail you wrote. What the outbox
                       // counts is what is waiting, and what is waiting on you.

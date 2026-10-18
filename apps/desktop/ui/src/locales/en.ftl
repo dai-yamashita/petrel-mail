@@ -21,6 +21,7 @@ list-conversations = { $count ->
 }
 list-unread = { $count } unread
 list-selected = { $count } selected
+list-selected-of = { $count } of { $total } selected
 reader-archive = Archive
 reader-star = Star
 reader-more = More actions
@@ -581,6 +582,7 @@ format-link-apply = Apply
 format-font = Typeface
 format-size = Text size
 list-select-row = Select this conversation
+list-select-all = Select all conversations
 lists-sort-scope = Sort order
 sort-scope-mailbox = Per mailbox
 sort-scope-everywhere = Shared

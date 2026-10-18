@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extend, facing, prune, reanchor, rowsOf, tagsOnAll, targets, toggle } from './selection';
+import { coverage, extend, facing, prune, reanchor, rowsOf, tagsOnAll, targets, toggle } from './selection';
 
 const order = [1, 2, 3, 4, 5];
 
@@ -192,5 +192,35 @@ describe('tagsOnAll', () => {
 
   it('is empty for an empty group', () => {
     expect(tagsOnAll([])).toEqual(new Set());
+  });
+});
+
+describe('coverage', () => {
+  const rows = [{ id: 1 }, { id: 2 }, { id: 3 }];
+
+  it('is none with nothing ticked, and for a list with no rows', () => {
+    expect(coverage(new Set(), rows)).toBe('none');
+    expect(coverage(new Set([1]), [])).toBe('none');
+  });
+
+  it('is some while part of the list is ticked', () => {
+    expect(coverage(new Set([2]), rows)).toBe('some');
+  });
+
+  it('is all once every row the list holds is ticked', () => {
+    expect(coverage(new Set([1, 2, 3]), rows)).toBe('all');
+  });
+
+  it('counts only rows the list still holds', () => {
+    // A ticked row that left the list must not stand in for one still in it.
+    expect(coverage(new Set([1, 2, 99]), rows)).toBe('some');
+    expect(coverage(new Set([99]), rows)).toBe('none');
+  });
+
+  it('turns partial when more rows load after everything was ticked', () => {
+    // Select all takes the rows the list has; the next page arrives unticked,
+    // and the box says so rather than claiming rows it never took.
+    const more = [...rows, { id: 4 }];
+    expect(coverage(new Set([1, 2, 3]), more)).toBe('some');
   });
 });
