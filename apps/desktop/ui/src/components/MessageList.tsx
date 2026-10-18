@@ -501,16 +501,17 @@ export const MessageList = memo(function MessageList({
       previousHeadIdRef.current = items[0]?.id;
       return;
     }
-    const rowHeight = density === 'compact' ? COMPACT_ROW : RELAXED_ROW;
+    // Sized as the virtualizer sizes them: the rows that just arrived have
+    // not been drawn, so its estimate is the space it gave them.
     const delta = prependScrollDelta({
       previousHeadId: previousHeadIdRef.current,
       items,
       scrollTop: scroller.scrollTop,
-      rowHeight,
+      sizeOf: estimateSize,
     });
     if (delta > 0) scroller.scrollTop += delta;
     previousHeadIdRef.current = items[0]?.id;
-  }, [items, density]);
+  }, [items, estimateSize]);
 
   // Movement lives here rather than in Ariakit's composite navigation, because
   // the app needs to know the selection changed — moving the highlight without
