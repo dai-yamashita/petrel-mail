@@ -2,6 +2,7 @@ import { Monitor, Moon, Sun, type LucideIcon } from 'lucide-react';
 import { resolveLocale, DEFAULTS, useSettings, type Settings } from '../../lib/settings';
 import { Icon } from '../Icon';
 import { availableLocales, t, type StringId } from '../../lib/strings';
+import { TEXT_SIZE_MAX, TEXT_SIZE_MIN } from '../../lib/text-size';
 
 const ACCENTS = ['#0E7C86', '#3B6EA5', '#6B5CA5', '#9A6B1F', '#5E7C4A', '#A8544B'];
 
@@ -86,8 +87,8 @@ export function Appearance() {
           <span className="slider-a small">A</span>
           <input
             type="range"
-            min={12}
-            max={20}
+            min={TEXT_SIZE_MIN}
+            max={TEXT_SIZE_MAX}
             step={1}
             value={Number(settings.readingTextSize)}
             onChange={(e) => set('readingTextSize', e.target.value)}

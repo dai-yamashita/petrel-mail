@@ -802,6 +802,15 @@ menubar-petrel-help = Petrel 帮助
 menubar-report-issue = 报告问题
 menubar-view-source = 在 GitHub 上查看源代码
 menubar-fullscreen = 进入/退出全屏幕
+menubar-maximize = 最大化
+menubar-reading-pane = 阅读窗格
+menubar-sort-by = 排序方式
+menubar-text-size = 阅读文字大小
+menubar-text-bigger = 放大
+menubar-text-smaller = 缩小
+sidebar-expanded = 展开
+sidebar-collapsed = 收起
+about-tagline = 快速、本地优先的桌面电子邮件客户端。
 
 # Help: the shortcut list and the search-operator table. Until now the Help
 # dialog rendered these straight from lib/shortcuts.ts and lib/help.ts, in

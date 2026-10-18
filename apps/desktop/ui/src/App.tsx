@@ -105,8 +105,10 @@ import {
   type Announced,
 } from './lib/notify';
 import { Help } from './components/Help';
+import { AboutDialog } from './components/AboutDialog';
 import { Settings } from './components/Settings';
 import { RAIL_COLLAPSED, clampList, clampRail, useSettings } from './lib/settings';
+import { stepTextSize } from './lib/text-size';
 import { useMessageLinks, type HomographRisk } from './lib/links';
 import { RowMenu } from './components/RowMenu';
 import { Toast } from './components/Toast';
@@ -578,6 +580,7 @@ export function App() {
   const searchRef = useRef<HTMLInputElement>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
   // Null when closed; otherwise the pane to open on.
   const [settingsOpen, setSettingsOpen] = useState<'accounts' | 'appearance' | null>(null);
   // Where Settings reports. What it asks for can outlast it — an export of
@@ -1285,6 +1288,7 @@ export function App() {
     openPalette: () => setPaletteOpen(true),
     openHelp: () => setHelpOpen(true),
     openSettings: () => setSettingsOpen('appearance'),
+    textSize: (step) => set('readingTextSize', stepTextSize(settings.readingTextSize, step)),
     focusSearch: () => {
       // The field is in the list, which a reader filling the window hides:
       // back to the list first, then into the field, as the palette's search
@@ -1299,8 +1303,8 @@ export function App() {
     },
   });
 
-  // The macOS menu bar, driving the same functions as everything above it. Its
-  // ⌘, arrives here rather than in useKeyboard now — the OS gives a menu's key
+  // The menu bar, driving the same functions as everything above it. On macOS
+  // its ⌘, arrives here rather than in useKeyboard — the OS gives a menu's key
   // equivalents first refusal — which is only safe because both open the same
   // pane.
   useAppMenu({
@@ -1311,6 +1315,10 @@ export function App() {
     },
     openHelp: () => {
       if (!dialogOpen()) setHelpOpen(true);
+    },
+    // Windows and Linux only: macOS shows its own panel and never asks.
+    openAbout: () => {
+      if (!dialogOpen()) setAboutOpen(true);
     },
     // The same call ⌘F makes, guarded the same way: with no reading pane or
     // nothing open there is nothing to search, and a find bar that could never
@@ -1325,10 +1333,45 @@ export function App() {
       if (!document.hasFocus()) return;
       if ((settings.layout !== 'off' && activeRef.current) || overlayOpen) setFinding(true);
     },
-    theme: settings.theme,
-    density: settings.density,
-    setTheme: (v) => set('theme', v),
-    setDensity: (v) => set('density', v),
+    textSize: (step) => set('readingTextSize', stepTextSize(settings.readingTextSize, step)),
+    // What the View menu ticks: the settings as they stand, and the order the
+    // list is in now — this mailbox's, or the search's while there is one.
+    values: {
+      theme: settings.theme,
+      density: settings.density,
+      layout: settings.layout,
+      railCollapsed: settings.railCollapsed,
+      checkboxes: settings.checkboxes,
+      sortKey: activeSort.key,
+      sortDirection:
+        activeSort.key === 'relevance' ? '' : activeSort.ascending ? 'ascending' : 'descending',
+    },
+    searching: asked,
+    // Each choice the way its own control makes it: a setting through `set`,
+    // as its pane writes it, and the order through the sort control's setter,
+    // so it lands in this mailbox's order or the shared one as Settings ›
+    // Lists says.
+    choose: (choice) => {
+      const setSort = asked ? setSearchSort : setListSort;
+      switch (choice.setting) {
+        case 'theme':
+          return set('theme', choice.value);
+        case 'density':
+          return set('density', choice.value);
+        case 'layout':
+          return set('layout', choice.value);
+        case 'railCollapsed':
+          return set('railCollapsed', choice.value);
+        case 'checkboxes':
+          return set('checkboxes', choice.value);
+        case 'sortKey':
+          return setSort({ ...activeSort, key: choice.value });
+        case 'sortDirection':
+          return setSort({ ...activeSort, ascending: choice.value === 'ascending' });
+        default:
+          return ((x: never) => x)(choice);
+      }
+    },
   });
 
   // The rail key is the view's identity; its label comes from the same string
@@ -3841,6 +3884,7 @@ export function App() {
         }}
       />
       <Help open={helpOpen} onClose={() => setHelpOpen(false)} />
+      <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
       <Settings
         onAddAccount={() => setAddingAccount(true)}
         onAccountRemoved={(wasActive) => {

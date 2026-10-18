@@ -871,6 +871,15 @@ menubar-petrel-help = Ayuda de Petrel
 menubar-report-issue = Informar de un problema
 menubar-view-source = Ver el código en GitHub
 menubar-fullscreen = Activar o desactivar pantalla completa
+menubar-maximize = Maximizar
+menubar-reading-pane = Panel de lectura
+menubar-sort-by = Ordenar por
+menubar-text-size = Tamaño del texto de lectura
+menubar-text-bigger = Más grande
+menubar-text-smaller = Más pequeño
+sidebar-expanded = Expandida
+sidebar-collapsed = Contraída
+about-tagline = Un cliente de correo rápido para el escritorio, que funciona en local.
 
 # Help: the shortcut list and the search-operator table. Until now the Help
 # dialog rendered these straight from lib/shortcuts.ts and lib/help.ts, in

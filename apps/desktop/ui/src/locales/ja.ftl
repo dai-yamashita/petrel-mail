@@ -802,6 +802,15 @@ menubar-petrel-help = Petrel ヘルプ
 menubar-report-issue = 問題を報告
 menubar-view-source = GitHub でソースを見る
 menubar-fullscreen = フルスクリーンにする
+menubar-maximize = 最大化
+menubar-reading-pane = 閲覧ペイン
+menubar-sort-by = 並べ替え
+menubar-text-size = 本文の文字サイズ
+menubar-text-bigger = 大きく
+menubar-text-smaller = 小さく
+sidebar-expanded = 展開
+sidebar-collapsed = 折りたたみ
+about-tagline = 高速で、ローカルファーストのデスクトップ用メールクライアント。
 
 # Help: the shortcut list and the search-operator table. Until now the Help
 # dialog rendered these straight from lib/shortcuts.ts and lib/help.ts, in

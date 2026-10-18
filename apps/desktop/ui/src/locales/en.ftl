@@ -866,6 +866,18 @@ menubar-petrel-help = Petrel Help
 menubar-report-issue = Report an Issue
 menubar-view-source = View Source on GitHub
 menubar-fullscreen = Toggle Full Screen
+# Windows and Linux call it Maximize; macOS calls the same item Zoom.
+menubar-maximize = Maximize
+menubar-reading-pane = Reading Pane
+menubar-sort-by = Sort By
+menubar-text-size = Reading Text Size
+menubar-text-bigger = Bigger
+menubar-text-smaller = Smaller
+# The sidebar's two widths, as View › Sidebar offers them.
+sidebar-expanded = Expanded
+sidebar-collapsed = Collapsed
+# Petrel › About Petrel on Windows and Linux, under the name and version.
+about-tagline = A fast, local-first desktop email client.
 
 # Help: the shortcut list and the search-operator table. These were the last
 # strings hardcoded in English; the Help dialog rendered them straight from

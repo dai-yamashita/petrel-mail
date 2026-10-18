@@ -840,6 +840,15 @@ menubar-petrel-help = Petrel 도움말
 menubar-report-issue = 문제 신고
 menubar-view-source = GitHub에서 소스 보기
 menubar-fullscreen = 전체 화면 전환
+menubar-maximize = 최대화
+menubar-reading-pane = 읽기 창
+menubar-sort-by = 정렬 기준
+menubar-text-size = 본문 글자 크기
+menubar-text-bigger = 크게
+menubar-text-smaller = 작게
+sidebar-expanded = 펼침
+sidebar-collapsed = 접힘
+about-tagline = 빠르고 로컬 우선인 데스크톱 이메일 클라이언트.
 
 # Help: the shortcut list and the search-operator table. These were the last
 # strings hardcoded in English; the Help dialog rendered them straight from
