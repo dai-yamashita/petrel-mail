@@ -821,6 +821,7 @@ pub fn run() {
             commands::triage::folder_message_count,
             commands::triage::mark_folder_read,
             commands::triage::trash_folder_contents,
+            commands::triage::triage_view,
             commands::triage::create_tag,
             commands::triage::rename_tag,
             commands::triage::set_tag_colour,

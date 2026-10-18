@@ -1160,6 +1160,18 @@
       // the whole reason the dialog asks for one.
       return 1204;
     },
+    // Select all, then an action: the harness's whole view is the rows it
+    // holds, so read and star change them and the rest report what they
+    // reached. Enough to drive the confirmation and its toast in a browser.
+    triage_view: function (a) {
+      var n = 0;
+      rows.forEach(function (r) {
+        if (a.kind === 'mark_read' && r.unread) { r.unread = false; n += 1; }
+        else if (a.kind === 'mark_unread' && !r.unread) { r.unread = true; n += 1; }
+        else if (a.kind !== 'mark_read' && a.kind !== 'mark_unread') n += 1;
+      });
+      return { conversations: n, messages: n };
+    },
     mark_folder_read: function (a) {
       if (signinFor(activeAccountId())) throw new Error('sign in to this account again first');
       // Modelled, not faked: the rows the harness holds actually change, so

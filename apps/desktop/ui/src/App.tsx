@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from 'react';
 import {
   api,
   type ActionKind,
@@ -45,7 +45,7 @@ import { mergeOrder } from './lib/reorder';
 import { Rail } from './components/Rail';
 import { dialogOpen, useKeyboard } from './lib/useKeyboard';
 import { useAppMenu } from './lib/menu';
-import { useTriage, type UndoOffer } from './lib/useTriage';
+import { doneText, useTriage, type UndoOffer } from './lib/useTriage';
 import { TitleBar } from './components/TitleBar';
 import { Palette } from './components/Palette';
 import { Picker, type PickerOption } from './components/Picker';
@@ -94,7 +94,19 @@ import {
   withAttached,
   type Attached,
 } from './lib/attachments';
-import { extend, facing, prune, reanchor, rowsOf, tagsOnAll, targets, toggle } from './lib/selection';
+import {
+  extend,
+  facing,
+  isSelection,
+  prune,
+  reanchor,
+  rowsOf,
+  selectAllScope,
+  tagsOnAll,
+  targets,
+  toggle,
+} from './lib/selection';
+import { actionLabel } from './lib/bulk';
 import {
   announceStep,
   desktopNotice,
@@ -107,6 +119,7 @@ import {
 import { Help } from './components/Help';
 import { AboutDialog } from './components/AboutDialog';
 import { SelectAllCheck } from './components/SelectAllCheck';
+import { BulkConfirmDialog, type BulkAsk } from './components/BulkConfirmDialog';
 import { Settings } from './components/Settings';
 import { RAIL_COLLAPSED, clampList, clampRail, useSettings } from './lib/settings';
 import { stepTextSize } from './lib/text-size';
@@ -605,7 +618,37 @@ export function App() {
     setPickerFor(ids);
     setPicker(kind);
   }, []);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [selected, setSelectedRows] = useState<Set<number>>(new Set());
+  // The whole view, loaded or not: what the header box selects in a mailbox
+  // the list has not loaded all of (`selectAllScope`). `selected` then holds
+  // every row the list has, and grows as more arrive.
+  const [allInView, setAllInView] = useState(false);
+  const allInViewRef = useRef(allInView);
+  allInViewRef.current = allInView;
+  // Every ordinary change to the selection makes it a selection of rows
+  // again — a row unticked, a range, a clear — as unticking one conversation
+  // after Select all does in other clients. Only the header box and the
+  // effect that keeps its rows in step write the rows without ending it.
+  const setSelected = useCallback((next: SetStateAction<Set<number>>) => {
+    setAllInView(false);
+    setSelectedRows(next);
+  }, []);
+  // Every row the list loads while the whole view is selected arrives ticked,
+  // and a row that left the list leaves the selection with it.
+  useEffect(() => {
+    if (!allInView) return;
+    setSelectedRows((cur) =>
+      cur.size === items.length && items.every((m) => cur.has(m.id))
+        ? cur
+        : new Set(items.map((m) => m.id)),
+    );
+  }, [allInView, items]);
+  // Another mailbox, another search or another account is another "all".
+  useEffect(() => {
+    if (!allInViewRef.current) return;
+    setAllInView(false);
+    setSelectedRows(new Set());
+  }, [view, query, accountEpoch]);
   // Where a range grows from, so reversing direction shrinks it again.
   const [anchor, setAnchor] = useState<number | null>(null);
   // Where the last range from that anchor ended. A new range redraws only
@@ -961,7 +1004,48 @@ export function App() {
   const [emptyingTrash, setEmptyingTrash] = useState<number | null>(null);
   const askDelete = (ids?: number[]) => {
     const list = ids ?? targets(selected, activeId);
+    // All of the Trash, permanently, is the question Empty Trash already asks,
+    // and its answer already reaches the mail the list has not loaded.
+    if (allInView && view === 'trash' && isSelection(selected, list) && activeAccount) {
+      setEmptyingTrash(activeAccount.id);
+      return;
+    }
     if (list.length > 0) setPendingDelete(list);
+  };
+  // An action on the whole view, waiting on its yes: see `BulkConfirmDialog`.
+  const [bulkAsk, setBulkAsk] = useState<BulkAsk | null>(null);
+  /**
+   * Hands an action on the selection to the whole view when the whole view is
+   * what is selected, and says it did: the caller then leaves the selection
+   * alone, so answering no keeps it. One row's own menu, a row dragged from
+   * outside the selection and a selection of rows are all the caller's own.
+   */
+  const toWholeView = (kind: ActionKind, ids: readonly number[], target?: number): boolean => {
+    if (!allInView || viewTotal == null || !isSelection(selected, ids)) return false;
+    const toInbox =
+      kind === 'move' && folders.some((f) => f.id === target && f.role === 'inbox');
+    setBulkAsk({ kind, target, view, viewName, count: viewTotal, label: actionLabel(kind, toInbox) });
+    return true;
+  };
+  /** Runs the action the dialog was answered yes to, on every conversation
+   *  the view lists. Pessimistic, as a confirmed bulk action may be: the list
+   *  and the numbers are read back once the engine has done it, rather than
+   *  guessed at for rows the window never had. */
+  const runWholeView = (ask: BulkAsk) => {
+    setBulkAsk(null);
+    setToast(t('bulk-working', { action: t(ask.label), count: fmtCount(ask.count) }));
+    void api
+      .triageView(ask.view, ask.kind, ask.target)
+      .then((done) =>
+        setToast(t('triage-many', { what: doneText(ask.kind), count: fmtCount(done.conversations) })),
+      )
+      .catch((e) => setToast(t('triage-failed', { error: String(e) })))
+      .finally(() => {
+        setSelected(new Set());
+        anchorTo(null);
+        setListReload((n) => n + 1);
+        setTriageEpoch((n) => n + 1);
+      });
   };
 
   /** Opening a mailbox, which ends any search that was running.
@@ -1099,6 +1183,7 @@ export function App() {
       askDelete(ids);
       return;
     }
+    if (toWholeView(kind, ids)) return;
     void triage.runMany(kind, ids);
     if (selected.size > 0) setSelected(new Set());
   };
@@ -1152,7 +1237,9 @@ export function App() {
       const ids = targets(selected, activeId);
       const rows = rowsOf(ids, items);
       if (rows.length === 0) return;
-      void triage.runMany(facing(rows).starred ? 'unstar' : 'star', ids);
+      const kind = facing(rows).starred ? 'unstar' : 'star';
+      if (toWholeView(kind, ids)) return;
+      void triage.runMany(kind, ids);
       if (selected.size > 0) setSelected(new Set());
     },
     // Only where there is a reading pane to fill. With the layout off there is
@@ -1189,7 +1276,9 @@ export function App() {
       // The same helper every other key action uses: the selection when there
       // is one, otherwise the conversation under the cursor — and one call
       // for all of them, so a selection gets one toast and one undo.
-      void triage.runMany('move', targets(selected, activeId), inbox.id);
+      const ids = targets(selected, activeId);
+      if (toWholeView('move', ids, inbox.id)) return;
+      void triage.runMany('move', ids, inbox.id);
       if (selected.size > 0) setSelected(new Set());
     },
     // Acts on the conversation under the cursor, so it works while arrowing
@@ -1509,12 +1598,15 @@ export function App() {
     if (meaning.kind === 'tag') {
       const tag = tags.find((x) => x.name === meaning.tag);
       if (!tag) return;
+      if (toWholeView('tag', ids, tag.id)) return;
       void triage.runMany('tag', ids, tag.id);
     } else if (meaning.kind === 'move') {
       const folder = folders.find((f) => f.role === meaning.role);
       if (!folder) return;
+      if (toWholeView('move', ids, folder.id)) return;
       void triage.runMany('move', ids, folder.id);
     } else if (meaning.kind === 'move-folder') {
+      if (toWholeView('move', ids, meaning.folderId)) return;
       void triage.runMany('move', ids, meaning.folderId);
     } else if (meaning.kind === 'trash' && view === 'trash') {
       // Trash is where deletion becomes permanent, and permanent is asked
@@ -1522,6 +1614,7 @@ export function App() {
       askDelete(ids);
       return;
     } else {
+      if (toWholeView(meaning.kind, ids)) return;
       void triage.runMany(meaning.kind, ids);
     }
     // The selection goes only when it is what moved. A row dragged from
@@ -1688,7 +1781,7 @@ export function App() {
       setSelected((cur) => toggle(cur, id));
       anchorTo(id);
     },
-    [anchorTo],
+    [anchorTo, setSelected],
   );
 
   const onActivate = useCallback(
@@ -1730,7 +1823,7 @@ export function App() {
       // person who wrote it, in the one form they cannot edit.
       if (opensComposer(view)) void resumeDraft(id);
     },
-    [items, anchor, activeId, rangeEnd, selected, view, resumeDraft, anchorTo],
+    [items, anchor, activeId, rangeEnd, selected, view, resumeDraft, anchorTo, setSelected],
   );
 
   const onListAction = useCallback(
@@ -1760,7 +1853,7 @@ export function App() {
       }
       setRowMenu({ id, x, y });
     },
-    [selected, anchorTo],
+    [selected, anchorTo, setSelected],
   );
 
   /** Settles a draft conflict the chosen way and shows it in the composer. */
@@ -1956,6 +2049,7 @@ export function App() {
     // the selection means all of it, onto one outside means that row.
     (tagId, threadId) => {
       const ids = draggedIds(threadId, selected);
+      if (toWholeView('tag', ids, tagId)) return;
       void triage.runMany('tag', ids, tagId);
       if (ids.some((id) => selected.has(id))) {
         setSelected(new Set());
@@ -3227,7 +3321,18 @@ export function App() {
                 rows={items}
                 selected={selected}
                 density={settings.density}
-                onSelectAll={() => setSelected(new Set(items.map((m) => m.id)))}
+                // The whole view where the list has not loaded all of it, as
+                // desktop clients select a whole mailbox; the rows where they
+                // are everything, so the selection keeps its ordinary undo.
+                onSelectAll={() => {
+                  const rows = new Set(items.map((m) => m.id));
+                  if (selectAllScope(asked, viewTotal, items.length) === 'view') {
+                    setSelectedRows(rows);
+                    setAllInView(true);
+                  } else {
+                    setSelected(rows);
+                  }
+                }}
                 onClear={() => {
                   setSelected(new Set());
                   anchorTo(null);
@@ -3278,11 +3383,14 @@ export function App() {
             ) : (
               <span className="view-count">
                 {selected.size > 0
-                  ? // Out of the view's true size while the selection is not
-                    // all of it. The list loads in pages, so selecting all
-                    // takes the rows it holds — said as "36 of 40" rather than
-                    // a bare 36 that reads as everything.
-                    viewTotal != null && viewTotal > selected.size
+                  ? allInView && viewTotal != null
+                    ? // The whole view, loaded or not, so the number is the
+                      // mailbox's rather than the rows on screen.
+                      t('menu-applies-to', { count: fmtCount(viewTotal) })
+                    : // Out of the view's true size while the selection is
+                      // not all of it, as "36 of 40" rather than a bare 36
+                      // that reads as everything.
+                      viewTotal != null && viewTotal > selected.size
                     ? t('list-selected-of', {
                         count: fmtCount(selected.size),
                         total: fmtCount(viewTotal),
@@ -3798,8 +3906,9 @@ export function App() {
           if (picker === 'snooze') {
             // The id *is* the instant to come back at — a snooze has no row to
             // point at, only a time.
-            void triage.runMany('snooze', ids, id);
             setPicker(null);
+            if (toWholeView('snooze', ids, id)) return;
+            void triage.runMany('snooze', ids, id);
             leaveSelection();
             return;
           }
@@ -3810,13 +3919,19 @@ export function App() {
             // archiving at all.
             const kind =
               id === ARCHIVE_VERB ? 'archive' : id === TRASH_VERB ? 'trash' : null;
-            void (kind ? triage.runMany(kind, ids) : triage.runMany('move', ids, id));
             setPicker(null);
+            if (kind ? toWholeView(kind, ids) : toWholeView('move', ids, id)) return;
+            void (kind ? triage.runMany(kind, ids) : triage.runMany('move', ids, id));
             leaveSelection();
           } else {
             // Toggling: `on` is the state being moved to, so an applied tag
             // untags rather than re-applying and reporting "Tagged" twice.
-            void triage.runMany(on ? 'tag' : 'untag', ids, id);
+            // A toggle on the whole view is a question too, and the picker
+            // makes way for it rather than staying up behind it.
+            const kind = on ? 'tag' : 'untag';
+            if (allInView && isSelection(selected, ids)) setPicker(null);
+            if (toWholeView(kind, ids, id)) return;
+            void triage.runMany(kind, ids, id);
           }
         }}
         onCreate={(name) => {
@@ -3837,6 +3952,7 @@ export function App() {
                 void api.pushFolder(id).catch((e) => say(folderPending(name, e)));
                 // Into the new folder goes what the picker was for, not only
                 // the highlighted row.
+                if (toWholeView('move', pickerIds, id)) return api.folders().then(setFolders);
                 return triage.runMany('move', pickerIds, id).then(() => api.folders().then(setFolders));
               }
               // Re-read the tags *before* applying, not after. The row shows a
@@ -3846,6 +3962,7 @@ export function App() {
               // something else reloaded it.
               return api.tags().then(setTags).then(() => {
                 // ...and to everything the picker was for, not only the row underneath.
+                if (toWholeView('tag', pickerIds, id)) return;
                 return triage.runMany('tag', pickerIds, id);
               });
             })
@@ -3910,6 +4027,7 @@ export function App() {
       />
       <Help open={helpOpen} onClose={() => setHelpOpen(false)} />
       <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
+      <BulkConfirmDialog ask={bulkAsk} onCancel={() => setBulkAsk(null)} onConfirm={runWholeView} />
       <Settings
         onAddAccount={() => setAddingAccount(true)}
         onAccountRemoved={(wasActive) => {
@@ -4040,7 +4158,13 @@ export function App() {
               onClose={close}
               thread={row}
               view={view}
-              count={ids.length}
+              // The whole view's size while the whole view is what the menu
+              // will act on, as the header says.
+              count={
+                allInView && viewTotal != null && isSelection(selected, ids)
+                  ? viewTotal
+                  : ids.length
+              }
               facing={facing(rows)}
               onAction={(kind) => {
                 close();
@@ -4048,6 +4172,7 @@ export function App() {
                   askDelete(ids);
                   return;
                 }
+                if (toWholeView(kind, ids)) return;
                 void triage.runMany(kind, ids);
                 if (selected.size > 0) setSelected(new Set());
               }}
@@ -4055,6 +4180,7 @@ export function App() {
                 close();
                 const inbox = folders.find((f) => f.role === 'inbox');
                 if (!inbox) return;
+                if (toWholeView('move', ids, inbox.id)) return;
                 void triage.runMany('move', ids, inbox.id);
                 if (selected.size > 0) setSelected(new Set());
               }}

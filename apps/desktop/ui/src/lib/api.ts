@@ -366,6 +366,13 @@ export type ActionReceipt = {
   description: string;
 };
 
+/** What an action on a whole view did. A conversation it found nothing to
+ *  do in — the mark-read of one already read — is not counted. */
+export type ViewActionReceipt = {
+  conversations: number;
+  messages: number;
+};
+
 export type Status = {
   /** The account this describes: the one on screen when it was read. See
    *  `statusFor`, which is how the window reads it. */
@@ -670,6 +677,7 @@ const mock = {
         delete_forever: 'Deleted' }[kind],
   }),
   undoTriage: async () => true,
+  triageView: async (): Promise<ViewActionReceipt> => ({ conversations: 0, messages: 0 }),
   folders: async (_account?: number): Promise<Folder[]> => [
     { id: 101, role: '', path: 'Contracts' },
     { id: 102, role: '', path: 'Contracts/2026' },
@@ -1067,6 +1075,10 @@ const real = {
       messageId: messageId ?? null,
     }),
   undoTriage: (actionId: number) => invoke<boolean>('undo_triage', { actionId }),
+  /** One action on every conversation `view` lists, loaded or not. Asked
+   *  behind a confirmation, and no undo comes back: see the Rust command. */
+  triageView: (view: string, kind: ActionKind, target?: number) =>
+    invoke<ViewActionReceipt>('triage_view', { view, kind, target: target ?? null }),
   /** Absent `account` means the one on screen — see the Rust command. */
   folders: (account?: number) => invoke<Folder[]>('list_folders', { account: account ?? null }),
   /** Here only; the server's copy is `pushFolder`. */

@@ -819,6 +819,12 @@ triage-nothing-to-archive = Nothing to archive.
 undo-done = Undone
 undo-too-late = Too late to undo. That already went to the server.
 triage-many = { $what } · { $count } conversations
+# An action on every conversation in a view, past the rows the list has loaded.
+bulk-confirm-title = Apply to all { $count } conversations?
+bulk-confirm-body = { $action }: every conversation in { $view }, including ones not loaded yet. Undo isn’t offered for this many.
+bulk-working = { $action } · { $count } conversations…
+action-untag = Remove tag
+action-unsnooze = Unsnooze
 triage-done-archive = Archived
 triage-done-trash = Moved to Trash
 triage-done-spam = Reported as spam

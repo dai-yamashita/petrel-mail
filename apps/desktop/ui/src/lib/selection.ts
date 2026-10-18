@@ -24,6 +24,37 @@ export function toggle(selected: ReadonlySet<number>, id: number): Set<number> {
 }
 
 /**
+ * Whether the ids an action was given are the selection, exactly.
+ *
+ * An action on the selection can stand for the whole view (`selectAllScope`);
+ * one on a single row's own menu, or on a row dragged from outside the
+ * selection, never does, and this is what tells the two apart.
+ */
+export function isSelection(selected: ReadonlySet<number>, ids: readonly number[]): boolean {
+  if (ids.length === 0 || ids.length !== selected.size) return false;
+  return ids.every((id) => selected.has(id));
+}
+
+/**
+ * What the header box selects: the rows the list holds, or the whole view.
+ *
+ * The whole view where the list has not loaded all of it, as desktop mail
+ * clients select a whole mailbox and not the part that has scrolled past. A
+ * search arrives whole and a mailbox scrolled to its end holds every row, so
+ * there the rows are everything, and the selection stays an ordinary one with
+ * the undo an ordinary one has. A size not known yet is the rows: "all" is
+ * never claimed on a number nobody has.
+ */
+export function selectAllScope(
+  searching: boolean,
+  total: number | null,
+  loaded: number,
+): 'rows' | 'view' {
+  if (searching || total == null) return 'rows';
+  return total > loaded ? 'view' : 'rows';
+}
+
+/**
  * How much of the list a selection covers: what the checkbox column's header
  * box shows. Counted over the rows the list holds, so an id selected and since
  * gone from it cannot make a partial selection read as all of it — and a row

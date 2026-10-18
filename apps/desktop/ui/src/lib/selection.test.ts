@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { coverage, extend, facing, prune, reanchor, rowsOf, tagsOnAll, targets, toggle } from './selection';
+import {
+  coverage,
+  extend,
+  facing,
+  isSelection,
+  prune,
+  reanchor,
+  rowsOf,
+  selectAllScope,
+  tagsOnAll,
+  targets,
+  toggle,
+} from './selection';
 
 const order = [1, 2, 3, 4, 5];
 
@@ -222,5 +234,41 @@ describe('coverage', () => {
     // and the box says so rather than claiming rows it never took.
     const more = [...rows, { id: 4 }];
     expect(coverage(new Set([1, 2, 3]), more)).toBe('some');
+  });
+});
+
+describe('isSelection', () => {
+  it('is true only for exactly the ticked conversations', () => {
+    const ticked = new Set([1, 2, 3]);
+    expect(isSelection(ticked, [3, 1, 2])).toBe(true);
+    // One row's own menu, or a row dragged from outside the selection.
+    expect(isSelection(ticked, [2])).toBe(false);
+    expect(isSelection(ticked, [1, 2, 4])).toBe(false);
+    expect(isSelection(ticked, [1, 2, 3, 4])).toBe(false);
+  });
+
+  it('is never true of nothing', () => {
+    expect(isSelection(new Set(), [])).toBe(false);
+  });
+});
+
+describe('selectAllScope', () => {
+  it('takes the whole view where the list has not loaded all of it', () => {
+    // A mailbox of 12,345 with 200 on screen: Select all means the mailbox.
+    expect(selectAllScope(false, 12345, 200)).toBe('view');
+  });
+
+  it('takes the rows where they are everything', () => {
+    // Scrolled to the end, the rows are the mailbox, and an ordinary
+    // selection keeps its undo.
+    expect(selectAllScope(false, 40, 40)).toBe('rows');
+  });
+
+  it('takes the rows of a search, which arrives whole', () => {
+    expect(selectAllScope(true, 12345, 200)).toBe('rows');
+  });
+
+  it('claims no "all" on a size nobody knows yet', () => {
+    expect(selectAllScope(false, null, 100)).toBe('rows');
   });
 });
