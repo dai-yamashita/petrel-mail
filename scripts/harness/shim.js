@@ -70,6 +70,8 @@
         from_addr: sender[1],
         to: ['reader@example.test'],
         cc: [],
+        to_addrs: ['reader@example.test'],
+        cc_addrs: [],
         snippet: 'Synthetic probe message ' + id,
         unread: id === n,
         date_ms: base + id * 60000,
@@ -123,6 +125,8 @@
       from_addr: sender[1],
       to: ['reader@example.test'],
       cc: [],
+      to_addrs: ['reader@example.test'],
+      cc_addrs: [],
       snippet: 'Synthetic probe message ' + messageId,
       unread: messageId === n,
       date_ms: base + messageId * 60000,
@@ -823,6 +827,8 @@
           from_addr: row.from_addr,
           to: ['me'],
           cc: [],
+          to_addrs: ['you@example.com'],
+          cc_addrs: [],
           // Opt-in, as the store gives it for your own sent copy that kept
           // its Bcc header: set window.__PETREL_DETAIL_BCC__ to display names.
           bcc: window.__PETREL_DETAIL_BCC__ || [],
@@ -892,6 +898,8 @@
         from_addr: card.from_addr,
         to: ['me'],
         cc: [],
+        to_addrs: ['you@example.com'],
+        cc_addrs: [],
         // Opt-in, as thread_detail: window.__PETREL_DETAIL_BCC__.
         bcc: window.__PETREL_DETAIL_BCC__ || [],
         snippet: row.snippet,
@@ -1151,6 +1159,18 @@
       // Big enough that the confirmation's number is worth reading, which is
       // the whole reason the dialog asks for one.
       return 1204;
+    },
+    // Select all, then an action: the harness's whole view is the rows it
+    // holds, so read and star change them and the rest report what they
+    // reached. Enough to drive the confirmation and its toast in a browser.
+    triage_view: function (a) {
+      var n = 0;
+      rows.forEach(function (r) {
+        if (a.kind === 'mark_read' && r.unread) { r.unread = false; n += 1; }
+        else if (a.kind === 'mark_unread' && !r.unread) { r.unread = true; n += 1; }
+        else if (a.kind !== 'mark_read' && a.kind !== 'mark_unread') n += 1;
+      });
+      return { conversations: n, messages: n };
     },
     mark_folder_read: function (a) {
       if (signinFor(activeAccountId())) throw new Error('sign in to this account again first');

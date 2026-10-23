@@ -179,6 +179,38 @@ impl Store {
         )
     }
 
+    /// Every conversation a view lists, for an action on all of it: the keys
+    /// its pages walk, with no page to fill. In Drafts, which lists messages,
+    /// a key is the message's id negated, as the walk keeps it; everywhere
+    /// else it is the conversation's, as triage takes it.
+    ///
+    /// The walk a page takes, so "all" is exactly what the list shows scrolled
+    /// to its end and never a second definition of the view — and only the
+    /// walk, so nothing is aggregated for thousands of rows nobody will see.
+    pub fn conversation_keys(&self, account: i64, view: &ListView) -> Result<Vec<i64>> {
+        let walk = page_walk(view, account);
+        let inner = view.predicate("messages");
+        let outer = view.predicate("m");
+        let query = ListingQuery {
+            inner: &inner,
+            outer: &outer,
+            limit: u32::MAX,
+            offset: 0,
+            bound: view.bound().map(str::to_string),
+            per_message: matches!(view, ListView::Folder(r) if r == "drafts"),
+            from_where: walk.as_ref().map(|w| w.from_where.clone()),
+            prefix: walk.as_ref().map(|w| w.prefix.clone()).unwrap_or_default(),
+            aliased: walk.as_ref().map(|w| w.aliased).unwrap_or(false),
+            sort: Sort {
+                key: SortKey::Date,
+                ascending: false,
+            },
+            before: None,
+            shown: None,
+        };
+        Ok(self.page_keys(account, &query)?.keys)
+    }
+
     /// The next page after a conversation the caller already has.
     ///
     /// Offset would mean "skip N", which shifts when new mail lands at the
@@ -1653,6 +1685,8 @@ impl Store {
         ) in rows
         {
             let buckets = addrs.get(&id).cloned().unwrap_or_default();
+            let to_addrs: Vec<String> = buckets.to.iter().map(|(_, a)| a.clone()).collect();
+            let cc_addrs: Vec<String> = buckets.cc.iter().map(|(_, a)| a.clone()).collect();
             let to: Vec<String> = buckets.to.iter().map(|(d, _)| d.clone()).collect();
             let cc: Vec<String> = buckets.cc.iter().map(|(d, _)| d.clone()).collect();
             let bcc: Vec<String> = buckets.bcc.iter().map(|(d, _)| d.clone()).collect();
@@ -1677,6 +1711,8 @@ impl Store {
                 invite_response,
                 to,
                 cc,
+                to_addrs,
+                cc_addrs,
                 bcc,
                 recipients,
                 recipient_addrs,

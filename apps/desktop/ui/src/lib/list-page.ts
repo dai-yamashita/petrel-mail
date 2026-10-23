@@ -41,17 +41,23 @@ export function shouldRequestNextPage(
  *  Prepend without this leaves the same pixel offset showing different
  *  rows. At the top of the list the new mail should appear above, so a
  *  zero (or negative) offset is left alone. A full replace does not keep
- *  the previous head, so it also returns zero. */
+ *  the previous head, so it also returns zero.
+ *
+ *  The shift is the height of the rows that arrived, each as the list sizes
+ *  it — `sizeOf` is the virtualizer's own estimate. One height for every row
+ *  was right only until a new conversation carried a tag or an attachment:
+ *  that row is taller, and each one nudged the rows being read down by the
+ *  difference, which is what holding still is supposed to prevent. */
 export function prependScrollDelta(args: {
   previousHeadId: number | undefined;
   items: readonly { id: number }[];
   scrollTop: number;
-  rowHeight: number;
+  sizeOf: (index: number) => number;
 }): number {
-  if (args.scrollTop <= 0 || args.previousHeadId == null || args.rowHeight <= 0) {
-    return 0;
-  }
+  if (args.scrollTop <= 0 || args.previousHeadId == null) return 0;
   const at = args.items.findIndex((m) => m.id === args.previousHeadId);
   if (at <= 0) return 0;
-  return at * args.rowHeight;
+  let delta = 0;
+  for (let index = 0; index < at; index += 1) delta += Math.max(0, args.sizeOf(index));
+  return delta;
 }

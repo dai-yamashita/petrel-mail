@@ -10,8 +10,9 @@
 //! Design rules:
 //! * **Allowlist, never blocklist.** Anything not explicitly permitted is gone.
 //! * **CSS is executable-ish.** Attribute-selector exfiltration and layout
-//!   attacks are real, so declarations are filtered and `url()` is banned
-//!   outright inside styles.
+//!   attacks are real, so declarations are filtered and `url()` is banned in
+//!   every property but a background, where it names an image on exactly the
+//!   terms an `<img>` gets (`background_images`).
 //! * **Remote content is blocked by default** and *counted*, because "2
 //!   trackers removed" is a user-visible promise, not a log line.
 //! * **Fail closed.** Anything unparseable degrades to text.
@@ -38,10 +39,16 @@ pub struct Sanitized {
 
 /// CSS properties an email may set. Layout-affecting properties that enable
 /// overlay/clickjacking attacks (`position`, `z-index`, `transform`) are absent
-/// on purpose, as is anything that can fetch (`background-image`, `content`).
+/// on purpose. Nothing here can fetch: a style names an image only through the
+/// two background properties in `BACKGROUNDS`, and `content` not at all.
 const ALLOWED_CSS: &[&str] = &[
     "color",
     "background-color",
+    // Where a background image sits and how it is sized and tiled. None of the
+    // three can name an image; they only arrange one `BACKGROUNDS` admitted.
+    "background-position",
+    "background-size",
+    "background-repeat",
     "font",
     "font-family",
     "font-size",
@@ -170,11 +177,23 @@ fn absolute_scheme(url: &str) -> std::borrow::Cow<'static, str> {
     }
 }
 
+/// The two properties a style may name an image in. Every other property's
+/// `url()` is refused, so these are the only way an image gets into a style at
+/// all — and only one the remote-content rule would load as an `<img>`.
+const BACKGROUNDS: &[&str] = &["background", "background-image"];
+
 /// Filters a `style` attribute down to the allowlist. Any declaration that
 /// could fetch a resource or reposition content is dropped rather than
 /// rewritten — a mangled style is a cosmetic problem, a fetching one is a
 /// privacy breach.
-fn filter_style(value: &str) -> String {
+///
+/// The one fetch that survives is a background image, on the terms an `<img>`
+/// gets: kept while remote content is allowed, and otherwise dropped with each
+/// image added to `held`, so the count of blocked images includes it. A hero
+/// picture drawn as a background was dropped in both modes, which left an
+/// empty box where the message's main image belonged — with remote content
+/// allowed, and nothing anywhere saying an image had been removed.
+fn filter_style(value: &str, allow_remote: bool, held: &mut usize) -> String {
     let mut kept = Vec::new();
     for decl in value.split(';') {
         let Some((prop, val)) = decl.split_once(':') else {
@@ -183,14 +202,15 @@ fn filter_style(value: &str) -> String {
         let prop_norm = prop.trim().to_ascii_lowercase();
         let val_trim = val.trim();
         let val_norm = val_trim.to_ascii_lowercase();
-        if !ALLOWED_CSS.contains(&prop_norm.as_str()) {
+        let background = BACKGROUNDS.contains(&prop_norm.as_str());
+        if !background && !ALLOWED_CSS.contains(&prop_norm.as_str()) {
             continue;
         }
         // No fetching, no expressions, no escapes used to smuggle either.
         // `list-style` takes an image, and image-set() is not url(), so the
-        // fetching functions are named one by one.
-        if val_norm.contains("url(")
-            || val_norm.contains("image(")
+        // fetching functions are named one by one. url() is the one answered
+        // rather than refused, and only in a background, below.
+        if val_norm.contains("image(")
             || val_norm.contains("image-set(")
             || val_norm.contains("cross-fade(")
             || val_norm.contains("element(")
@@ -203,6 +223,20 @@ fn filter_style(value: &str) -> String {
         {
             continue;
         }
+        let value: std::borrow::Cow<'_, str> = if background {
+            match background_images(&prop_norm, val_trim, allow_remote) {
+                Images::Kept(written) => written.into(),
+                Images::Held(images) => {
+                    *held += images;
+                    continue;
+                }
+                Images::Refused => continue,
+            }
+        } else if val_norm.contains("url(") {
+            continue;
+        } else {
+            val_trim.into()
+        };
         // Viewport heights size the message to the iframe window, and the
         // window is sized to the message: a `100vh` wrapper and the frame
         // chase each other up to the host's cap. Any property, not only
@@ -210,12 +244,190 @@ fn filter_style(value: &str) -> String {
         // same way. `vw` stays: the width is the pane's, never the content's.
         // Pixel and percent heights stay too; percent resolves against
         // auto-height parents, not the window.
-        if is_viewport_sized(val_trim) {
+        if is_viewport_sized(&value) {
             continue;
         }
-        kept.push(format!("{prop_norm}: {val_trim}"));
+        kept.push(format!("{prop_norm}: {value}"));
     }
     kept.join("; ")
+}
+
+/// What a background's images come to under the remote-content rule.
+#[derive(Debug, PartialEq, Eq)]
+enum Images {
+    /// Every image is a web image the frame may load: the value as it may be
+    /// written, each address in the full form `absolute_scheme` gives it.
+    Kept(String),
+    /// Web images while remote content is off. The declaration goes and each
+    /// image is counted, because "2 images blocked" promises every fetch.
+    Held(usize),
+    /// No image this frame can load, or a value that cannot be read the way a
+    /// browser would read it. Dropped, as any other refused declaration is.
+    Refused,
+}
+
+/// Reads a `background` or `background-image` value for its images.
+///
+/// Only `url()` names an image here, and only a web address does. A `cid:`
+/// reference is resolved in attributes, never inside a style, so it could only
+/// ever be a broken request; a `data:` picture carries `;base64,`, which the
+/// declaration split has already cut in two. Matched without regard to case,
+/// which is how a browser reads `URL(` — the spelling ammonia's own CSS filter
+/// let through (RUSTSEC-2026-0373).
+///
+/// Everything around the images has to be plainly layout and color, so nothing
+/// in it can name a fetch this did not see: a gradient, a variable, `attr()`
+/// or a stray string is refused rather than understood. `background-image`
+/// holds images and the commas between them, nothing else; the shorthand
+/// needs one image at least, so a color written as `background:#fff` stays
+/// out as it always has.
+fn background_images(prop: &str, value: &str, allow_remote: bool) -> Images {
+    // `!important` is the declaration's, not part of the value read here.
+    let (value, important) = split_important(value);
+    let mut written = String::with_capacity(value.len());
+    let mut rest = value;
+    let mut images = 0;
+    let mut held = 0;
+    while let Some(at) = find_url(rest) {
+        let (before, after) = (&rest[..at], &rest[at + "url(".len()..]);
+        // `url(` opens the function only where a token can start: in `xurl(`
+        // it is the tail of some other name, and that function is refused.
+        let joined = before
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if joined || !layout_only(before, prop) {
+            return Images::Refused;
+        }
+        let Some((address, used)) = read_url(after) else {
+            return Images::Refused;
+        };
+        if !is_remote(&address) {
+            return Images::Refused;
+        }
+        images += 1;
+        written.push_str(before);
+        if allow_remote {
+            let full = absolute_scheme(&address);
+            // Serialized URLs escape quotes; one surviving would end the
+            // string early, and what followed it would be read as CSS.
+            if full.contains('"') {
+                return Images::Refused;
+            }
+            written.push_str("url(\"");
+            written.push_str(&full);
+            written.push_str("\")");
+        } else {
+            held += 1;
+        }
+        rest = &after[used..];
+    }
+    if images == 0 || !layout_only(rest, prop) {
+        return Images::Refused;
+    }
+    if held > 0 {
+        return Images::Held(held);
+    }
+    written.push_str(rest);
+    if important {
+        written.push_str(" !important");
+    }
+    Images::Kept(written)
+}
+
+/// The value without a trailing `!important`, and whether it had one.
+fn split_important(value: &str) -> (&str, bool) {
+    let trimmed = value.trim_end();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(head) = lower.strip_suffix("important")
+        && let Some(head) = head.trim_end().strip_suffix('!')
+    {
+        // Lowering is ASCII-only, so byte offsets in `lower` are offsets in
+        // `trimmed` too.
+        return (&trimmed[..head.trim_end().len()], true);
+    }
+    (trimmed, false)
+}
+
+/// Where the next `url(` starts, in any case.
+fn find_url(text: &str) -> Option<usize> {
+    // ASCII, so a match starts on a character boundary.
+    text.as_bytes()
+        .windows("url(".len())
+        .position(|w| w.eq_ignore_ascii_case(b"url("))
+}
+
+/// The address inside `url(…)` and how much of the text after `url(` it took,
+/// closing parenthesis included. None for anything a browser would not read as
+/// one address: an unterminated or mismatched quote, a quote, space or bracket
+/// inside an unquoted address, or nothing at all.
+fn read_url(after: &str) -> Option<(String, usize)> {
+    let body = after.trim_start();
+    let lead = after.len() - body.len();
+    let (address, end) = match body.chars().next()? {
+        quote @ ('"' | '\'') => {
+            let close = body[1..].find(quote)? + 1;
+            let tail = &body[close + 1..];
+            let gap = tail.len() - tail.trim_start().len();
+            if !tail.trim_start().starts_with(')') {
+                return None;
+            }
+            (&body[1..close], close + 1 + gap + 1)
+        }
+        _ => {
+            let close = body.find(')')?;
+            let address = body[..close].trim_end();
+            if address
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '('))
+            {
+                return None;
+            }
+            (address, close + 1)
+        }
+    };
+    if address.trim().is_empty() || address.contains(['\n', '\r']) {
+        return None;
+    }
+    Some((address.to_string(), lead + end))
+}
+
+/// Whether the text around a background's images is layout and color only.
+///
+/// For `background-image` that is the commas between images and nothing else.
+/// The shorthand may add keywords, numbers and lengths, `/` between position
+/// and size, `#` colors and the `rgb()` and `hsl()` color functions — and
+/// every bracket has to be one of those, closed before anything else opens.
+fn layout_only(text: &str, prop: &str) -> bool {
+    if prop == "background-image" {
+        return text.chars().all(|c| c == ',' || c.is_whitespace());
+    }
+    let plain = |c: char| {
+        c.is_ascii_alphanumeric()
+            || c.is_ascii_whitespace()
+            || matches!(c, '#' | '%' | '.' | ',' | '/' | '-' | '+')
+    };
+    let lower = text.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(open) = rest.find('(') {
+        let head = &rest[..open];
+        let name = head
+            .rsplit(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or_default();
+        if !head.chars().all(plain) || !matches!(name, "rgb" | "rgba" | "hsl" | "hsla") {
+            return false;
+        }
+        let Some(close) = rest[open + 1..].find(')') else {
+            return false;
+        };
+        let inner = &rest[open + 1..open + 1 + close];
+        if !inner.chars().all(plain) {
+            return false;
+        }
+        rest = &rest[open + 1 + close + 1..];
+    }
+    rest.chars().all(plain)
 }
 
 /// A length in viewport heights — vh, vmin, vmax, their dynamic forms
@@ -621,7 +833,13 @@ pub fn sanitize_html(html: &str, allow_remote: bool) -> Sanitized {
                     Some(absolute_scheme(value))
                 }
                 (_, "style") => {
-                    let filtered = filter_style(value);
+                    // A background image held back is counted like an `<img>`
+                    // held back: the reader's "images blocked" covers both.
+                    let mut held = 0;
+                    let filtered = filter_style(value, allow_remote, &mut held);
+                    if held > 0 {
+                        blocked_cb.fetch_add(held, Ordering::Relaxed);
+                    }
                     if filtered.is_empty() {
                         None
                     } else {
@@ -936,15 +1154,233 @@ mod tests {
         assert_eq!(allowed.report.blocked_remote, 0);
     }
 
+    /// A style attribute with each `"` written as HTML would carry it.
+    ///
+    /// A `div`, not a `td`: a cell outside a table is dropped by the parser
+    /// before the filter sees it, which makes any assertion about its style
+    /// pass without testing anything.
+    fn styled(style: &str) -> String {
+        format!(r#"<div style="{}">a</div>"#, style.replace('"', "&quot;"))
+    }
+
     #[test]
-    fn layout_attributes_cannot_smuggle_a_fetch() {
-        // The geometry allowlist must stay geometry: anything taking a URL has
-        // to go through the remote-content decision, never round it.
+    fn style_backgrounds_follow_the_remote_content_rule() {
+        // A background image fetches exactly as an image source does, so it
+        // answers to the same decision rather than going round it: loaded
+        // while remote content is allowed, and otherwise removed and counted.
+        let markup = styled("background-image: url('https://cdn.example/bg.png')");
+
+        let blocked = sanitize_html(&markup, false);
+        assert!(!blocked.html.contains("cdn.example"), "{}", blocked.html);
+        assert_eq!(blocked.report.blocked_remote, 1);
+
+        let allowed = sanitize_html(&markup, true);
+        assert!(
+            allowed
+                .html
+                .contains("background-image: url(&quot;https://cdn.example/bg.png&quot;)"),
+            "{}",
+            allowed.html
+        );
+        assert_eq!(allowed.report.blocked_remote, 0);
+    }
+
+    #[test]
+    fn a_layered_background_picture_shows_when_remote_content_does() {
+        // The shape mail builders write for an animated picture over a still
+        // poster: two image layers on an otherwise empty box. Dropped, the
+        // reader showed an empty square where the message's main picture
+        // belonged, with remote content allowed.
+        let markup = styled(
+            "width:146px;height:146px;background:url('https://cdn.example/wave.gif') center / contain no-repeat, url('https://cdn.example/poster.png') center / contain no-repeat;border-radius:20px",
+        );
+
+        let allowed = sanitize_html(&markup, true);
+        for want in [
+            "background: url(&quot;https://cdn.example/wave.gif&quot;) center / contain no-repeat, url(&quot;https://cdn.example/poster.png&quot;) center / contain no-repeat",
+            "width: 146px",
+            "border-radius: 20px",
+        ] {
+            assert!(allowed.html.contains(want), "lost {want}: {}", allowed.html);
+        }
+
+        let blocked = sanitize_html(&markup, false);
+        assert!(!blocked.html.contains("cdn.example"), "{}", blocked.html);
+        assert_eq!(blocked.report.blocked_remote, 2, "each layer is a fetch");
+        assert!(
+            blocked.html.contains("width: 146px"),
+            "the box keeps its size: {}",
+            blocked.html
+        );
+    }
+
+    #[test]
+    fn a_background_shorthand_keeps_its_color_beside_its_image() {
         let res = sanitize_html(
-            r#"<td style="background-image: url('https://evil.example/x')" width="10">a</td>"#,
+            &styled(
+                "background: #f4f4f4 url('https://cdn.example/bg.png') top center / cover no-repeat",
+            ),
             true,
         );
-        assert!(!res.html.contains("evil.example"), "{}", res.html);
+        assert!(
+            res.html.contains(
+                "background: #f4f4f4 url(&quot;https://cdn.example/bg.png&quot;) top center / cover no-repeat"
+            ),
+            "{}",
+            res.html
+        );
+        let rgb = sanitize_html(
+            &styled(
+                "background: rgb(244, 244, 244) url(https://cdn.example/bg.png) no-repeat !important",
+            ),
+            true,
+        );
+        assert!(
+            rgb.html.contains(
+                "background: rgb(244, 244, 244) url(&quot;https://cdn.example/bg.png&quot;) no-repeat !important"
+            ),
+            "{}",
+            rgb.html
+        );
+    }
+
+    #[test]
+    fn a_background_with_no_image_stays_out_as_before() {
+        // The shorthand is admitted for its pictures. A color alone in it
+        // stays out as it always has: admitting it would change how every
+        // message that writes `background:#fff` looks, which is a decision of
+        // its own and not this one.
+        let res = sanitize_html(&styled("background: #ffffff; color: #111111"), true);
+        assert!(!res.html.contains("background"), "{}", res.html);
+        assert!(res.html.contains("color: #111111"), "{}", res.html);
+    }
+
+    #[test]
+    fn only_a_web_image_can_be_a_style_background() {
+        // Remote content allowed throughout: each of these is refused for what
+        // it is, not for the setting.
+        for style in [
+            // No host to load from.
+            "background-image: url(images/bg.png)",
+            // cid: is resolved in attributes only, so this is a broken request.
+            "background-image: url(cid:part1@example.com)",
+            // data: in a style is not admitted.
+            "background-image: url(data:image/gif,R0lGODlh)",
+            "background-image: url(javascript:alert(1))",
+            "background-image: image-set('https://cdn.example/a.png' 1x)",
+            // Images only, and a gradient is not one this reads.
+            "background-image: linear-gradient(red, blue)",
+            "background-image: url(https://cdn.example/a.png) red",
+            "background: linear-gradient(red, blue), url(https://cdn.example/a.png)",
+            // Nothing that could carry an address this scan did not see.
+            "background: var(--x, url(https://cdn.example/a.png))",
+            "background: url(https://cdn.example/a.png) attr(data-x)",
+            "background: url(https://cdn.example/a.png) 'x'",
+            // Not url() at all, but the tail of another name.
+            "background: xurl(https://cdn.example/a.png)",
+            // Not one address the way a browser reads it.
+            r#"background: url("https://cdn.example/a.png"#,
+            r#"background: url("https://cdn.example/a.png')"#,
+            "background: url(https://cdn.example/a b.png)",
+            "background: url()",
+        ] {
+            let res = sanitize_html(&styled(style), true);
+            assert!(!res.html.contains("background"), "{style} -> {}", res.html);
+            assert!(!res.html.contains("cdn.example"), "{style} -> {}", res.html);
+        }
+    }
+
+    #[test]
+    fn no_other_property_can_name_an_image() {
+        // A background is the one place a style may name a picture. The
+        // geometry and type allowlist must stay geometry and type: a URL
+        // anywhere else is dropped, remote content allowed or not.
+        for style in [
+            "list-style: url(https://evil.example/x.png)",
+            "list-style-type: url(https://evil.example/x.png)",
+            "border: url(https://evil.example/x.png)",
+            "border-image: url(https://evil.example/x.png) 30",
+            "content: url(https://evil.example/x.png)",
+            "cursor: url(https://evil.example/x.cur), auto",
+            "background-position: url(https://evil.example/x.png)",
+        ] {
+            for allow_remote in [false, true] {
+                let res = sanitize_html(&styled(style), allow_remote);
+                assert!(
+                    !res.html.contains("evil.example"),
+                    "{style} -> {}",
+                    res.html
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_background_is_read_whatever_its_case() {
+        // `URL(` is the same fetch to a browser as `url(`: the upper-case
+        // spelling is the one ammonia's CSS filter let through
+        // (RUSTSEC-2026-0373), and here it would have gone uncounted.
+        let markup = styled(r#"BACKGROUND-IMAGE: URL("https://cdn.example/bg.png")"#);
+        let blocked = sanitize_html(&markup, false);
+        assert!(!blocked.html.contains("cdn.example"), "{}", blocked.html);
+        assert_eq!(blocked.report.blocked_remote, 1);
+        let allowed = sanitize_html(&markup, true);
+        assert!(
+            allowed
+                .html
+                .contains("background-image: url(&quot;https://cdn.example/bg.png&quot;)"),
+            "{}",
+            allowed.html
+        );
+    }
+
+    #[test]
+    fn a_disguised_background_address_is_still_remote() {
+        // The URL a browser reads, not the one written: a tab inside the
+        // scheme, no scheme at all, and the abbreviated form are each a fetch
+        // from the host, and each is written out in full when it may load.
+        for address in [
+            "ht\ttps://tracker.example/p.gif",
+            "//tracker.example/p.gif",
+            "https:tracker.example/p.gif",
+        ] {
+            let markup = styled(&format!("background-image: url('{address}')"));
+            let blocked = sanitize_html(&markup, false);
+            assert!(
+                !blocked.html.contains("tracker.example"),
+                "{address:?}: {}",
+                blocked.html
+            );
+            assert_eq!(blocked.report.blocked_remote, 1, "{address:?}");
+            let allowed = sanitize_html(&markup, true);
+            assert!(
+                allowed
+                    .html
+                    .contains("url(&quot;https://tracker.example/p.gif&quot;)"),
+                "{address:?}: {}",
+                allowed.html
+            );
+        }
+    }
+
+    #[test]
+    fn a_background_keeps_where_and_how_big_it_was_drawn() {
+        let res = sanitize_html(
+            &styled(
+                "background-image: url('https://cdn.example/bg.png'); background-size: cover; background-position: center top; background-repeat: no-repeat",
+            ),
+            true,
+        );
+        for want in [
+            "background-size: cover",
+            "background-position: center top",
+            "background-repeat: no-repeat",
+        ] {
+            assert!(res.html.contains(want), "lost {want}: {}", res.html);
+        }
+        // Sized to the window is sized to the window wherever it is written.
+        let tall = sanitize_html(&styled("background-size: 100vh"), true);
+        assert!(!tall.html.contains("100vh"), "{}", tall.html);
     }
 
     #[test]
@@ -1278,8 +1714,13 @@ mod tests {
             r#"<p style="color: red; background-image: url('https://evil.example/x?a=1')">a</p>
                <div style="position: fixed; top: 0; z-index: 99999; width: 100%">overlay</div>
                <span style="background: url(https://evil.example/y)">b</span>
-               <b style="width: expression(alert(1))">c</b>"#,
+               <b style="width: expression(alert(1))">c</b>
+               <ul style='list-style: URL("https://evil.example/z")'><li>d</li></ul>"#,
         );
+        // CSS function names are case-insensitive, so `URL(` fetches just as
+        // `url(` does: the spelling ammonia's own CSS filter once let through
+        // (RUSTSEC-2026-0373). `list-style` is allowed and takes an image, so
+        // only the fetch check stands between that one and the network.
         assert!(!out.contains("evil.example"), "css must not fetch: {out}");
         assert!(!out.contains("position"), "no overlay positioning: {out}");
         assert!(!out.contains("z-index"), "{out}");

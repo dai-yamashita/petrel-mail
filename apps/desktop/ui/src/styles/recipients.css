@@ -192,3 +192,32 @@
   background: var(--accent-fill);
   border-color: var(--accent-fill);
 }
+
+/* The column's header box, in the list head: the same box, set over the rows'
+   boxes rather than beside the title. The head's inline padding (14px) and the
+   row's border plus padding (3px + 11px) come to the same edge, so the offset
+   is the row's own geometry — the dot's 7px track, the gap after it, then
+   centred in the 25px track as .row-check centres itself. Compact rows keep a
+   9px gap, so their header box sits a pixel nearer the edge. */
+.view-check {
+  margin-block-start: 0;
+  margin-inline-start: calc(7px + 10px + (25px - 16px) / 2);
+  padding: 0;
+  background: none;
+  font: inherit;
+}
+
+.view-check[data-density='compact'] {
+  margin-inline-start: calc(7px + 9px + (25px - 16px) / 2);
+}
+
+.view-check[aria-checked='true'],
+.view-check[aria-checked='mixed'] {
+  background: var(--accent-fill);
+  border-color: var(--accent-fill);
+}
+
+.view-check:disabled {
+  opacity: 0.4;
+  cursor: default;
+}

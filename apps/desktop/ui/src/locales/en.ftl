@@ -21,6 +21,7 @@ list-conversations = { $count ->
 }
 list-unread = { $count } unread
 list-selected = { $count } selected
+list-selected-of = { $count } of { $total } selected
 reader-archive = Archive
 reader-star = Star
 reader-more = More actions
@@ -581,6 +582,7 @@ format-link-apply = Apply
 format-font = Typeface
 format-size = Text size
 list-select-row = Select this conversation
+list-select-all = Select all conversations
 lists-sort-scope = Sort order
 sort-scope-mailbox = Per mailbox
 sort-scope-everywhere = Shared
@@ -723,6 +725,7 @@ folder-into-itself = A folder cannot move into itself.
 folder-trashed = Moved “{ $name }” to Trash. Drag it back out to restore, or delete it from its menu for good.
 folder-fold = Collapse
 folder-unfold = Expand
+folder-container-tip = Not a folder on the server. It only groups the folders inside it.
 folder-delete = Delete folder
 folder-mark-all-read = Mark all as read
 folder-mark-all-unread = Mark all as unread
@@ -816,6 +819,12 @@ triage-nothing-to-archive = Nothing to archive.
 undo-done = Undone
 undo-too-late = Too late to undo. That already went to the server.
 triage-many = { $what } · { $count } conversations
+# An action on every conversation in a view, past the rows the list has loaded.
+bulk-confirm-title = Apply to all { $count } conversations?
+bulk-confirm-body = { $action }: every conversation in { $view }, including ones not loaded yet. Undo isn’t offered for this many.
+bulk-working = { $action } · { $count } conversations…
+action-untag = Remove tag
+action-unsnooze = Unsnooze
 triage-done-archive = Archived
 triage-done-trash = Moved to Trash
 triage-done-spam = Reported as spam
@@ -865,6 +874,18 @@ menubar-petrel-help = Petrel Help
 menubar-report-issue = Report an Issue
 menubar-view-source = View Source on GitHub
 menubar-fullscreen = Toggle Full Screen
+# Windows and Linux call it Maximize; macOS calls the same item Zoom.
+menubar-maximize = Maximize
+menubar-reading-pane = Reading Pane
+menubar-sort-by = Sort By
+menubar-text-size = Reading Text Size
+menubar-text-bigger = Bigger
+menubar-text-smaller = Smaller
+# The sidebar's two widths, as View › Sidebar offers them.
+sidebar-expanded = Expanded
+sidebar-collapsed = Collapsed
+# Petrel › About Petrel on Windows and Linux, under the name and version.
+about-tagline = A fast, local-first desktop email client.
 
 # Help: the shortcut list and the search-operator table. These were the last
 # strings hardcoded in English; the Help dialog rendered them straight from

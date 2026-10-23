@@ -5,6 +5,7 @@ import {
   mailKeyDecision,
   placeOf,
   singleKeysAllowed,
+  textSizeStep,
 } from './useKeyboard';
 
 /**
@@ -193,5 +194,23 @@ describe('each pane', () => {
       expect(found.length, pane).toBeGreaterThan(0);
       for (const tag of found) expect(tag, pane).toMatch(/tabIndex=\{-1\}/);
     }
+  });
+});
+
+describe('the reading text size keys', () => {
+  it('grows on the key that carries = and +, shifted or not', () => {
+    // ⌘+ is ⌘⇧= on most keyboards, and the keypad's plus reports + too.
+    expect(textSizeStep('=')).toBe(1);
+    expect(textSizeStep('+')).toBe(1);
+  });
+
+  it('shrinks on minus and goes back to the default on zero', () => {
+    expect(textSizeStep('-')).toBe(-1);
+    expect(textSizeStep('0')).toBe(0);
+  });
+
+  it('leaves every other key alone, the account digits most of all', () => {
+    // ⌘1 to ⌘9 switch account; ⌘0 is the only digit this claims.
+    for (const key of ['1', '9', '_', ')', 'n', 'Enter']) expect(textSizeStep(key)).toBeNull();
   });
 });

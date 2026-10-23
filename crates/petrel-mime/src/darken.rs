@@ -69,6 +69,9 @@ enum Attr {
 const COLOR_PROPS: &[&str] = &[
     "color",
     "background-color",
+    // Admitted only with a picture in it, and a color can ride along with one:
+    // left as written, that box stayed white in a dark pane.
+    "background",
     "border",
     "border-top",
     "border-bottom",
@@ -78,8 +81,8 @@ const COLOR_PROPS: &[&str] = &[
 ];
 
 fn recolor_style(style: &str) -> String {
-    style
-        .split(';')
+    declarations(style)
+        .into_iter()
         .map(|decl| {
             let Some((prop, value)) = decl.split_once(':') else {
                 return decl.to_string();
@@ -99,6 +102,59 @@ fn recolor_style(style: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// The declarations of a serialized style value, cut where CSS cuts them.
+///
+/// The value is the serializer's, so a `;` can also close a character
+/// reference — `&quot;` around a font name, `&amp;` in an image address — or
+/// sit inside a bracket, as in `url(…)`. Neither ends a declaration. Cut there,
+/// the pieces were joined back with a space, and the font name or the address
+/// came back with one inside it: `" Helvetica Neue"` names no font, and an
+/// image's `&h=400` became `& h=400`.
+fn declarations(style: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    // The markers are ASCII, so every index found is a character boundary.
+    for (i, byte) in style.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 && !ends_reference(&style[start..i]) => {
+                out.push(&style[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&style[start..]);
+    out
+}
+
+/// Whether the text ends inside a character reference — `&amp`, `&#39`,
+/// `&#x27` — so the `;` after it closes the reference, not a declaration.
+fn ends_reference(text: &str) -> bool {
+    let Some(amp) = text.rfind('&') else {
+        return false;
+    };
+    let body = &text[amp + 1..];
+    let named = !body.is_empty() && body.chars().all(|c| c.is_ascii_alphanumeric());
+    let numeric = body.strip_prefix('#').is_some_and(|n| {
+        let (digits, hex) = match n.strip_prefix(['x', 'X']) {
+            Some(h) => (h, true),
+            None => (n, false),
+        };
+        !digits.is_empty()
+            && digits.chars().all(|c| {
+                if hex {
+                    c.is_ascii_hexdigit()
+                } else {
+                    c.is_ascii_digit()
+                }
+            })
+    });
+    named || numeric
 }
 
 /// One CSS color token flipped, or None when it is not a color we read.
@@ -245,6 +301,57 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_background_keeps_its_picture_and_flips_its_color() {
+        // The shorthand arrives only with a picture in it. Its color turns
+        // with the rest of the page; its address comes out exactly as it went
+        // in, `&amp;` and all — cut at that `;`, the query came back as
+        // `& h=400` and asked for some other image.
+        let html = r#"<td style="background: #ffffff url(&quot;https://cdn.example/bg.png?w=600&amp;h=400&quot;) top center / cover no-repeat; color: #111111">x</td>"#;
+        let out = recolor_for_dark(html);
+        assert!(
+            out.contains(
+                "url(&quot;https://cdn.example/bg.png?w=600&amp;h=400&quot;) top center / cover no-repeat"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("background: #0a0a0a"), "{out}");
+        assert!(out.contains("color: #eeeeee"), "{out}");
+    }
+
+    #[test]
+    fn a_quoted_font_name_comes_through_whole() {
+        // `&quot;` ends in a `;` too. Cut there, the name came back as
+        // `" Helvetica Neue"`, which names no font, and the text fell back.
+        let html =
+            r#"<p style="font-family: &quot;Helvetica Neue&quot;, Arial; color: #111111">x</p>"#;
+        let out = recolor_for_dark(html);
+        assert!(
+            out.contains("font-family: &quot;Helvetica Neue&quot;, Arial"),
+            "{out}"
+        );
+        assert!(out.contains("color: #eeeeee"), "{out}");
+    }
+
+    #[test]
+    fn declarations_part_where_css_parts_them() {
+        assert_eq!(
+            declarations("color: red; margin: 0"),
+            ["color: red", " margin: 0"]
+        );
+        assert_eq!(
+            declarations("background: url(&quot;a;b&quot;); color: red"),
+            ["background: url(&quot;a;b&quot;)", " color: red"]
+        );
+        assert_eq!(
+            declarations("content: &#39;x&#x27;; a: b"),
+            ["content: &#39;x&#x27;", " a: b"]
+        );
+        // Past the end of a reference, a `;` divides again: the serializer
+        // writes a text `&` as `&amp;`, and what follows it is ordinary text.
+        assert_eq!(declarations("a: R&amp;D; b: c"), ["a: R&amp;D", " b: c"]);
+    }
 
     #[test]
     fn light_flips_dark_and_hue_survives() {

@@ -46,6 +46,89 @@ pub fn triage(
     Ok(receipt)
 }
 
+/// What an action on a whole view did: how many conversations it changed and
+/// how many messages they held. A conversation it found nothing to do in — the
+/// mark-read of one already read — is not counted.
+#[derive(serde::Serialize)]
+pub struct ViewActionReceipt {
+    pub conversations: usize,
+    pub messages: usize,
+}
+
+/// Conversations filed per hold of the store. The lock is let go between
+/// batches, so sync and the window are not shut out for the length of a
+/// mailbox while this works through one.
+const VIEW_ACTION_BATCH: usize = 200;
+
+/// Applies one triage action to every conversation a view lists: Select all as
+/// desktop mail clients mean it, the whole mailbox rather than the rows the
+/// window happens to have loaded.
+///
+/// The conversations come from the view's own walk (`conversation_keys`), so
+/// "all" is what the list shows scrolled to its end, never a second definition
+/// of the view. Each is then filed as `triage` files one — one action and one
+/// queued delivery per conversation, in the order the walk gives — so the
+/// drain meets the same work a run of keypresses would have queued, and
+/// delivers it the same way.
+///
+/// The window asks behind a confirmation and offers no undo, as Move all to
+/// Trash does not: an undo for ten thousand conversations is ten thousand
+/// actions the window would have to carry back. A failure partway stops here
+/// with what was done already done, as each conversation's change is its own;
+/// the list the window reloads afterwards says where it got to.
+#[tauri::command]
+pub async fn triage_view(
+    view: String,
+    kind: ActionKind,
+    target: Option<i64>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ViewActionReceipt, String> {
+    let list = petrel_engine::store::ListView::parse(&view);
+    // Drafts lists messages, and a key there is the message's id negated: the
+    // conversation is the wrong unit for a draft (see `triage`).
+    let per_message = matches!(&list, petrel_engine::store::ListView::Folder(r) if r == "drafts");
+    let (account, keys) = {
+        let store = state.store_read()?;
+        let account = active_account(&store)?;
+        let keys = store
+            .conversation_keys(account, &list)
+            .map_err(|e| e.to_string())?;
+        (account, keys)
+    };
+    let mut done = ViewActionReceipt {
+        conversations: 0,
+        messages: 0,
+    };
+    for batch in keys.chunks(VIEW_ACTION_BATCH) {
+        {
+            let store = state.store()?;
+            let policy = store.placement_policy(account).map_err(|e| e.to_string())?;
+            for &key in batch {
+                let receipt = if per_message {
+                    store.apply_message_action(account, -key, kind, target, policy)
+                } else {
+                    store.apply_thread_action(account, key, kind, target, policy)
+                }
+                .map_err(|e| e.to_string())?;
+                if receipt.message_count > 0 {
+                    done.conversations += 1;
+                    done.messages += receipt.message_count;
+                }
+            }
+        }
+        // Delivery starts with the first batch rather than after the last.
+        state.nudge_drain(account);
+        // A moment between holds: the lock is not fair, and taken straight
+        // back it can go on winning against the sync waiting for it.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    log_sync(&format!(
+        "acted on a whole view: {} conversation(s), {} message(s)",
+        done.conversations, done.messages
+    ));
+    Ok(done)
+}
+
 /// The account a triage acts for: the one the conversation or message is in,
 /// not whichever the rail shows now.
 ///

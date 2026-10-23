@@ -15,25 +15,27 @@
  * `install` logs what it replaced, so that claim can be checked rather than
  * believed.
  *
- * macOS only in effect. The structure is what a Mac app is expected to have —
- * the app menu first, Window last — and Windows and Linux will want their own
- * arrangement when they arrive (docs 16 §5). Nothing here breaks on them; the
- * predefined items that those platforms lack are simply absent from the menu
- * they draw.
+ * Two arrangements from one description (`menuFor`). macOS gets the menu a Mac
+ * app is expected to have — the app menu first, Window last. Windows and Linux
+ * get the same menus without the items only AppKit implements. muda draws every
+ * item it is handed but answers only the ones its platform has, so on Windows
+ * those rows were drawn and did nothing — and Hide did worse, which is why the
+ * split exists rather than being left for later.
  */
 
 import { useEffect, useRef } from 'react';
 import type {
   CheckMenuItem,
-  CheckMenuItemOptions,
   MenuItemOptions,
   PredefinedMenuItemOptions,
   Submenu,
   SubmenuOptions,
 } from '@tauri-apps/api/menu';
 import { api } from './api';
+import { isMac } from './keys';
 import { t, type StringId } from './strings';
 import type { Settings } from './settings';
+import { directionLabels, type SortKey } from './sort';
 import { ISSUES_URL, SOURCE_URL } from './project';
 
 /** The items macOS implements itself. Their accelerators, their behavior and
@@ -44,14 +46,46 @@ type NativeItem = Extract<PredefinedMenuItemOptions['item'], string>;
 /** A command Petrel answers itself. Adding a name here forces the hook below
  *  to provide a handler for it — the compiler, not a code review, is what
  *  stops a menu item that does nothing. */
-export const MENU_COMMANDS = ['new-message', 'settings', 'help', 'find'] as const;
+export const MENU_COMMANDS = [
+  'new-message',
+  'settings',
+  'help',
+  'find',
+  'about',
+  'text-bigger',
+  'text-smaller',
+  'text-reset',
+] as const;
 export type MenuCommand = (typeof MENU_COMMANDS)[number];
 
-/** The settings the View menu drives. Both already exist in Settings ›
- *  Appearance; the menu is another way to reach them, not another copy. */
-type Choice =
+/** Which way a sort runs. Named as the setting holds it; the words people see
+ *  are the key's own (`directionLabels`). */
+export type SortDirection = 'descending' | 'ascending';
+
+/** The settings the View menu drives. Every one already has a home — Settings
+ *  › Appearance and › Lists, the rail's collapse button, the sort control above
+ *  the list — and the menu is another way to reach it, not another copy. The
+ *  sort is two choices because that control is two: which key, which way. */
+export type Choice =
   | { setting: 'theme'; value: Settings['theme'] }
-  | { setting: 'density'; value: Settings['density'] };
+  | { setting: 'density'; value: Settings['density'] }
+  | { setting: 'layout'; value: Settings['layout'] }
+  | { setting: 'railCollapsed'; value: Settings['railCollapsed'] }
+  | { setting: 'checkboxes'; value: Settings['checkboxes'] }
+  | { setting: 'sortKey'; value: SortKey }
+  | { setting: 'sortDirection'; value: SortDirection };
+
+/** What each choice reads as now. The direction is '' under Best match, which
+ *  has none: it is the order the ranking produced. */
+export type ChoiceValues = {
+  theme: Settings['theme'];
+  density: Settings['density'];
+  layout: Settings['layout'];
+  railCollapsed: Settings['railCollapsed'];
+  checkboxes: Settings['checkboxes'];
+  sortKey: SortKey;
+  sortDirection: SortDirection | '';
+};
 
 export type MenuNode =
   | { role: 'separator' }
@@ -71,145 +105,270 @@ export type MenuNode =
       helpMenu?: true;
     };
 
-/**
- * The menu, as data.
- *
- * Kept declarative so it can be asserted on: menu.test.ts walks this and checks
- * that every label exists in the bundle, every command has a handler, and no
- * two accelerators collide. None of that is observable from a running menu bar
- * without a person looking at one.
- */
-export const MENU: MenuNode[] = [
-  {
-    role: 'submenu',
-    label: 'app-name',
-    items: [
-      { role: 'about', label: 'menubar-about' },
-      { role: 'separator' },
-      // The same pane ⌘, has always opened. The accelerator now belongs to the
-      // menu: macOS gives its key equivalents first refusal, so the window's
-      // own ⌘, handler no longer sees the keystroke. Both lead to one place.
-      { role: 'command', command: 'settings', label: 'menubar-settings', accelerator: 'CmdOrCtrl+,' },
-      { role: 'separator' },
-      { role: 'native', native: 'Services', label: 'menubar-services' },
-      { role: 'separator' },
-      { role: 'native', native: 'Hide', label: 'menubar-hide' },
-      { role: 'native', native: 'HideOthers', label: 'menubar-hide-others' },
-      { role: 'native', native: 'ShowAll', label: 'menubar-show-all' },
-      { role: 'separator' },
-      { role: 'native', native: 'Quit', label: 'menubar-quit' },
-    ],
-  },
-  {
-    role: 'submenu',
-    label: 'menubar-file',
-    items: [
-      { role: 'command', command: 'new-message', label: 'menubar-new-message', accelerator: 'CmdOrCtrl+N' },
-      { role: 'separator' },
-      { role: 'native', native: 'CloseWindow', label: 'menubar-close-window' },
-    ],
-  },
-  {
-    // Load-bearing beyond the obvious. Without these, macOS has nowhere to send
-    // the editing commands dictation and the emoji picker issue, and both
-    // misbehave inside the webview.
-    //
-    // They look inert more often than they are. Every one carries the real
-    // AppKit selector with no target, so it travels the responder chain and
-    // works wherever this app has text — the composer, the search field, a
-    // folder being renamed, a selection in the reader — and does nothing
-    // elsewhere. What it will not do is *say* so: the menu library calls
-    // setAutoenablesItems(false) on every menu it builds, which is exactly the
-    // macOS mechanism that would grey them out when nothing can respond. So
-    // they stay black and clickable whether or not they apply. Reaching past
-    // Tauri into the NSMenu to turn validation back on would couple this file
-    // to another library's internals for the sake of some dimming.
-    //
-    // Find is the one item here Petrel implements itself, and it is the reason
-    // this menu is worth opening: ⌘F searches the whole open conversation,
-    // across every message frame in it, and until now existed only for people
-    // who already knew to press it.
-    role: 'submenu',
-    label: 'menubar-edit',
-    items: [
-      { role: 'native', native: 'Undo', label: 'menubar-undo' },
-      { role: 'native', native: 'Redo', label: 'menubar-redo' },
-      { role: 'separator' },
-      { role: 'native', native: 'Cut', label: 'menubar-cut' },
-      { role: 'native', native: 'Copy', label: 'menubar-copy' },
-      { role: 'native', native: 'Paste', label: 'menubar-paste' },
-      { role: 'native', native: 'SelectAll', label: 'menubar-select-all' },
-      { role: 'separator' },
-      { role: 'command', command: 'find', label: 'menubar-find', accelerator: 'CmdOrCtrl+F' },
-    ],
-  },
-  {
-    role: 'submenu',
-    label: 'menubar-view',
-    items: [
-      {
-        role: 'submenu',
-        label: 'appearance-theme',
-        items: [
-          { role: 'choice', setting: 'theme', value: 'light', label: 'theme-light' },
-          { role: 'choice', setting: 'theme', value: 'dark', label: 'theme-dark' },
-          { role: 'choice', setting: 'theme', value: 'system', label: 'theme-system' },
-        ],
-      },
-      {
-        role: 'submenu',
-        label: 'appearance-density',
-        items: [
-          { role: 'choice', setting: 'density', value: 'relaxed', label: 'density-relaxed' },
-          { role: 'choice', setting: 'density', value: 'compact', label: 'density-compact' },
-        ],
-      },
-      { role: 'separator' },
-      // Kept, not added. Tauri's default View menu held this one item, and
-      // ⌃⌘F exists only because a menu item claims it — replacing the menu
-      // without it would have quietly taken full screen off the keyboard.
-      { role: 'native', native: 'Fullscreen', label: 'menubar-fullscreen' },
-    ],
-  },
-  {
-    // `windowMenu` hands this one to AppKit, which appends the list of open
-    // windows to it. That list is the whole reason the menu is worth having
-    // with a popped-out composer or message on screen, and it is not something
-    // this file can draw for itself.
-    role: 'submenu',
-    label: 'menubar-window',
-    windowMenu: true,
-    items: [
-      { role: 'native', native: 'Minimize', label: 'menubar-minimize' },
-      { role: 'native', native: 'Maximize', label: 'menubar-zoom' },
-      { role: 'separator' },
-    ],
-  },
-  {
-    // Last, which is where macOS expects it, and marked so AppKit takes it:
-    // a Help menu it owns gets the search box that walks the menus for you.
-    // Tauri's default menu had an empty Help submenu, so replacing that menu
-    // took the search box away; this puts it back and gives it something to
-    // hold.
-    role: 'submenu',
-    label: 'menubar-help',
-    helpMenu: true,
-    items: [
-      // No accelerator, deliberately. ? already opens this pane, and a menu
-      // item claiming that key would take it from every text field in the app
-      // — menus get first refusal on their key equivalents, which is the same
-      // mechanism that nearly cost Toggle Full Screen, running the other way.
-      { role: 'command', command: 'help', label: 'menubar-petrel-help' },
-      { role: 'separator' },
-      { role: 'link', label: 'menubar-report-issue', url: ISSUES_URL },
-      { role: 'link', label: 'menubar-view-source', url: SOURCE_URL },
-    ],
-  },
-];
+type ChoiceNode = Extract<MenuNode, { role: 'choice' }>;
 
-/** What the window has to supply for the menu to mean anything. The two
- *  settings are read as well as written: a checkmark that does not follow the
- *  Appearance pane is worse than no checkmark. */
+/**
+ * How one choice should read, given the state the window is in.
+ *
+ * Pure, so its rules can be asserted rather than looked at: a menu bar cannot
+ * be read back out of the OS (menu.test.ts). The sort's rules are the list's
+ * sort control's, so the two places that show the order cannot disagree.
+ */
+export function choiceView(
+  node: { label: StringId } & Choice,
+  values: ChoiceValues,
+  searching: boolean,
+): { text: string; checked: boolean; enabled: boolean } {
+  const checked = values[node.setting] === node.value;
+  if (node.setting === 'sortKey') {
+    // Best match is an order only a search has; the control above the list
+    // leaves it out of a mailbox, and a menu that cannot leave items out
+    // greys it instead.
+    return { text: t(node.label), checked, enabled: node.value !== 'relevance' || searching };
+  }
+  if (node.setting === 'sortDirection') {
+    // In the key's own words, as the control says them: newest first for a
+    // date, A to Z for a name. A ranking has no direction, so under Best match
+    // both stand unticked and greyed rather than claiming one.
+    const ranked = values.sortKey === 'relevance';
+    const words = directionLabels(ranked ? 'date' : values.sortKey);
+    return { text: t(words[node.value]), checked: !ranked && checked, enabled: !ranked };
+  }
+  return { text: t(node.label), checked, enabled: true };
+}
+
+/** The state a choice leaves behind, before the settings have caught up. */
+function withChoice(values: ChoiceValues, choice: Choice): ChoiceValues {
+  const next = { ...values, [choice.setting]: choice.value } as ChoiceValues;
+  if (choice.setting === 'sortKey' && choice.value === 'relevance') next.sortDirection = '';
+  return next;
+}
+
+/**
+ * The menu, as data, for the platform it is drawn on.
+ *
+ * Kept declarative so it can be asserted on: menu.test.ts walks both
+ * arrangements and checks that every label exists in the bundle, every command
+ * has a handler, and no two accelerators collide. None of that is observable
+ * from a running menu bar without a person looking at one.
+ *
+ * Away from macOS the app menu loses Services, Hide, Hide Others and Show All,
+ * and View loses Toggle Full Screen. muda answers none of them on Windows bar
+ * Hide, and Hide there is ShowWindow(SW_HIDE): the window leaves the screen and
+ * the taskbar both, with no tray icon to call it back and no second launch to
+ * hand it to — a running app with no way into it short of ending it. About
+ * becomes Petrel's own, because the box muda draws in its place wraps the
+ * values in English that no setting can change ("Name:", "Version:") in an
+ * app that speaks eight languages.
+ */
+export function menuFor(mac: boolean): MenuNode[] {
+  return [
+    {
+      role: 'submenu',
+      label: 'app-name',
+      items: [
+        mac
+          ? { role: 'about', label: 'menubar-about' }
+          : { role: 'command', command: 'about', label: 'menubar-about' },
+        { role: 'separator' },
+        // The same pane ⌘, has always opened. The accelerator now belongs to
+        // the menu: macOS gives its key equivalents first refusal, so the
+        // window's own ⌘, handler no longer sees the keystroke. Both lead to
+        // one place.
+        { role: 'command', command: 'settings', label: 'menubar-settings', accelerator: 'CmdOrCtrl+,' },
+        { role: 'separator' },
+        ...(mac
+          ? ([
+              { role: 'native', native: 'Services', label: 'menubar-services' },
+              { role: 'separator' },
+              { role: 'native', native: 'Hide', label: 'menubar-hide' },
+              { role: 'native', native: 'HideOthers', label: 'menubar-hide-others' },
+              { role: 'native', native: 'ShowAll', label: 'menubar-show-all' },
+              { role: 'separator' },
+            ] satisfies MenuNode[])
+          : []),
+        { role: 'native', native: 'Quit', label: 'menubar-quit' },
+      ],
+    },
+    {
+      role: 'submenu',
+      label: 'menubar-file',
+      items: [
+        { role: 'command', command: 'new-message', label: 'menubar-new-message', accelerator: 'CmdOrCtrl+N' },
+        { role: 'separator' },
+        { role: 'native', native: 'CloseWindow', label: 'menubar-close-window' },
+      ],
+    },
+    {
+      // Load-bearing beyond the obvious. Without these, macOS has nowhere to
+      // send the editing commands dictation and the emoji picker issue, and
+      // both misbehave inside the webview.
+      //
+      // They look inert more often than they are. Every one carries the real
+      // AppKit selector with no target, so it travels the responder chain and
+      // works wherever this app has text — the composer, the search field, a
+      // folder being renamed, a selection in the reader — and does nothing
+      // elsewhere. What it will not do is *say* so: the menu library calls
+      // setAutoenablesItems(false) on every menu it builds, which is exactly
+      // the macOS mechanism that would grey them out when nothing can respond.
+      // So they stay black and clickable whether or not they apply. Reaching
+      // past Tauri into the NSMenu to turn validation back on would couple
+      // this file to another library's internals for the sake of some dimming.
+      //
+      // Find is the one item here Petrel implements itself, and it is the
+      // reason this menu is worth opening: ⌘F searches the whole open
+      // conversation, across every message frame in it, and until now existed
+      // only for people who already knew to press it.
+      role: 'submenu',
+      label: 'menubar-edit',
+      items: [
+        { role: 'native', native: 'Undo', label: 'menubar-undo' },
+        { role: 'native', native: 'Redo', label: 'menubar-redo' },
+        { role: 'separator' },
+        { role: 'native', native: 'Cut', label: 'menubar-cut' },
+        { role: 'native', native: 'Copy', label: 'menubar-copy' },
+        { role: 'native', native: 'Paste', label: 'menubar-paste' },
+        { role: 'native', native: 'SelectAll', label: 'menubar-select-all' },
+        { role: 'separator' },
+        { role: 'command', command: 'find', label: 'menubar-find', accelerator: 'CmdOrCtrl+F' },
+      ],
+    },
+    {
+      // How the window looks and how the list is laid out, which is what a
+      // View menu is for: everything here is a setting with a home elsewhere,
+      // reachable from the menu bar too and ticked as it currently stands.
+      role: 'submenu',
+      label: 'menubar-view',
+      items: [
+        {
+          role: 'submenu',
+          label: 'appearance-theme',
+          items: [
+            { role: 'choice', setting: 'theme', value: 'light', label: 'theme-light' },
+            { role: 'choice', setting: 'theme', value: 'dark', label: 'theme-dark' },
+            { role: 'choice', setting: 'theme', value: 'system', label: 'theme-system' },
+          ],
+        },
+        {
+          role: 'submenu',
+          label: 'appearance-density',
+          items: [
+            { role: 'choice', setting: 'density', value: 'relaxed', label: 'density-relaxed' },
+            { role: 'choice', setting: 'density', value: 'compact', label: 'density-compact' },
+          ],
+        },
+        {
+          role: 'submenu',
+          label: 'menubar-reading-pane',
+          items: [
+            { role: 'choice', setting: 'layout', value: 'right', label: 'layout-right' },
+            { role: 'choice', setting: 'layout', value: 'below', label: 'layout-below' },
+            { role: 'choice', setting: 'layout', value: 'off', label: 'layout-off' },
+          ],
+        },
+        {
+          role: 'submenu',
+          label: 'settings-sidebar',
+          items: [
+            { role: 'choice', setting: 'railCollapsed', value: 'off', label: 'sidebar-expanded' },
+            { role: 'choice', setting: 'railCollapsed', value: 'on', label: 'sidebar-collapsed' },
+          ],
+        },
+        {
+          role: 'submenu',
+          label: 'appearance-checkboxes',
+          items: [
+            { role: 'choice', setting: 'checkboxes', value: 'on', label: 'checkboxes-on' },
+            { role: 'choice', setting: 'checkboxes', value: 'off', label: 'checkboxes-off' },
+          ],
+        },
+        { role: 'separator' },
+        {
+          // The same choices as the control above the list, in the same order,
+          // applied to the same list — this mailbox's order or the search's.
+          // Every key is drawn, because a native menu cannot add one when a
+          // search starts; Best match is greyed until there is a query.
+          role: 'submenu',
+          label: 'menubar-sort-by',
+          items: [
+            { role: 'choice', setting: 'sortKey', value: 'relevance', label: 'sort-relevance' },
+            { role: 'choice', setting: 'sortKey', value: 'date', label: 'sort-date' },
+            { role: 'choice', setting: 'sortKey', value: 'sender', label: 'sort-sender' },
+            { role: 'choice', setting: 'sortKey', value: 'subject', label: 'sort-subject' },
+            { role: 'separator' },
+            // Labelled for a date here; `choiceView` renames them for the key
+            // in force, so a name reads A to Z rather than oldest first.
+            { role: 'choice', setting: 'sortDirection', value: 'descending', label: 'sort-newest' },
+            { role: 'choice', setting: 'sortDirection', value: 'ascending', label: 'sort-oldest' },
+          ],
+        },
+        {
+          // The keys browsers and reading apps use for the size of what is
+          // being read, held to the slider's range in Settings › Appearance.
+          role: 'submenu',
+          label: 'menubar-text-size',
+          items: [
+            { role: 'command', command: 'text-bigger', label: 'menubar-text-bigger', accelerator: 'CmdOrCtrl+=' },
+            { role: 'command', command: 'text-smaller', label: 'menubar-text-smaller', accelerator: 'CmdOrCtrl+-' },
+            { role: 'command', command: 'text-reset', label: 'reset', accelerator: 'CmdOrCtrl+0' },
+          ],
+        },
+        // Kept, not added. Tauri's default View menu held this one item, and
+        // ⌃⌘F exists only because a menu item claims it — replacing the menu
+        // without it would have quietly taken full screen off the keyboard.
+        // macOS only: muda has no full screen to give it anywhere else, and a
+        // row that does nothing is worse than no row.
+        ...(mac
+          ? ([
+              { role: 'separator' },
+              { role: 'native', native: 'Fullscreen', label: 'menubar-fullscreen' },
+            ] satisfies MenuNode[])
+          : []),
+      ],
+    },
+    {
+      // `windowMenu` hands this one to AppKit, which appends the list of open
+      // windows to it. That list is the whole reason the menu is worth having
+      // with a popped-out composer or message on screen, and it is not
+      // something this file can draw for itself. Elsewhere nothing appends to
+      // it, so the separator that would part the list from the items goes too.
+      role: 'submenu',
+      label: 'menubar-window',
+      windowMenu: true,
+      items: [
+        { role: 'native', native: 'Minimize', label: 'menubar-minimize' },
+        // Zoom is the Mac's word for it; everywhere else it is Maximize.
+        { role: 'native', native: 'Maximize', label: mac ? 'menubar-zoom' : 'menubar-maximize' },
+        ...(mac ? ([{ role: 'separator' }] satisfies MenuNode[]) : []),
+      ],
+    },
+    {
+      // Last, which is where macOS expects it, and marked so AppKit takes it:
+      // a Help menu it owns gets the search box that walks the menus for you.
+      // Tauri's default menu had an empty Help submenu, so replacing that menu
+      // took the search box away; this puts it back and gives it something to
+      // hold.
+      role: 'submenu',
+      label: 'menubar-help',
+      helpMenu: true,
+      items: [
+        // No accelerator, deliberately. ? already opens this pane, and a menu
+        // item claiming that key would take it from every text field in the
+        // app — menus get first refusal on their key equivalents, which is the
+        // same mechanism that nearly cost Toggle Full Screen, running the
+        // other way.
+        { role: 'command', command: 'help', label: 'menubar-petrel-help' },
+        { role: 'separator' },
+        { role: 'link', label: 'menubar-report-issue', url: ISSUES_URL },
+        { role: 'link', label: 'menubar-view-source', url: SOURCE_URL },
+      ],
+    },
+  ];
+}
+
+/** What the window has to supply for the menu to mean anything. The choices are
+ *  read as well as written: a checkmark that does not follow the pane that owns
+ *  the setting is worse than no checkmark. */
 export type MenuBindings = {
   /** The same draft the C key and the palette open. */
   newMessage: () => void;
@@ -217,28 +376,38 @@ export type MenuBindings = {
   openSettings: () => void;
   /** The same pane ? opens. */
   openHelp: () => void;
+  /** Petrel's own About, where the OS has no panel of its own to show. */
+  openAbout: () => void;
   /** The same bar ⌘F opens, with the same rule about when there is anything
    *  to find in. */
   find: () => void;
-  theme: Settings['theme'];
-  density: Settings['density'];
-  setTheme: (value: Settings['theme']) => void;
-  setDensity: (value: Settings['density']) => void;
+  /** The reading text a step bigger or smaller, or back to the default. */
+  textSize: (step: -1 | 0 | 1) => void;
+  /** Where every View choice stands now. */
+  values: ChoiceValues;
+  /** Whether a search is running: Best match is an order only a search has. */
+  searching: boolean;
+  /** Applies a View choice as its own control would. */
+  choose: (choice: Choice) => void;
 };
 
 type Built = CheckMenuItem | Submenu | MenuItemOptions | SubmenuOptions | PredefinedMenuItemOptions;
 
 type Tauri = typeof import('@tauri-apps/api/menu');
 
+/** A choice as drawn: the item in the menu bar and what it stands for. */
+type ChoiceItem = { item: CheckMenuItem; node: ChoiceNode };
+
 type BuildContext = {
   tauri: Tauri;
   /** Current values, so the checkmarks start honest. */
-  state: { theme: string; density: string };
+  state: ChoiceValues;
+  searching: boolean;
   run: (command: MenuCommand) => void;
-  choose: (setting: 'theme' | 'density', value: string) => void;
-  /** Every check item, so their marks can be corrected without rebuilding the
-   *  menu. Keyed `setting:value`. */
-  checks: Map<string, CheckMenuItem>;
+  choose: (choice: Choice) => void;
+  /** Every choice item, so its mark, its greying and — for the sort's
+   *  direction — its words can be corrected without rebuilding the menu. */
+  checks: ChoiceItem[];
   /** The submenu AppKit should own, once the menu is installed. */
   windowMenu: Submenu | null;
   /** Likewise, the one it should treat as Help. */
@@ -271,14 +440,14 @@ async function build(node: MenuNode, ctx: BuildContext): Promise<Built> {
         },
       };
     case 'choice': {
-      const key = `${node.setting}:${node.value}`;
-      const options: CheckMenuItemOptions = {
-        text: t(node.label),
-        checked: ctx.state[node.setting] === node.value,
-        action: () => ctx.choose(node.setting, node.value),
-      };
-      const item = await ctx.tauri.CheckMenuItem.new(options);
-      ctx.checks.set(key, item);
+      const view = choiceView(node, ctx.state, ctx.searching);
+      const item = await ctx.tauri.CheckMenuItem.new({
+        text: view.text,
+        checked: view.checked,
+        enabled: view.enabled,
+        action: () => ctx.choose(node),
+      });
+      ctx.checks.push({ item, node });
       return item;
     }
     case 'submenu': {
@@ -291,6 +460,18 @@ async function build(node: MenuNode, ctx: BuildContext): Promise<Built> {
       else ctx.helpMenu = submenu;
       return submenu;
     }
+  }
+}
+
+/** Brings every choice item into line with where the settings stand. Only the
+ *  sort's direction ever changes its words without the language changing,
+ *  and a change of language rebuilds the whole menu. */
+function refresh(checks: ChoiceItem[], values: ChoiceValues, searching: boolean): void {
+  for (const { item, node } of checks) {
+    const view = choiceView(node, values, searching);
+    void item.setChecked(view.checked);
+    void item.setEnabled(view.enabled);
+    if (node.setting === 'sortDirection') void item.setText(view.text);
   }
 }
 
@@ -313,12 +494,12 @@ async function describe(menu: { items: () => Promise<unknown[]> }): Promise<stri
 /**
  * Builds the menu and hands it to the OS.
  *
- * Returns the check items so their marks can be kept in step, and logs both the
- * menu it built and the menu it replaced.
+ * Returns the choice items so their marks can be kept in step, and logs both
+ * the menu it built and the menu it replaced.
  */
-async function install(ctx: BuildContext): Promise<Map<string, CheckMenuItem>> {
+async function install(ctx: BuildContext): Promise<ChoiceItem[]> {
   const items: Built[] = [];
-  for (const node of MENU) items.push(await build(node, ctx));
+  for (const node of menuFor(isMac)) items.push(await build(node, ctx));
   const menu = await ctx.tauri.Menu.new({ items });
   const previous = await menu.setAsAppMenu();
   // Told to AppKit after the menu is in place; before, and there is no menu
@@ -348,7 +529,7 @@ async function install(ctx: BuildContext): Promise<Map<string, CheckMenuItem>> {
 export function useAppMenu(bindings: MenuBindings): void {
   const ref = useRef(bindings);
   ref.current = bindings;
-  const checks = useRef<Map<string, CheckMenuItem> | null>(null);
+  const checks = useRef<ChoiceItem[] | null>(null);
 
   useEffect(() => {
     // Not under Tauri: `npm run dev` in a browser, and the harness, both run
@@ -357,22 +538,14 @@ export function useAppMenu(bindings: MenuBindings): void {
     if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return;
     let live = true;
 
-    const mark = (theme: string, density: string) => {
-      const map = checks.current;
-      if (!map) return;
-      for (const [key, item] of map) {
-        const [setting, value] = key.split(':');
-        void item.setChecked(setting === 'theme' ? value === theme : value === density);
-      }
-    };
-
     void (async () => {
       try {
         const tauri = await import('@tauri-apps/api/menu');
         if (!live) return;
         const ctx: BuildContext = {
           tauri,
-          state: { theme: ref.current.theme, density: ref.current.density },
+          state: ref.current.values,
+          searching: ref.current.searching,
           run: (command) => {
             // Logged like the keyboard's own commands are, because a menu
             // click leaves no other trace: nothing changes in the DOM to say
@@ -392,29 +565,37 @@ export function useAppMenu(bindings: MenuBindings): void {
                 return ref.current.openHelp();
               case 'find':
                 return ref.current.find();
+              case 'about':
+                return ref.current.openAbout();
+              case 'text-bigger':
+                return ref.current.textSize(1);
+              case 'text-smaller':
+                return ref.current.textSize(-1);
+              case 'text-reset':
+                return ref.current.textSize(0);
               default:
                 return ((x: never) => x)(command);
             }
           },
-          choose: (setting, value) => {
-            void api.log(JSON.stringify({ kind: 'menu', command: `${setting}:${value}` }));
-            if (setting === 'theme') {
-              ref.current.setTheme(value as Settings['theme']);
-              // Corrected here as well as in the effect below: a check item
-              // toggles itself on click, so choosing the value that was
-              // already set would otherwise clear its own mark, and the
-              // effect will not fire because nothing changed.
-              mark(value, ref.current.density);
-            } else {
-              ref.current.setDensity(value as Settings['density']);
-              mark(ref.current.theme, value);
-            }
+          choose: (choice) => {
+            void api.log(JSON.stringify({ kind: 'menu', command: `${choice.setting}:${choice.value}` }));
+            ref.current.choose(choice);
+            // Corrected here as well as in the effect below: a check item
+            // toggles itself on click, so choosing the value that was already
+            // set would otherwise clear its own mark, and the effect will not
+            // fire because nothing changed.
+            refresh(checks.current ?? [], withChoice(ref.current.values, choice), ref.current.searching);
           },
-          checks: new Map(),
+          checks: [],
           windowMenu: null,
           helpMenu: null,
         };
-        checks.current = await install(ctx);
+        const built = await install(ctx);
+        if (!live) return;
+        checks.current = built;
+        // Building takes a round trip per item, and a setting that moved in
+        // the meantime was marked against the state the build started from.
+        refresh(built, ref.current.values, ref.current.searching);
       } catch (e) {
         // A window with no menu bar is a poorer window, not a broken one. This
         // must never be the reason the app fails to start.
@@ -427,14 +608,13 @@ export function useAppMenu(bindings: MenuBindings): void {
     };
   }, []);
 
-  // Settings change from the Appearance pane too, and the marks follow.
+  // Settings change from their own panes and controls too, and the marks
+  // follow. Keyed on the values themselves rather than the object, which is a
+  // new one every render: once per change, not once per keystroke.
+  const stamp = JSON.stringify([bindings.values, bindings.searching]);
   useEffect(() => {
-    const map = checks.current;
-    if (!map) return;
-    for (const [key, item] of map) {
-      const [setting, value] = key.split(':');
-      const want = setting === 'theme' ? bindings.theme : bindings.density;
-      void item.setChecked(value === want);
-    }
-  }, [bindings.theme, bindings.density]);
+    const list = checks.current;
+    if (!list) return;
+    refresh(list, ref.current.values, ref.current.searching);
+  }, [stamp]);
 }

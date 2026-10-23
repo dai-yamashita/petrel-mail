@@ -30,6 +30,8 @@ export type KeyActions = {
   /** Saves the search in the field, when there is one to save. */
   saveSearch: () => void;
   undo: () => void;
+  /** The reading text a step bigger or smaller, or back to the default. */
+  textSize: (step: -1 | 0 | 1) => void;
 };
 
 /** True while a modal or a menu is up. Single-key commands must not reach the
@@ -178,6 +180,19 @@ export function accountSwitchAllowed(dialogUp: boolean, typingInComposer: boolea
   return !dialogUp && !typingInComposer;
 }
 
+/** Which reading text size step a key held with ⌘ or Ctrl asks for, or null
+ *  for any other key.
+ *
+ *  `=` and `+` both: the key that grows text carries the two, and people press
+ *  it shifted or not — the keypad's plus reports `+` as well. `-` and `0` come
+ *  from either row the same way. */
+export function textSizeStep(key: string): -1 | 0 | 1 | null {
+  if (key === '=' || key === '+') return 1;
+  if (key === '-') return -1;
+  if (key === '0') return 0;
+  return null;
+}
+
 /** True when the focused thing already answers to Enter on its own.
  *
  *  Enter is how a button is pressed. This handler claimed it for "open the
@@ -260,6 +275,23 @@ export function useKeyboard(actions: KeyActions) {
             e.preventDefault();
             if (!dialogOpen()) a.openSettings();
             return;
+          }
+          // The menu's own keys, answered here as well. On Windows a menu
+          // shortcut is matched in the app's message loop, which never sees a
+          // key pressed while the page has focus — and the page nearly always
+          // has it — so New Message and the text size keys printed in the menu
+          // did nothing from the keyboard. On macOS the menu takes them first
+          // and this never runs: a key goes to one or the other, not both,
+          // which is how ⌘, has always worked.
+          if (k === 'n' && !e.shiftKey) {
+            e.preventDefault();
+            if (!dialogOpen()) a.compose();
+            return;
+          }
+          const step = textSizeStep(e.key);
+          if (step !== null) {
+            e.preventDefault();
+            return a.textSize(step);
           }
           if (/^[1-9]$/.test(e.key)) {
             e.preventDefault();

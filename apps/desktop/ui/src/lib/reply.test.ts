@@ -13,6 +13,8 @@ const message = (over: Partial<ThreadMessage> = {}): ThreadMessage =>
     unread: false,
     recipients: [],
     recipient_addrs: ['you@example.com', 'dana@example.com'],
+    to_addrs: ['you@example.com', 'dana@example.com'],
+    cc_addrs: [],
     attachments: [],
     ...over,
   }) as ThreadMessage;
@@ -92,6 +94,18 @@ describe('reply all', () => {
     expect(cc).toEqual(['dana@example.com']);
   });
 
+  it('keeps a Cc address in Cc on reply-all, not in To', () => {
+    const m = message({
+      recipient_addrs: ['you@example.com', 'dana@example.com', 'alex@example.com'],
+      to_addrs: ['you@example.com', 'dana@example.com'],
+      cc_addrs: ['alex@example.com'],
+    });
+    const { to, cc } = replyTargets(m, 'you@example.com', true);
+    expect(to).toEqual(['sam@example.com']);
+    expect(cc).toContain('alex@example.com');
+    expect(to).not.toContain('alex@example.com');
+  });
+
   it('degrades to a plain reply when there is nobody else', () => {
     const m = message({ recipient_addrs: ['you@example.com'] });
     expect(replyTargets(m, 'you@example.com', true)).toEqual({
@@ -106,6 +120,8 @@ describe('replying to a message you sent', () => {
     from_addr: 'you@example.com',
     from_display: 'You',
     recipient_addrs: ['sam@example.com', 'dana@example.com'],
+    to_addrs: ['sam@example.com', 'dana@example.com'],
+    cc_addrs: [],
   });
 
   it('writes to the people you wrote to, not to yourself', () => {
@@ -121,6 +137,34 @@ describe('replying to a message you sent', () => {
     const { to, cc } = replyTargets(mine, 'you@example.com', true);
     expect(to).toEqual(['sam@example.com', 'dana@example.com']);
     expect(cc).toEqual([]);
+  });
+
+  it('keeps the people you copied in Cc on a reply-all', () => {
+    const m = message({
+      from_addr: 'you@example.com',
+      recipient_addrs: ['sam@example.com', 'dana@example.com'],
+      to_addrs: ['sam@example.com'],
+      cc_addrs: ['dana@example.com'],
+    });
+    expect(replyTargets(m, 'you@example.com', true)).toEqual({
+      to: ['sam@example.com'],
+      cc: ['dana@example.com'],
+    });
+  });
+
+  it('moves the people you copied up when you wrote To yourself', () => {
+    // A note To yourself that copies the people it concerns: they are who a
+    // reply-all is for, and a To left empty above a full Cc looks broken.
+    const m = message({
+      from_addr: 'you@example.com',
+      recipient_addrs: ['you@example.com', 'sam@example.com', 'dana@example.com'],
+      to_addrs: ['you@example.com'],
+      cc_addrs: ['sam@example.com', 'dana@example.com'],
+    });
+    expect(replyTargets(m, 'you@example.com', true)).toEqual({
+      to: ['sam@example.com', 'dana@example.com'],
+      cc: [],
+    });
   });
 
   it('still replies to the sender when the sender is somebody else', () => {
