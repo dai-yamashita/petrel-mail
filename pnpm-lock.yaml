@@ -67,7 +67,7 @@ importers:
         version: 19.2.4(@types/react@19.2.18)
       '@vitejs/plugin-react':
         specifier: ^5.0.0
-        version: 5.2.0(vite@7.3.6)
+        version: 5.2.0(vite@7.3.7)
       eslint:
         specifier: ^10.9.0
         version: 10.9.0
@@ -82,10 +82,10 @@ importers:
         version: 8.67.0(eslint@10.9.0)(typescript@5.9.3)
       vite:
         specifier: ^7.0.0
-        version: 7.3.6
+        version: 7.3.7
       vitest:
         specifier: ^4.1.11
-        version: 4.1.11(vite@7.3.6)
+        version: 4.1.11(vite@7.3.7)
 
 packages:
 
@@ -1370,8 +1370,8 @@ packages:
     peerDependencies:
       react: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
 
-  vite@7.3.6:
-    resolution: {integrity: sha512-4XP60spRGjSZFf1qYH+dJIkK2znL3zQfl9KkOV9MkkRR/3Dls0dxaBsQPTloEc5BLXWPL9vsOxopxyKoMmDueg==}
+  vite@7.3.7:
+    resolution: {integrity: sha512-AHEzTORMbi7/7aXp7w7KZ5+DCUdSeLsJz0grY8xHpc9DHdYb0vQu6DqJfm2tOw3gDExNgPgnJTXxM6syYFHaCA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     hasBin: true
     peerDependencies:
@@ -2216,7 +2216,7 @@ snapshots:
       '@typescript-eslint/types': 8.67.0
       eslint-visitor-keys: 5.0.1
 
-  '@vitejs/plugin-react@5.2.0(vite@7.3.6)':
+  '@vitejs/plugin-react@5.2.0(vite@7.3.7)':
     dependencies:
       '@babel/core': 7.29.7
       '@babel/plugin-transform-react-jsx-self': 7.29.7(@babel/core@7.29.7)
@@ -2224,7 +2224,7 @@ snapshots:
       '@rolldown/pluginutils': 1.0.0-rc.3
       '@types/babel__core': 7.20.5
       react-refresh: 0.18.0
-      vite: 7.3.6
+      vite: 7.3.7
     transitivePeerDependencies:
       - supports-color
 
@@ -2237,13 +2237,13 @@ snapshots:
       chai: 6.2.2
       tinyrainbow: 3.1.1
 
-  '@vitest/mocker@4.1.11(vite@7.3.6)':
+  '@vitest/mocker@4.1.11(vite@7.3.7)':
     dependencies:
       '@vitest/spy': 4.1.11
       estree-walker: 3.0.3
       magic-string: 0.30.21
     optionalDependencies:
-      vite: 7.3.6
+      vite: 7.3.7
 
   '@vitest/pretty-format@4.1.11':
     dependencies:
@@ -2770,7 +2770,7 @@ snapshots:
     dependencies:
       react: 19.2.8
 
-  vite@7.3.6:
+  vite@7.3.7:
     dependencies:
       esbuild: 0.28.2
       fdir: 6.5.0(picomatch@4.0.5)
@@ -2781,10 +2781,10 @@ snapshots:
     optionalDependencies:
       fsevents: 2.3.3
 
-  vitest@4.1.11(vite@7.3.6):
+  vitest@4.1.11(vite@7.3.7):
     dependencies:
       '@vitest/expect': 4.1.11
-      '@vitest/mocker': 4.1.11(vite@7.3.6)
+      '@vitest/mocker': 4.1.11(vite@7.3.7)
       '@vitest/pretty-format': 4.1.11
       '@vitest/runner': 4.1.11
       '@vitest/snapshot': 4.1.11
@@ -2801,7 +2801,7 @@ snapshots:
       tinyexec: 1.3.0
       tinyglobby: 0.2.17
       tinyrainbow: 3.1.1
-      vite: 7.3.6
+      vite: 7.3.7
       why-is-node-running: 2.3.0
     transitivePeerDependencies:
       - msw
