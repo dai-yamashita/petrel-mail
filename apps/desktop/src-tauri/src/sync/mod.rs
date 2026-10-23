@@ -2273,6 +2273,20 @@ async fn run_thrid_sweep(state: &Arc<AppState>, account: i64, cfg: &ImapConfig) 
     }
 }
 
+/// Whether `raw` restates a draft's subject and plain text.
+///
+/// Line endings are the only thing taken out. A push renders the same words
+/// under a new date, and the date is what made the copy look like a
+/// different message.
+fn draft_echo(subject: &str, body: &str, raw: &[u8]) -> bool {
+    let Some(parsed) = petrel_mime::parse_message(raw) else {
+        return false;
+    };
+    let norm = |s: &str| s.replace("\r\n", "\n");
+    norm(parsed.subject.as_deref().unwrap_or("")).trim() == norm(subject).trim()
+        && norm(&parsed.body_text).trim() == norm(body).trim()
+}
+
 /// Drops placements the server no longer backs.
 ///
 /// The windowed sync only ever adds and updates: a message moved out of a
@@ -2427,6 +2441,17 @@ async fn reconcile_ghost_placements(
                     && let Ok(Some(existing)) = store.message_by_msgid(account, mid)
                     && matches!(store.placement_uid(existing, folder_id), Ok(Some(Some(held))) if held != i64::from(uid))
                 {
+                    // Our own push, come back before the previous copy was
+                    // removed. The bytes differ — each push stamps a new
+                    // date — so the ordinary second-copy path kept it as
+                    // another draft of the same words. A revision whose
+                    // subject or body differs is still someone else's, and
+                    // stays a row of its own.
+                    if let Ok(Some((subject, body))) = store.composer_draft_words(existing)
+                        && draft_echo(&subject, &body, raw)
+                    {
+                        return;
+                    }
                     let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         store.ingest_raw_second_copy(&state.blobs, account, Some(folder_id), uid, raw)
                     }));
