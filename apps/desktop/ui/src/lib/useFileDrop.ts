@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { filesFromDataTransfer } from './dropped-files';
 
 /**
  * Stops a file dropped on the window from replacing the application.
@@ -78,7 +79,7 @@ export function useDropGuard() {
  * overhead, so "recently heard one" is the honest question, and the flicker
  * cannot happen because nothing turns it off except silence.
  */
-export function useFileDropZone(onFiles: (files: FileList) => void) {
+export function useFileDropZone(onFiles: (files: readonly File[]) => void) {
   const [over, setOver] = useState(false);
   const timer = useRef<number | null>(null);
 
@@ -89,7 +90,7 @@ export function useFileDropZone(onFiles: (files: FileList) => void) {
 
   useEffect(() => stopClock, []);
 
-  const onDragOver = useCallback((e: React.DragEvent) => {
+  const onDragOverCapture = useCallback((e: React.DragEvent) => {
     // Cancelled whatever is being dragged, so a drop is always possible here;
     // the drop itself decides whether there were files. Only the sign shown to
     // the reader depends on the engine's description of the drag, so the worst
@@ -105,18 +106,22 @@ export function useFileDropZone(onFiles: (files: FileList) => void) {
     timer.current = window.setTimeout(() => setOver(false), 160);
   }, []);
 
-  const onDrop = useCallback(
+  const onDropCapture = useCallback(
     (e: React.DragEvent) => {
+      if (droppingTextIntoAField(e.nativeEvent)) return;
+      // `files` alone is not always populated — on WKWebView it is often empty
+      // while `items` still holds the file. `filesFromDataTransfer` is the
+      // check worth acting on.
+      const files = filesFromDataTransfer(e.dataTransfer);
+      if (files.length === 0) return;
       e.preventDefault();
+      e.stopPropagation();
       stopClock();
       setOver(false);
-      // `files` at drop time is the definitive answer, and the only one worth
-      // acting on: it is the actual list, not the engine's description of what
-      // the drag was carrying.
-      if (e.dataTransfer.files.length > 0) onFiles(e.dataTransfer.files);
+      onFiles(files);
     },
     [onFiles],
   );
 
-  return { over, dropProps: { onDragOver, onDrop } };
+  return { over, dropProps: { onDragOverCapture, onDropCapture } };
 }

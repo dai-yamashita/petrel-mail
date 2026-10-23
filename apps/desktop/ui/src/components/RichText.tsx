@@ -20,6 +20,7 @@ import { Icon } from './Icon';
 import { t, type StringId } from '../lib/strings';
 import { Tip } from './Tip';
 import { nextTool, typedIntoBody } from '../lib/toolbar';
+import { filesFromDataTransfer } from '../lib/dropped-files';
 
 /** The typefaces on offer.
  *
@@ -148,6 +149,8 @@ type Props = {
   autoFocus?: boolean;
   /** Something worth saying that is not worth a dialog — a refused paste. */
   onNotice?: (text: string) => void;
+  /** Files dragged onto the body become attachments, not inline images. */
+  onDropFiles?: (files: readonly File[]) => void;
   /** Filled in once the editor exists. */
   handle?: { current: RichTextHandle | null };
 };
@@ -167,7 +170,7 @@ type Props = {
  * `**bold**`, `- ` for a list, `> ` for a quote. Someone who types markdown out
  * of habit gets what they meant rather than the punctuation.
  */
-export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice, handle }: Props) {
+export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice, onDropFiles, handle }: Props) {
   // The link card: its own text and address, so a link can be labelled rather
   // than only wrapped around whatever happened to be selected.
   const [link, setLink] = useState<
@@ -187,6 +190,8 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice, handl
   // back from the body returns to it.
   const [tool, setTool] = useState(0);
   const tools = useRef<HTMLDivElement>(null);
+  const dropRef = useRef(onDropFiles);
+  dropRef.current = onDropFiles;
 
   const editor = useEditor({
     extensions: composerExtensions(),
@@ -224,6 +229,16 @@ export function RichText({ html, onChange, onKeyDown, autoFocus, onNotice, handl
             view.dispatch(tr.scrollIntoView());
           });
         }
+        return true;
+      },
+      handleDrop: (_view, event) => {
+        const files = filesFromDataTransfer(event.dataTransfer);
+        if (files.length === 0) return false;
+        event.preventDefault();
+        // Some webviews only expose dropped files on the target; if capture
+        // already handled the drop this never runs, so nothing is staged twice.
+        event.stopPropagation();
+        dropRef.current?.(files);
         return true;
       },
     },

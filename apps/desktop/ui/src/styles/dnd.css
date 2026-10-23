@@ -89,10 +89,12 @@ body.dragging * {
 
 /* A file being dragged onto the composer.
 
-   Over the composer, not in it: an overlay that took part in layout would
-   shift the fields the moment the pointer arrived, which is exactly when
-   someone is aiming at them. Transparent to the pointer, so the drop lands on
-   the composer underneath rather than on the sign describing it. */
+   A child of section.compose. The section's capture handler reads the drop
+   on the way down to this overlay and stops it, so the editor never sees the
+   file. pointer-events: none used to let the hit pass through to the
+   contenteditable body. ProseMirror treated the file as text, and no
+   attachment chip appeared. The overlay exists only while a file drag is
+   over the composer. */
 .compose-drop {
   position: absolute;
   inset: 0;
@@ -105,7 +107,7 @@ body.dragging * {
   color: var(--accent);
   font-size: 13px;
   font-weight: 600;
-  pointer-events: none;
+  pointer-events: auto;
 }
 
 /* No positioning rule for the dropping state, deliberately. `.compose` is

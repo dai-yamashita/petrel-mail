@@ -37,10 +37,17 @@ export type Draft = {
   account?: number | null;
 };
 
+/** Merges a patch into the draft the updater sees, not a snapshot from the last render. */
+export function patchDraft(current: Draft, patch: Partial<Draft>): Draft {
+  // A body edit used to copy the draft from the last render, and an attachment
+  // added after that render disappeared. The updater receives the draft as it is now.
+  return { ...current, ...patch };
+}
+
 type Props = {
   draft: Draft;
   account: string;
-  onChange: (d: Draft) => void;
+  onChange: (update: (current: Draft) => Draft) => void;
   onClose: () => void;
   /** These three are handed the draft as it stands at the keystroke, with any
    *  recipient still being typed committed. The parent's own copy is a render
@@ -49,7 +56,7 @@ type Props = {
   onAttach: () => void;
   /** Files dragged in from the desktop. Separate from `onAttach`, which opens
       the picker: these arrive as bytes and have to be written down first. */
-  onDropFiles: (files: FileList) => void;
+  onDropFiles: (files: readonly File[]) => void;
   onSaveDraft: (d: Draft) => void;
   /** Handed the draft as it stands at the keystroke, as Send is, so it can
    *  say there is nobody to send to before a time is asked for. */
@@ -106,7 +113,13 @@ export function Compose({ draft, account, onChange, onClose, onSend, onAttach, o
     const bcc = bccField.current?.flush() ?? null;
     if (to == null && cc == null && bcc == null) return draft;
     const next = { ...draft, to: to ?? draft.to, cc: cc ?? draft.cc, bcc: bcc ?? draft.bcc };
-    onChange(next);
+    onChange((current) =>
+      patchDraft(current, {
+        to: to ?? current.to,
+        cc: cc ?? current.cc,
+        bcc: bcc ?? current.bcc,
+      }),
+    );
     return next;
   };
   // The Cc button unmounts itself when clicked, and focus fell to the body:
@@ -211,7 +224,8 @@ export function Compose({ draft, account, onChange, onClose, onSend, onAttach, o
     else body.current?.focus();
   };
 
-  const field = <K extends keyof Draft>(k: K, v: Draft[K]) => onChange({ ...draft, [k]: v });
+  const field = <K extends keyof Draft>(k: K, v: Draft[K]) =>
+    onChange((current) => patchDraft(current, { [k]: v }));
 
   return (
     <section
@@ -243,9 +257,10 @@ export function Compose({ draft, account, onChange, onClose, onSend, onAttach, o
       }}
     >
       {/* Shown over the composer rather than in it, so nothing shifts as the
-          pointer arrives and the fields stay where they were aimed at. It takes
-          no pointer events of its own — it must not become the thing the drop
-          lands on, or the section beneath would never hear it. */}
+          pointer arrives. It takes the hit while a file drag is overhead: with
+          pointer-events off the drop landed on the body and ProseMirror treated
+          the file as text. The section reads the drop on the way down, in
+          capture, and stops it before the editor can. */}
       {dropping && (
         <div className="compose-drop" aria-hidden="true">
           <span>{t('compose-drop')}</span>
@@ -355,7 +370,12 @@ export function Compose({ draft, account, onChange, onClose, onSend, onAttach, o
         handle={body}
         html={draft.html}
         autoFocus={bodyFocus}
-        onChange={(html, doc) => onChange({ ...draft, html, body: plainTextFromDoc(doc) })}
+        onChange={(html, doc) =>
+          onChange((current) =>
+            patchDraft(current, { html, body: plainTextFromDoc(doc) }),
+          )
+        }
+        onDropFiles={onDropFiles}
         onNotice={onNotice}
       />
 
@@ -371,10 +391,11 @@ export function Compose({ draft, account, onChange, onClose, onSend, onAttach, o
                 className="att-remove"
                 aria-label={t('compose-remove-attachment', { name: a.name })}
                 onClick={() =>
-                  onChange({
-                    ...draft,
-                    attachments: draft.attachments!.filter((x) => x.path !== a.path),
-                  })
+                  onChange((current) =>
+                    patchDraft(current, {
+                      attachments: (current.attachments ?? []).filter((x) => x.path !== a.path),
+                    }),
+                  )
                 }
               >
                 <Icon icon={X} size={11} />
