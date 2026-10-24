@@ -2224,7 +2224,7 @@ export function App() {
   );
 
   /** Files dragged onto the composer from the desktop. */
-  const dropAttachments = async (files: FileList) => {
+  const dropAttachments = async (files: readonly File[]) => {
     try {
       const current = draftRef.current;
       if (!current) return;
@@ -2233,7 +2233,7 @@ export function App() {
       // another message: the files belong to this one or to nothing.
       const slot = slotRef.current;
       const base = current.attachments ?? [];
-      const result = await stageDropped([...files], base, api.stageAttachment);
+      const result = await stageDropped(files, base, api.stageAttachment);
       if (slotRef.current !== slot) return;
       addAttached(result.kept.slice(base.length), result.rejected);
     } catch (e) {
@@ -3722,7 +3722,7 @@ export function App() {
             activeAccount?.email ??
             ''
           }
-          onChange={setDraft}
+          onChange={(update) => setDraft((cur) => (cur ? update(cur) : cur))}
           onClose={() => {
             // Keeping it, not discarding it. Losing what someone wrote because
             // they hit the wrong corner is unforgivable, and a confirmation on

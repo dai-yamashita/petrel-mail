@@ -191,7 +191,7 @@ export function ComposeWindow({ draftId }: { draftId: number }) {
       <Compose
         draft={draft}
         account={account}
-        onChange={setDraft}
+        onChange={(update) => setDraft((cur) => (cur ? update(cur) : cur))}
         // Closing keeps the message, exactly as the docked composer does —
         // and only closes once it is kept.
         onClose={() =>
@@ -215,7 +215,7 @@ export function ComposeWindow({ draftId }: { draftId: number }) {
         }}
         onDropFiles={(files) => {
           const base = draft.attachments ?? [];
-          void stageDropped([...files], base, api.stageAttachment)
+          void stageDropped(files, base, api.stageAttachment)
             .then((result) => addAttached(result.kept.slice(base.length), result.rejected))
             .catch((e) => setToast(t('compose-attach-failed', { error: String(e) })));
         }}
