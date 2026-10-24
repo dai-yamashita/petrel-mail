@@ -816,7 +816,12 @@ mod push_replaces_its_copy {
         );
         srv.put(
             "Drafts",
-            letter("d-keep@example.com", "dana@example.com", "Plans", "their edit"),
+            letter(
+                "d-keep@example.com",
+                "dana@example.com",
+                "Plans",
+                "their edit",
+            ),
             &["\\Draft"],
         );
         tauri::async_runtime::block_on(async {
@@ -846,7 +851,12 @@ mod push_replaces_its_copy {
         let srv = Imap::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\\Drafts")]);
         srv.put(
             "Drafts",
-            letter("d-cc@example.com", "dana@example.com, sam@example.com", "Plans", "yes"),
+            letter(
+                "d-cc@example.com",
+                "dana@example.com, sam@example.com",
+                "Plans",
+                "yes",
+            ),
             &["\\Draft"],
         );
         tauri::async_runtime::block_on(async {
@@ -910,7 +920,11 @@ mod push_replaces_its_copy {
             push(&state, draft, port).await;
         });
         let uids: Vec<u32> = srv.held("Drafts").iter().map(|m| m.uid).collect();
-        assert_eq!(uids, vec![1, 2], "the newer copy of the same draft was removed");
+        assert_eq!(
+            uids,
+            vec![1, 2],
+            "the newer copy of the same draft was removed"
+        );
         assert_eq!(recorded(&state, draft), Some(1));
     }
 }

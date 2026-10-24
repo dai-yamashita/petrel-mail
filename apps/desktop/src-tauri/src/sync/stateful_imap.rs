@@ -450,9 +450,7 @@ fn answer(srv: &Imap, selected: &mut Option<String>, line: &str) -> (Vec<u8>, bo
                         .to_lowercase();
                     let mut found = Vec::new();
                     for (i, m) in b.msgs.iter().enumerate() {
-                        if crit.contains("UNDELETED")
-                            && m.flags.iter().any(|f| f == "\\Deleted")
-                        {
+                        if crit.contains("UNDELETED") && m.flags.iter().any(|f| f == "\\Deleted") {
                             continue;
                         }
                         let pick = if crit.contains("HEADER MESSAGE-ID") {
