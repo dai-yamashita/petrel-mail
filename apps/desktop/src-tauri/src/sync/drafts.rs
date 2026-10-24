@@ -843,11 +843,11 @@ mod push_replaces_its_copy {
             let mut store = state.store.lock().unwrap();
             store.set_draft_msgid(draft, "d-cc@example.com").unwrap();
         }
-        let srv = Imap::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\Drafts")]);
+        let srv = Imap::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\\Drafts")]);
         srv.put(
             "Drafts",
             letter("d-cc@example.com", "dana@example.com, sam@example.com", "Plans", "yes"),
-            &["\Draft"],
+            &["\\Draft"],
         );
         tauri::async_runtime::block_on(async {
             let port = serve(Arc::clone(&srv)).await;
@@ -868,7 +868,7 @@ mod push_replaces_its_copy {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path());
         let draft = open(&state, "Plans", "one");
-        let srv = Imap::new("MOVE", &[("INBOX", ""), ("Drafts", "\Drafts")]);
+        let srv = Imap::new("MOVE", &[("INBOX", ""), ("Drafts", "\\Drafts")]);
         let (first, last) = tauri::async_runtime::block_on(async {
             let port = serve(Arc::clone(&srv)).await;
             push(&state, draft, port).await;
@@ -884,7 +884,7 @@ mod push_replaces_its_copy {
         let held = srv.held("Drafts");
         let live: Vec<u32> = held
             .iter()
-            .filter(|m| !m.flags.iter().any(|f| f == "\Deleted"))
+            .filter(|m| !m.flags.iter().any(|f| f == "\\Deleted"))
             .map(|m| m.uid)
             .collect();
         assert_eq!(live, vec![3], "an earlier copy was not marked deleted");
@@ -903,7 +903,7 @@ mod push_replaces_its_copy {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path());
         let draft = open(&state, "Plans", "yes");
-        let srv = Imap::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\Drafts")]);
+        let srv = Imap::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\\Drafts")]);
         srv.twin_next_append.store(true, Ordering::Relaxed);
         tauri::async_runtime::block_on(async {
             let port = serve(Arc::clone(&srv)).await;

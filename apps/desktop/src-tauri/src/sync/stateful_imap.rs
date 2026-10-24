@@ -451,7 +451,7 @@ fn answer(srv: &Imap, selected: &mut Option<String>, line: &str) -> (Vec<u8>, bo
                     let mut found = Vec::new();
                     for (i, m) in b.msgs.iter().enumerate() {
                         if crit.contains("UNDELETED")
-                            && m.flags.iter().any(|f| f == "\Deleted")
+                            && m.flags.iter().any(|f| f == "\\Deleted")
                         {
                             continue;
                         }
