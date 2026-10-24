@@ -238,6 +238,24 @@ impl Store {
             .unwrap_or((None, None)))
     }
 
+    /// The subject and plain text of a draft this app is writing.
+    ///
+    /// `None` for any other row. A second server copy of a received message
+    /// is still a second message; only an open draft's own push is compared
+    /// against these words, so a copy that merely restates them is not filed
+    /// beside it.
+    pub fn composer_draft_words(&self, id: i64) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT coalesce(subject, ''), coalesce(draft_body, '')
+                 FROM messages WHERE id = ?1 AND draft_envelope IS NOT NULL",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// Gives a draft its travelling name, once, for life.
     ///
     /// Also written as the dedupe key: the server copy comes back through

@@ -11,8 +11,9 @@
 //! (docs/26-probes/p2-shell/src/p2/srv.rs).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,10 @@ pub(crate) struct Imap {
     /// second's bytes instead: a reply the client's parser cannot read.
     garble: Mutex<Option<(String, Vec<u8>)>>,
     arrivals: Mutex<u32>,
+    /// A Message-ID search omits the mailbox's highest UID. APPENDUID still
+    /// names it. A draft push that learned its UID from a later search used
+    /// to miss the copy it had just appended and leave the previous one.
+    pub(crate) hide_newest_message_id: AtomicBool,
 }
 
 impl Imap {
@@ -64,6 +69,7 @@ impl Imap {
             lines: Mutex::new(Vec::new()),
             garble: Mutex::new(None),
             arrivals: Mutex::new(0),
+            hide_newest_message_id: AtomicBool::new(false),
         })
     }
 
@@ -252,6 +258,64 @@ fn missing(name: &str) -> String {
     format!("NO [NONEXISTENT] Mailbox doesn't exist: {name} (0.001 + 0.000 secs).")
 }
 
+/// `{n}` at the end of a command: the next `n` bytes are a literal.
+fn literal_len(line: &str) -> Option<usize> {
+    let start = line.rfind('{')?;
+    let end = line.rfind('}')?;
+    if end <= start || !line[end + 1..].trim().is_empty() {
+        return None;
+    }
+    line[start + 1..end].parse().ok()
+}
+
+/// Stores an APPEND literal and names the UID it was given.
+fn append_literal(srv: &Imap, line: &str, raw: &[u8]) -> (Vec<u8>, bool) {
+    let tag = line.split_whitespace().next().unwrap_or("*");
+    let name = mailbox_of_append(line);
+    let mut boxes = srv.boxes.lock().unwrap();
+    let Some(name) = name else {
+        return (format!("{tag} BAD no mailbox\r\n").into_bytes(), false);
+    };
+    let Some(b) = boxes.get_mut(&name) else {
+        return (
+            format!("{tag} NO [NONEXISTENT] Unknown Mailbox: {name}\r\n").into_bytes(),
+            false,
+        );
+    };
+    let uid = b.next;
+    b.next += 1;
+    let validity = b.validity;
+    let flags = line
+        .split_once('(')
+        .and_then(|(head, rest)| rest.split_once(')').map(|pair| (head, pair.0)))
+        .filter(|(head, _)| head.contains("APPEND"))
+        .map(|(_, inside)| {
+            inside
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    b.msgs.push(Msg {
+        uid,
+        raw: raw.to_vec(),
+        flags,
+        date: "01-Oct-2026 09:00:00 +0000".into(),
+    });
+    (
+        format!("{tag} OK [APPENDUID {validity} {uid}] Appended\r\n").into_bytes(),
+        false,
+    )
+}
+
+fn mailbox_of_append(line: &str) -> Option<String> {
+    let toks = tokens(line);
+    let at = toks
+        .iter()
+        .position(|tok| tok.text().eq_ignore_ascii_case("APPEND"))?;
+    Some(toks.get(at + 1)?.text())
+}
+
 /// The reply to one command line, and whether to close afterwards.
 fn answer(srv: &Imap, selected: &mut Option<String>, line: &str) -> (Vec<u8>, bool) {
     let tag = line.split_whitespace().next().unwrap_or("*").to_string();
@@ -373,6 +437,15 @@ fn answer(srv: &Imap, selected: &mut Option<String>, line: &str) -> (Vec<u8>, bo
                         if pick {
                             found.push(if uid { m.uid } else { i as u32 + 1 }.to_string());
                         }
+                    }
+                    if crit.contains("HEADER MESSAGE-ID")
+                        && srv.hide_newest_message_id.load(Ordering::Relaxed)
+                        && let Some((idx, _)) = found
+                            .iter()
+                            .enumerate()
+                            .max_by_key(|(_, n)| n.parse::<u32>().unwrap_or(0))
+                    {
+                        found.remove(idx);
                     }
                     let sp = if found.is_empty() { "" } else { " " };
                     let out = format!("* SEARCH{sp}{}\r\n{tag} OK searched\r\n", found.join(" "));
@@ -542,6 +615,25 @@ pub(crate) async fn serve(srv: Arc<Imap>) -> u16 {
                     }
                     let command = line.trim_end().to_string();
                     srv.lines.lock().unwrap().push(command.clone());
+                    if let Some(n) = literal_len(&command) {
+                        if tx.write_all(b"+ OK\r\n").await.is_err() {
+                            return;
+                        }
+                        let mut buf = vec![0u8; n];
+                        if reader.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        let mut trail = String::new();
+                        if reader.read_line(&mut trail).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let (reply, close) = append_literal(&srv, &command, &buf);
+                        if tx.write_all(&reply).await.is_err() || close {
+                            let _ = tx.shutdown().await;
+                            return;
+                        }
+                        continue;
+                    }
                     let garbled = {
                         let mut garble = srv.garble.lock().unwrap();
                         let hit = garble

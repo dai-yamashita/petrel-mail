@@ -899,3 +899,132 @@ fn the_gap_filler_leaves_a_renumbered_folder_to_the_recovery() {
         srv.said("FETCH")
     );
 }
+
+fn letter(id: &str, subject: &str, body: &str, date: &str) -> Vec<u8> {
+    format!(
+        "From: Dana Wu <dana@example.com>\r\nTo: Sam Ortiz <sam@example.com>\r\n\
+         Subject: {subject}\r\nDate: {date}\r\nMessage-ID: <{id}>\r\n\
+         MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n"
+    )
+    .into_bytes()
+}
+
+/// The reconcile files a second UID of one Message-ID as its own row. An
+/// open draft is the exception when that UID only repeats the draft's words:
+/// it is this client's push, not another client's revision. A different body
+/// is still the revision.
+#[test]
+fn an_open_drafts_own_copy_is_not_filed_beside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = test_state(dir.path());
+    let account = state.account_id;
+    let srv = Imap::new("UIDPLUS", &[("Drafts", "\\Drafts")]);
+    let id = "d-echo@example.com";
+    srv.put(
+        "Drafts",
+        letter(id, "Plans", "yes", "Tue, 01 Oct 2026 09:00:00 +0000"),
+        &[],
+    );
+    srv.put(
+        "Drafts",
+        letter(id, "Plans", "yes", "Tue, 01 Oct 2026 09:05:00 +0000"),
+        &[],
+    );
+    srv.put(
+        "Drafts",
+        letter(id, "Plans", "their edit", "Tue, 01 Oct 2026 09:06:00 +0000"),
+        &[],
+    );
+    let (draft, folder) = {
+        let mut store = state.store.lock().unwrap();
+        store
+            .sync_folders(account, &[("Drafts".into(), Some("drafts".into()))])
+            .unwrap();
+        let folder = store.folder_for_role(account, "drafts").unwrap().unwrap();
+        let draft = store
+            .save_draft(account, None, "dana@example.com", "Plans", "yes", "")
+            .unwrap();
+        store.set_draft_msgid(draft, id).unwrap();
+        store.set_folder_validity(folder, Some(1)).unwrap();
+        assert!(
+            store
+                .heal_placement_uid(draft, account, "Drafts", 1, Some(1))
+                .unwrap()
+        );
+        store.set_draft_server_uid(draft, Some(1)).unwrap();
+        store.set_backfill_floor(folder, 1).unwrap();
+        (draft, folder)
+    };
+    tauri::async_runtime::block_on(async {
+        let port = serve(Arc::clone(&srv)).await;
+        super::reconcile_ghost_placements(&state, account, &plain(port)).await;
+    });
+    let mut uids = state.store.lock().unwrap().placement_uids(folder).unwrap();
+    uids.sort_unstable();
+    assert_eq!(
+        uids,
+        vec![1, 3],
+        "the same words became a second draft, or the other revision did not"
+    );
+    assert!(
+        state
+            .store
+            .lock()
+            .unwrap()
+            .draft_conflict(draft)
+            .unwrap()
+            .is_some(),
+        "the other revision is not offered as a conflict"
+    );
+}
+
+/// The exception is the open draft. Two deliveries of an ordinary message
+/// stay two rows, even when the words match and only the date differs.
+#[test]
+fn a_second_copy_of_an_ordinary_message_stays_its_own_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = test_state(dir.path());
+    let account = state.account_id;
+    let srv = Imap::new("UIDPLUS", &[("INBOX", "")]);
+    let first = letter(
+        "m@example.com",
+        "Note",
+        "hello",
+        "Tue, 01 Oct 2026 09:00:00 +0000",
+    );
+    srv.put("INBOX", first.clone(), &["\\Seen"]);
+    srv.put(
+        "INBOX",
+        letter(
+            "m@example.com",
+            "Note",
+            "hello",
+            "Tue, 01 Oct 2026 09:05:00 +0000",
+        ),
+        &["\\Seen"],
+    );
+    let folder = {
+        let mut store = state.store.lock().unwrap();
+        store
+            .sync_folders(account, &[("INBOX".into(), Some("inbox".into()))])
+            .unwrap();
+        let folder = store.folder_for_role(account, "inbox").unwrap().unwrap();
+        store
+            .ingest_raw(&state.blobs, account, Some(folder), Some(1), &first)
+            .unwrap();
+        store.set_folder_validity(folder, Some(1)).unwrap();
+        store.set_backfill_floor(folder, 1).unwrap();
+        folder
+    };
+    tauri::async_runtime::block_on(async {
+        let port = serve(Arc::clone(&srv)).await;
+        super::reconcile_ghost_placements(&state, account, &plain(port)).await;
+    });
+    let mut uids = state.store.lock().unwrap().placement_uids(folder).unwrap();
+    uids.sort_unstable();
+    assert_eq!(
+        uids,
+        vec![1, 2],
+        "the second delivery was folded into the first"
+    );
+}
