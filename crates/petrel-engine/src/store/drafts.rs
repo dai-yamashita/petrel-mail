@@ -238,6 +238,23 @@ impl Store {
             .unwrap_or((None, None)))
     }
 
+    /// Whether this row is a draft this app is writing.
+    ///
+    /// A second server copy of a received message is still a second message;
+    /// only an open draft's own push is compared against what the draft
+    /// says, so a copy that merely restates it is not filed beside it.
+    pub fn is_composer_draft(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM messages WHERE id = ?1 AND draft_envelope IS NOT NULL",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Gives a draft its travelling name, once, for life.
     ///
     /// Also written as the dedupe key: the server copy comes back through

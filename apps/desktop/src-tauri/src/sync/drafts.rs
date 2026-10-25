@@ -14,14 +14,26 @@ use std::sync::Arc;
 /// The draft travels under a Message-ID minted on its first push and kept for
 /// life: every later push carries the same one, so the server copy is an edit
 /// rather than a sibling — and when ordinary folder sync fetches it back, the
-/// dedupe key lands it on the local draft row instead of beside it. The old
-/// server copy is deleted only when it is exactly the UID this store
-/// recorded; a copy some other client replaced meanwhile is left standing, so
-/// a conflicting revision is never silently discarded.
+/// dedupe key lands it on the local draft row instead of beside it. The copy
+/// this store recorded last time is removed, and so is any other copy of
+/// these same words. A copy whose subject or body differs is another
+/// client's revision and is left standing, so a conflict is never silently
+/// discarded.
 pub(crate) async fn push_draft_to_server(
     state: &Arc<AppState>,
     draft_id: i64,
 ) -> Result<(), String> {
+    push_draft_using(state, draft_id, imap_config_for).await
+}
+
+async fn push_draft_using<F>(
+    state: &Arc<AppState>,
+    draft_id: i64,
+    config_for: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&Store, i64) -> Option<petrel_providers::imap::ImapConfig>,
+{
     let (account, record, msgid, old_uid, cfg, drafts_folder, identity, from_addr) = {
         let mut store = state.store()?;
         // The draft's own account, never the active one: a send or a save can
@@ -61,7 +73,7 @@ pub(crate) async fn push_draft_to_server(
         let (msgid, old_uid) = store
             .draft_sync_state(draft_id)
             .map_err(|e| e.to_string())?;
-        let Some(cfg) = imap_config_for(&store, account) else {
+        let Some(cfg) = config_for(&store, account) else {
             // No server to push to is not a failure of the draft. Servers and
             // no password Petrel can read is not "no server": the account
             // needs its password, and the push waits for it.
@@ -126,38 +138,25 @@ pub(crate) async fn push_draft_to_server(
         &msgid,
     );
 
-    petrel_providers::imap::append_message(&cfg, &drafts_path, Some("(\\Draft \\Seen)"), &raw)
-        .await
-        .map_err(|e| format!("append: {e}"))?;
-    let new_uid = petrel_providers::imap::uids_for_message_id(&cfg, &drafts_path, &msgid)
-        .await
-        .ok()
-        .and_then(|hits| hits.last().copied());
-
-    if let Some(old) = old_uid
-        && new_uid != Some(old)
-    {
-        // Only the exact copy this store recorded. Anything else standing at
-        // another UID is somebody's revision, and it stays.
-        if let Err(e) = petrel_providers::imap::expunge_uid(
-            &cfg,
-            &drafts_path,
-            old,
-            drafts_validity,
-            state.caps(account).has_uidplus,
-        )
-        .await
-        {
-            log_sync(&format!(
-                "old draft copy (uid {old}) not removed: {}",
-                loggable(&e)
-            ));
-        }
+    let replaced = petrel_providers::imap::replace_draft_copy(
+        &cfg,
+        &drafts_path,
+        drafts_validity,
+        &raw,
+        &msgid,
+        old_uid,
+        state.caps(account).has_uidplus,
+    )
+    .await
+    .map_err(|e| format!("append: {e}"))?;
+    for uid in &replaced.unremoved {
+        log_sync(&format!("old draft copy (uid {uid}) not removed"));
     }
-    // Absent (search failed), the next push simply leaves a copy behind
-    // rather than deleting blind.
+    // Unknown, the next push must not treat the previous UID as the copy
+    // just written: that is how a search which had not caught up skipped
+    // the removal and left a duplicate behind.
     if let Ok(mut store) = state.store.lock() {
-        let _ = store.set_draft_server_uid(draft_id, new_uid);
+        let _ = store.set_draft_server_uid(draft_id, replaced.new_uid);
     }
     log_sync(&format!("draft {draft_id} pushed to folder {drafts_id}"));
     Ok(())
@@ -673,5 +672,259 @@ mod signed_out_tests {
             assert_eq!(state.signin(account), Some(SignIn::Missing));
             assert!(state.take_held(account).drafts.contains(&draft));
         });
+    }
+}
+
+/// A push replaces the copy it wrote last time, including when a search of
+/// the folder cannot see the append yet.
+#[cfg(all(test, feature = "dev-plaintext-imap"))]
+mod push_replaces_its_copy {
+    use super::push_draft_using;
+    use crate::state::test_state;
+    use crate::sync::stateful_imap::{Imap, serve};
+    use petrel_providers::imap::{Credential, ImapConfig, Security};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    fn plain(port: u16) -> ImapConfig {
+        ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            user: "u".into(),
+            credential: Credential::password("pw"),
+            security: Security::InsecurePlaintext,
+        }
+    }
+
+    fn letter(id: &str, to: &str, subject: &str, body: &str) -> Vec<u8> {
+        format!(
+            "From: Dana Wu <dana@example.com>\r\nTo: {to}\r\n\
+             Subject: {subject}\r\nDate: Tue, 01 Oct 2026 09:00:00 +0000\r\n\
+             Message-ID: <{id}>\r\nMIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn open(state: &crate::state::AppState, subject: &str, body: &str) -> i64 {
+        let account = state.account_id;
+        let mut store = state.store.lock().unwrap();
+        store
+            .sync_folders(
+                account,
+                &[
+                    ("INBOX".into(), Some("inbox".into())),
+                    ("Drafts".into(), Some("drafts".into())),
+                ],
+            )
+            .unwrap();
+        store
+            .save_draft(account, None, "dana@example.com", subject, body, "")
+            .unwrap()
+    }
+
+    fn bodies(srv: &Imap) -> Vec<String> {
+        srv.held("Drafts")
+            .into_iter()
+            .map(|m| {
+                String::from_utf8_lossy(&m.raw)
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The server UID this store holds for the draft's copy.
+    fn recorded(state: &crate::state::AppState, draft: i64) -> Option<u32> {
+        let store = state.store.lock().unwrap();
+        store.draft_sync_state(draft).unwrap().1
+    }
+
+    /// The composer saving new words, to the same recipient as `open`.
+    fn edit(state: &crate::state::AppState, draft: i64, body: &str) {
+        let account = state.account_id;
+        let store = state.store.lock().unwrap();
+        store
+            .save_draft(account, Some(draft), "dana@example.com", "Plans", body, "")
+            .unwrap();
+    }
+
+    async fn push(state: &Arc<crate::state::AppState>, draft: i64, port: u16) {
+        push_draft_using(state, draft, move |_, _| Some(plain(port)))
+            .await
+            .unwrap();
+    }
+
+    /// Two edits, and the search never lists the copy just appended. One
+    /// message remains, and it is the later edit.
+    #[test]
+    fn two_pushes_leave_the_latest_copy_when_search_misses_the_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let account = state.account_id;
+        let draft = open(&state, "Plans", "one");
+        let srv = Imap::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\\Drafts")]);
+        srv.hide_newest_message_id.store(true, Ordering::Relaxed);
+        tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            push(&state, draft, port).await;
+            {
+                let store = state.store.lock().unwrap();
+                store
+                    .save_draft(account, Some(draft), "dana@example.com", "Plans", "two", "")
+                    .unwrap();
+            }
+            push(&state, draft, port).await;
+        });
+        let held = srv.held("Drafts");
+        assert_eq!(held.len(), 1, "both edits stayed in Drafts");
+        let body = String::from_utf8_lossy(&held[0].raw);
+        assert!(body.contains("two"), "the remaining copy is the later edit");
+        assert!(
+            !body.contains("\r\none\r\n"),
+            "the first edit is still there"
+        );
+        let recorded = state
+            .store
+            .lock()
+            .unwrap()
+            .draft_sync_state(draft)
+            .unwrap()
+            .1;
+        assert_eq!(recorded, Some(held[0].uid));
+    }
+
+    /// A copy of the same words is the draft and goes. A copy that says
+    /// something else, under the same Message-ID, is the other client and stays.
+    #[test]
+    fn a_push_drops_its_own_duplicate_and_keeps_another_clients_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let draft = open(&state, "Plans", "yes");
+        {
+            let mut store = state.store.lock().unwrap();
+            store.set_draft_msgid(draft, "d-keep@example.com").unwrap();
+        }
+        let srv = Imap::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\\Drafts")]);
+        srv.put(
+            "Drafts",
+            letter("d-keep@example.com", "dana@example.com", "Plans", "yes"),
+            &["\\Draft"],
+        );
+        srv.put(
+            "Drafts",
+            letter(
+                "d-keep@example.com",
+                "dana@example.com",
+                "Plans",
+                "their edit",
+            ),
+            &["\\Draft"],
+        );
+        tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            push(&state, draft, port).await;
+        });
+        let mut left = bodies(&srv);
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["their edit".to_string(), "yes".to_string()],
+            "the duplicate of this draft stayed, or the other revision went"
+        );
+    }
+
+    /// The same words to other people are still the other client's
+    /// revision: a copy that changed only who it goes to stays.
+    #[test]
+    fn a_copy_to_other_recipients_is_another_clients_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let draft = open(&state, "Plans", "yes");
+        {
+            let mut store = state.store.lock().unwrap();
+            store.set_draft_msgid(draft, "d-cc@example.com").unwrap();
+        }
+        let srv = Imap::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\\Drafts")]);
+        srv.put(
+            "Drafts",
+            letter(
+                "d-cc@example.com",
+                "dana@example.com, sam@example.com",
+                "Plans",
+                "yes",
+            ),
+            &["\\Draft"],
+        );
+        tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            push(&state, draft, port).await;
+        });
+        assert_eq!(
+            srv.held("Drafts").len(),
+            2,
+            "a revision that changed only the recipients was taken for a duplicate"
+        );
+    }
+
+    /// Without UIDPLUS the server names no UID for an append and cannot
+    /// expunge one message. The push finds its copy by searching, marks the
+    /// one before it, and a later push does not fetch a marked copy again.
+    #[test]
+    fn without_uidplus_a_push_finds_its_copy_and_passes_over_marked_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let draft = open(&state, "Plans", "one");
+        let srv = Imap::new("MOVE", &[("INBOX", ""), ("Drafts", "\\Drafts")]);
+        let (first, last) = tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            push(&state, draft, port).await;
+            let first = recorded(&state, draft);
+            edit(&state, draft, "two");
+            push(&state, draft, port).await;
+            edit(&state, draft, "three");
+            push(&state, draft, port).await;
+            (first, recorded(&state, draft))
+        });
+        assert_eq!(first, Some(1), "the first push did not find its copy");
+        assert_eq!(last, Some(3), "the last push did not find its copy");
+        let held = srv.held("Drafts");
+        let live: Vec<u32> = held
+            .iter()
+            .filter(|m| !m.flags.iter().any(|f| f == "\\Deleted"))
+            .map(|m| m.uid)
+            .collect();
+        assert_eq!(live, vec![3], "an earlier copy was not marked deleted");
+        assert_eq!(
+            srv.said("UID FETCH 1 (BODY.PEEK[])").len(),
+            1,
+            "a copy already marked deleted was fetched again to compare"
+        );
+    }
+
+    /// Another push of this draft can land between this one's append and
+    /// its search. That copy says the same and is newer: removing it, while
+    /// that push removed this one's, left the server with neither.
+    #[test]
+    fn a_newer_copy_of_the_same_draft_is_left_to_the_push_that_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let draft = open(&state, "Plans", "yes");
+        let srv = Imap::new("UIDPLUS", &[("INBOX", ""), ("Drafts", "\\Drafts")]);
+        srv.twin_next_append.store(true, Ordering::Relaxed);
+        tauri::async_runtime::block_on(async {
+            let port = serve(Arc::clone(&srv)).await;
+            push(&state, draft, port).await;
+        });
+        let uids: Vec<u32> = srv.held("Drafts").iter().map(|m| m.uid).collect();
+        assert_eq!(
+            uids,
+            vec![1, 2],
+            "the newer copy of the same draft was removed"
+        );
+        assert_eq!(recorded(&state, draft), Some(1));
     }
 }

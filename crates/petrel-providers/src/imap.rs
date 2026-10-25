@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::{
-    AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
+    AttributeValue, MailboxDatum, MessageSection, Response, ResponseCode, SectionPath, Status,
+    UidSetMember,
 };
 use async_imap::types::Flag;
 use async_imap::{Client, Session};
@@ -737,6 +738,297 @@ pub async fn append_message(
     session.append(wire_name(folder), flags, None, raw).await?;
     sign_out(&mut session).await?;
     Ok(())
+}
+
+/// What one draft push left on the server.
+pub struct DraftReplacement {
+    /// The UID of the copy just appended. Absent when the server accepted
+    /// the append and neither `APPENDUID` nor a search of this same session
+    /// could name it. The previously recorded UID is not reused for this:
+    /// a search that still only sees that copy has not seen the append.
+    pub new_uid: Option<u32>,
+    /// Copies that should have gone and did not.
+    pub unremoved: Vec<u32>,
+}
+
+/// Appends one revision of a draft and removes the copies this client
+/// already accounts for, on a single selected mailbox.
+///
+/// `APPEND`, the search for the Message-ID and the removal used to be three
+/// connections. The search often ran before the append was visible, so the
+/// only UID it returned was the one already recorded, the removal was
+/// skipped, and every autosave left another copy in Drafts. Those copies
+/// came back through the reconcile as separate drafts of the same words.
+///
+/// The new UID is `APPENDUID` when the server names it. Otherwise it is a
+/// UID this session's search found, newer than `old_uid`, that says what
+/// the revision just appended says (`draft_content`). A search that only
+/// names `old_uid` has not seen the append: that number is not recorded as
+/// the new copy, and the old copy is still removed.
+///
+/// Also removed: every other UID under `message_id` that says the same and
+/// is older than the copy just appended. A copy that says something else —
+/// other words, other recipients, other files — is another client's
+/// revision and stays. So does a newer one: another push of this draft
+/// wrote it after this one did, and two pushes that each removed the
+/// other's copy left the server with none.
+///
+/// The search passes over copies already marked deleted. Without UIDPLUS
+/// they are never expunged, and every push fetched each of them again in
+/// full to compare it.
+pub async fn replace_draft_copy(
+    cfg: &ImapConfig,
+    folder: &str,
+    validity: Option<u32>,
+    raw: &[u8],
+    message_id: &str,
+    old_uid: Option<u32>,
+    server_has_uidplus: bool,
+) -> Result<DraftReplacement> {
+    let client = Client::new(connect(cfg).await?);
+    let mut session = sign_in(client, cfg).await?;
+    let (_, uidplus) = confirm_move_caps(&mut session, true, server_has_uidplus).await;
+    select_numbered(&mut session, folder, validity).await?;
+    let appended =
+        append_capturing_uid(&mut session, folder, Some("(\\Draft \\Seen)"), raw).await?;
+    let hits = exact_message_id_hits(&mut session, message_id, true).await;
+    let hits = match hits {
+        Ok(hits) => hits,
+        Err(_) if appended.is_some() => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let sent = draft_content(raw);
+    let new_uid = match appended {
+        Some(uid) => Some(uid),
+        None => {
+            let mut newer: Vec<u32> = hits
+                .iter()
+                .map(|copy| copy.uid)
+                .filter(|uid| old_uid.is_none_or(|old| *uid > old))
+                .collect();
+            newer.sort_unstable();
+            newer.dedup();
+            let mut found = None;
+            for uid in newer.into_iter().rev() {
+                let Some(bytes) = message_at(&mut session, uid).await? else {
+                    continue;
+                };
+                if sent.is_some() && draft_content(&bytes) == sent {
+                    found = Some(uid);
+                    break;
+                }
+            }
+            found
+        }
+    };
+    let mut going = Vec::new();
+    if let Some(old) = old_uid
+        && Some(old) != new_uid
+    {
+        going.push(old);
+    }
+    for copy in &hits {
+        // Ours, already going, or written after ours by another push.
+        if Some(copy.uid) == new_uid
+            || going.contains(&copy.uid)
+            || new_uid.is_some_and(|new| copy.uid > new)
+        {
+            continue;
+        }
+        let Some(bytes) = message_at(&mut session, copy.uid).await? else {
+            continue;
+        };
+        if sent.is_some() && draft_content(&bytes) == sent {
+            going.push(copy.uid);
+        }
+    }
+    let unremoved = delete_uids(&mut session, &going, uidplus).await;
+    sign_out(&mut session).await?;
+    Ok(DraftReplacement { new_uid, unremoved })
+}
+
+/// What a copy of a draft says, for telling this client's own push from
+/// another client's revision: the subject, the plain text, who it is
+/// addressed to, and the files it carries, by name and size.
+///
+/// Comparing the words alone took another client's revision for a
+/// duplicate when it changed only the recipients, and removed it. Not the
+/// date: every push stamps a new one, and two renders of the same draft
+/// would otherwise never match. Not the sender either: the reconcile
+/// renders the stored draft to compare with, and which identity a push
+/// went out under is not part of what the draft says. Line endings a
+/// renderer and a parser disagree on are taken out.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DraftContent {
+    subject: String,
+    body: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+    attachments: Vec<(Option<String>, usize)>,
+}
+
+/// `DraftContent` of a whole message; `None` when it does not parse.
+pub fn draft_content(raw: &[u8]) -> Option<DraftContent> {
+    let parsed = petrel_mime::parse_message(raw)?;
+    Some(DraftContent {
+        subject: plain_words(parsed.subject.as_deref().unwrap_or_default()),
+        body: plain_words(&parsed.body_text),
+        to: bare_addresses(&parsed.to),
+        cc: bare_addresses(&parsed.cc),
+        bcc: bare_addresses(&parsed.bcc),
+        attachments: parsed
+            .attachments
+            .iter()
+            .map(|a| (a.filename.clone(), a.size))
+            .collect(),
+    })
+}
+
+fn plain_words(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
+}
+
+/// The addresses alone, as the store keys them: a display name another
+/// client wrote back in its own encoding is not a different recipient.
+fn bare_addresses(list: &[(Option<String>, String)]) -> Vec<String> {
+    let bare = |(_, addr): &(Option<String>, String)| addr.trim().to_lowercase();
+    list.iter().map(bare).collect()
+}
+
+/// The message at `uid` in the selected mailbox.
+async fn message_at<S>(session: &mut Session<S>, uid: u32) -> Result<Option<Vec<u8>>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    let mut body = None;
+    fetch_command(session, format!("UID FETCH {uid} (BODY.PEEK[])"), |attrs| {
+        if body.is_none() && attr_uid(attrs) == Some(uid) {
+            body = attr_body(attrs).map(|bytes| bytes.to_vec());
+        }
+    })
+    .await?;
+    Ok(body)
+}
+
+/// APPEND, keeping the UID the server assigns.
+///
+/// `Session::append` stops at `OK` and drops the response code, so a draft
+/// push had to search for a message the server might not list yet.
+async fn append_capturing_uid<S>(
+    session: &mut Session<S>,
+    folder: &str,
+    flags: Option<&str>,
+    raw: &[u8],
+) -> Result<Option<u32>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    use tokio::io::AsyncWriteExt;
+    let flags = flags.unwrap_or("");
+    let gap = if flags.is_empty() { "" } else { " " };
+    let tag = session
+        .run_command(&format!(
+            "APPEND {}{gap}{flags} {{{}}}",
+            quote_imap(&wire_name(folder)),
+            raw.len()
+        ))
+        .await?;
+    loop {
+        let Some(response) = session.read_response().await? else {
+            return Err(ImapError::Protocol(
+                "APPEND: the connection closed before the server accepted the literal".into(),
+            ));
+        };
+        match response.parsed() {
+            Response::Continue { .. } => break,
+            Response::Done {
+                tag: answered,
+                status,
+                information,
+                ..
+            } if answered == &tag => {
+                return Err(ImapError::Protocol(format!(
+                    "APPEND: {status:?} {}",
+                    information.as_deref().unwrap_or_default()
+                )));
+            }
+            _ => {}
+        }
+    }
+    session.as_mut().write_all(raw).await?;
+    session.as_mut().write_all(b"\r\n").await?;
+    session.as_mut().flush().await?;
+    loop {
+        let Some(response) = session.read_response().await? else {
+            return Err(ImapError::Protocol(
+                "APPEND: the connection closed before the server finished".into(),
+            ));
+        };
+        let Response::Done {
+            tag: answered,
+            status,
+            code,
+            information,
+        } = response.parsed()
+        else {
+            continue;
+        };
+        if answered != &tag {
+            continue;
+        }
+        let uid = match code {
+            Some(ResponseCode::AppendUid(_, members)) => append_uid(members),
+            _ => None,
+        };
+        return match status {
+            Status::Ok => Ok(uid),
+            _ => Err(ImapError::Protocol(format!(
+                "APPEND: {status:?} {}",
+                information.as_deref().unwrap_or_default()
+            ))),
+        };
+    }
+}
+
+fn append_uid(members: &[UidSetMember]) -> Option<u32> {
+    match members.first()? {
+        UidSetMember::Uid(uid) => Some(*uid),
+        UidSetMember::UidRange(range) => Some(*range.start()),
+    }
+}
+
+/// Marks `uids` deleted and, where the server can, removes just those.
+/// The ones the server refused come back; an empty list means they went,
+/// or the server has no UIDPLUS and they are only flagged, as `expunge_uid`
+/// leaves them.
+async fn delete_uids<S>(session: &mut Session<S>, uids: &[u32], uidplus: bool) -> Vec<u32>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    if uids.is_empty() {
+        return Vec::new();
+    }
+    let set = uids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    match session.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await {
+        Ok(mut updates) => while updates.next().await.is_some() {},
+        Err(_) => return uids.to_vec(),
+    }
+    if !uidplus {
+        return Vec::new();
+    }
+    match session.uid_expunge(&set).await {
+        Ok(updates) => {
+            futures::pin_mut!(updates);
+            while updates.next().await.is_some() {}
+            Vec::new()
+        }
+        Err(_) => uids.to_vec(),
+    }
 }
 
 /// Fetches whole messages (`RFC822`) with their UIDs — the bytes the engine
@@ -3305,7 +3597,7 @@ where
     let already_there = match stored {
         Some(stored) => {
             session.select(wire_name(to)).await?;
-            match exact_message_id_hits(&mut session, stored.message_id).await {
+            match exact_message_id_hits(&mut session, stored.message_id, false).await {
                 Ok(hits) if hits.is_empty() => false,
                 Ok(hits) => {
                     select_numbered(&mut session, from, validity).await?;
@@ -3414,7 +3706,7 @@ where
 {
     let mut session = sign_in(client, cfg).await?;
     session.select(wire_name(folder)).await?;
-    let found = exact_message_id_hits(&mut session, message_id).await?;
+    let found = exact_message_id_hits(&mut session, message_id, false).await?;
     sign_out(&mut session).await?;
     Ok(found)
 }
@@ -3478,9 +3770,15 @@ const HIT_CHECK_BATCH: usize = 500;
 /// An error, never an empty answer, when there is no id to ask about or no
 /// safe way to ask: callers read empty as absent, and Gmail's Sent check
 /// reads absent as "did not go" and sends again.
+///
+/// `undeleted_only` leaves out copies already marked `\Deleted`. Only the
+/// draft push asks for that: a copy it marked last time, on a server that
+/// cannot expunge just that one, is gone as far as it is concerned. A send
+/// or a move asks about every copy, marked or not.
 async fn exact_message_id_hits<S>(
     session: &mut Session<S>,
     message_id: &str,
+    undeleted_only: bool,
 ) -> Result<Vec<MessageCopy>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
@@ -3495,9 +3793,10 @@ where
             "this Message-ID has too little plain text to search for".into(),
         ));
     };
+    let live = if undeleted_only { "UNDELETED " } else { "" };
     let hits = search_command(
         session,
-        format!("UID SEARCH HEADER Message-ID {}", quote_imap(&term)),
+        format!("UID SEARCH {live}HEADER Message-ID {}", quote_imap(&term)),
     )
     .await?;
     let asked: std::collections::HashSet<u32> = hits.iter().copied().collect();

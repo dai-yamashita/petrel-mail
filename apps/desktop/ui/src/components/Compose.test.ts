@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { addresses } from './Compose';
+import { addresses, patchDraft, type Draft } from './Compose';
 
 /**
  * Recipient parsing. Forgiving on input by design: people paste addresses from
@@ -37,5 +37,22 @@ describe('addresses', () => {
     expect(addresses('')).toEqual([]);
     expect(addresses('   ')).toEqual([]);
     expect(addresses(' , ; ')).toEqual([]);
+  });
+});
+
+describe('patchDraft', () => {
+  it('keeps attachments when the body is edited', () => {
+    const current: Draft = {
+      to: 'a@example.com',
+      cc: '',
+      subject: 'hi',
+      body: 'old',
+      html: '<p>old</p>',
+      attachments: [{ path: '/tmp/a.pdf', name: 'a.pdf', size: 3 }],
+    };
+    const next = patchDraft(current, { html: '<p>x</p>', body: 'x' });
+    expect(next.attachments).toEqual([{ path: '/tmp/a.pdf', name: 'a.pdf', size: 3 }]);
+    expect(next.html).toBe('<p>x</p>');
+    expect(next.body).toBe('x');
   });
 });
