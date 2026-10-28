@@ -89,9 +89,10 @@ body.dragging * {
 
 /* A file being dragged onto the composer.
 
-   A child of section.compose. The section's capture handler reads the drop
-   on the way down to this overlay and stops it, so the editor never sees the
-   file. pointer-events: none used to let the hit pass through to the
+   A child of section.compose. While it is up it is the drop target, so the
+   editor never sees the file. Capture attaches only when `files` is already
+   filled and then stops the event. Otherwise this element's own drop reads
+   `items` once. pointer-events: none used to let the hit pass through to the
    contenteditable body. ProseMirror treated the file as text, and no
    attachment chip appeared. The overlay exists only while a file drag is
    over the composer. */
