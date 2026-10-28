@@ -89,13 +89,11 @@ body.dragging * {
 
 /* A file being dragged onto the composer.
 
-   A child of section.compose. While it is up it is the drop target, so the
-   editor never sees the file. Capture attaches only when `files` is already
-   filled and then stops the event. Otherwise this element's own drop reads
-   `items` once. pointer-events: none used to let the hit pass through to the
-   contenteditable body. ProseMirror treated the file as text, and no
-   attachment chip appeared. The overlay exists only while a file drag is
-   over the composer. */
+   A sign painted over the composer, not a drop target. WKWebView gives the
+   file to the element the pointer was already over. An overlay that took the
+   hit read an empty transfer, the body never saw the drop, and the chip —
+   the name and the remove button — never appeared. The editor's drop handler
+   is the one read. The overlay exists only while a file drag is overhead. */
 .compose-drop {
   position: absolute;
   inset: 0;
@@ -108,7 +106,7 @@ body.dragging * {
   color: var(--accent);
   font-size: 13px;
   font-weight: 600;
-  pointer-events: auto;
+  pointer-events: none;
 }
 
 /* No positioning rule for the dropping state, deliberately. `.compose` is

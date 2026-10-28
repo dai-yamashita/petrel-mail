@@ -83,7 +83,7 @@ export { splitRecipients as addresses } from '../lib/recipients';
  * being replied to. Popping out is a deliberate escalation, not the default.
  */
 export function Compose({ draft, account, onChange, onClose, onSend, onAttach, onDropFiles, onSaveDraft, onSendLater, onPopOut, onNotice, pane }: Props) {
-  const { over: dropping, dropProps, onOverlayDrop } = useFileDropZone(onDropFiles);
+  const { over: dropping, dropProps } = useFileDropZone(onDropFiles);
   const toRef = useRef<HTMLInputElement>(null);
   const ccRef = useRef<HTMLInputElement>(null);
   const bccRef = useRef<HTMLInputElement>(null);
@@ -256,14 +256,11 @@ export function Compose({ draft, account, onChange, onClose, onSend, onAttach, o
         }
       }}
     >
-      {/* Shown over the composer rather than in it, so nothing shifts as the
-          pointer arrives. WKWebView often describes a file drag as
-          `text/uri-list` without `Files`, so the overlay must cover the body
-          or ProseMirror inserts the drop as text. When `files` is already
-          filled, capture attaches and stops the event; otherwise this element
-          is the drop target and reads `items` once. */}
+      {/* A sign only. It must not take the drop: WKWebView hands the file to
+          the element the drag was already over, which is the body, and an
+          overlay that intercepts it gets nothing — no name, no remove button. */}
       {dropping && (
-        <div className="compose-drop" aria-hidden="true" onDrop={onOverlayDrop}>
+        <div className="compose-drop" aria-hidden="true">
           <span>{t('compose-drop')}</span>
         </div>
       )}

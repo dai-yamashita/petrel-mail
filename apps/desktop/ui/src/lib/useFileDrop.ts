@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { classifyComposerDrag, type ComposerDrag } from './composer-drag';
-import { filesFromDataTransfer, filesFromDropCapture } from './dropped-files';
+import { filesFromDataTransfer } from './dropped-files';
 
 /**
  * Stops a file dropped on the window from replacing the application.
@@ -110,26 +110,16 @@ export function useFileDropZone(onFiles: (files: readonly File[]) => void) {
     timer.current = window.setTimeout(() => setOver(false), 160);
   }, []);
 
-  const onDropCapture = useCallback(
+  // Bubble, not capture. Capture runs before the editor, and on WKWebView
+  // `getAsFile()` returns the file only for the element the drag was already
+  // over — an overlay that reads it first, or a capture handler that does,
+  // leaves the body with nothing and no chip is drawn. The editor stops the
+  // event when it attached the file, so this runs only for a drop on the
+  // headers or the footer.
+  const onDrop = useCallback(
     (e: React.DragEvent) => {
       const kind = composerDragKind(e.nativeEvent);
       if (kind === 'field') return;
-      // Must not call `getAsFile()` here. On WKWebView that call returns the
-      // file once, and this listener runs before the drop target. Read `files`
-      // only. The overlay reads `items` when it is up; otherwise the editor does.
-      const files = filesFromDropCapture(e.dataTransfer);
-      if (files.length === 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      stopClock();
-      setOver(false);
-      onFiles(files);
-    },
-    [onFiles],
-  );
-
-  const onOverlayDrop = useCallback(
-    (e: React.DragEvent) => {
       const files = filesFromDataTransfer(e.dataTransfer);
       if (files.length === 0) return;
       e.preventDefault();
@@ -141,5 +131,5 @@ export function useFileDropZone(onFiles: (files: readonly File[]) => void) {
     [onFiles],
   );
 
-  return { over, dropProps: { onDragOverCapture, onDropCapture }, onOverlayDrop };
+  return { over, dropProps: { onDragOverCapture, onDrop } };
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filesFromDataTransfer, filesFromDropCapture } from './dropped-files';
+import { filesFromDataTransfer } from './dropped-files';
 
 function fileList(files: File[]): FileList {
   const list = {
@@ -76,40 +76,11 @@ describe('filesFromDataTransfer', () => {
   });
 });
 
-describe('filesFromDropCapture', () => {
-  it('does not read items when the file list is empty', () => {
-    // WKWebView leaves `files` empty and puts the file on `items`. Calling
-    // getAsFile() here, in the capture phase, consumes it. The editor, which
-    // is the drop target on a reply body, then sees null and no chip appears.
-    const pdf = new File(['%PDF'], 'doc.pdf', { type: 'application/pdf' });
-    let reads = 0;
-    const transfer = {
-      files: fileList([]),
-      get items(): DataTransferItemList {
-        reads += 1;
-        return [
-          {
-            kind: 'file',
-            type: 'application/pdf',
-            getAsFile: () => {
-              reads += 1;
-              return pdf;
-            },
-          },
-        ] as unknown as DataTransferItemList;
-      },
-    } as unknown as DataTransfer;
-
-    expect(filesFromDropCapture(transfer)).toEqual([]);
-    expect(reads).toBe(0);
-  });
-
-  it('keeps the file list when the browser already filled it', () => {
-    const pdf = new File(['%PDF'], 'doc.pdf', { type: 'application/pdf' });
-    expect(filesFromDropCapture(dropTransfer([pdf]))).toEqual([pdf]);
-  });
-
-  it('leaves getAsFile for the drop target, which can call it only once', () => {
+describe('one read of a webkit drop', () => {
+  it('returns the file on the first call and nothing on the second', () => {
+    // WKWebView's getAsFile() yields the file once. The composer must make
+    // that call from the element the drag was already over — the body — and
+    // not from an overlay that appeared on top of it.
     const pdf = new File(['%PDF'], 'doc.pdf', { type: 'application/pdf' });
     let reads = 0;
     const transfer = dropTransfer([], [
@@ -123,9 +94,8 @@ describe('filesFromDropCapture', () => {
       },
     ]);
 
-    expect(filesFromDropCapture(transfer)).toEqual([]);
-    expect(reads).toBe(0);
     expect(filesFromDataTransfer(transfer)).toEqual([pdf]);
-    expect(reads).toBe(1);
+    expect(filesFromDataTransfer(transfer)).toEqual([]);
+    expect(reads).toBe(2);
   });
 });
