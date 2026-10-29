@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { classifyComposerDrag, type ComposerDrag } from './composer-drag';
-import { noteDragOver, noteDrop } from './drop-timing';
+import { noteComposerDrag, noteDragOver, noteDrop } from './drop-timing';
 import { filesFromDataTransfer } from './dropped-files';
 
 /**
@@ -61,6 +61,7 @@ export function useDropGuard() {
     // drop at all — with one exception: dragged *text* over somewhere text
     // belongs. A subject line should still accept a dragged word.
     const stopDragOver = (e: DragEvent) => {
+      noteDragOver();
       if (droppingTextIntoAField(e)) return;
       e.preventDefault();
     };
@@ -124,13 +125,13 @@ export function useFileDropZone(onFiles: (files: readonly File[]) => void) {
   const onDragOverCapture = useCallback(
     (e: React.DragEvent) => {
       const kind = composerDragKind(e.nativeEvent);
+      noteComposerDrag(kind);
       if (kind === 'field') return;
       // Cancelled whatever is being dragged, so a drop is always possible here;
       // the drop itself decides whether there were files.
       e.preventDefault();
       if (kind !== 'file') return;
       e.dataTransfer.dropEffect = 'copy';
-      noteDragOver();
       cover.dragOver();
     },
     [cover],
