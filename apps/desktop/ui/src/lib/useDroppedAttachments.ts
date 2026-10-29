@@ -8,6 +8,7 @@ import {
   type Attached,
   type Copying,
 } from './attachments';
+import { takeDrop, traceChip, traceCopy } from './drop-timing';
 
 type Job = {
   cancelled: boolean;
@@ -32,6 +33,8 @@ export function useDroppedAttachments(opts: {
   stage: (name: string, bytes: Uint8Array) => Promise<Attached>;
   onRejected: (names: string[]) => void;
   onFailed: (error: unknown) => void;
+  /** Where a drop's timings go (`drop-timing`). Without it nothing is timed. */
+  log?: (line: string) => void;
 }) {
   const jobs = useRef(new Map<string, Job>());
   // A copy that finished before the save asked for it. The job is gone by
@@ -41,6 +44,11 @@ export function useDroppedAttachments(opts: {
   optsRef.current = opts;
 
   const drop = (files: readonly File[]) => {
+    // Taken first, so a drop that adds nothing does not leave its marks for
+    // the next one.
+    const marks = takeDrop();
+    const handed = performance.now();
+    const log = optsRef.current.log;
     const current = optsRef.current.getDraft();
     if (!current) return;
     const slot = optsRef.current.composer();
@@ -60,7 +68,8 @@ export function useDroppedAttachments(opts: {
       if (!file) continue;
       const id = crypto.randomUUID();
       const base = current.attachments ?? [];
-      const job = deferredCopy(id, file, base, slot);
+      const timing = marks && log ? traceCopy(marks, file.size, log) : null;
+      const job = deferredCopy(id, file, base, slot, timing);
       jobs.current.set(id, job);
       starting.push(job);
       added.push({ id, name: file.name, size: file.size });
@@ -71,6 +80,8 @@ export function useDroppedAttachments(opts: {
     optsRef.current.setDraft((cur) =>
       cur ? { ...cur, copying: [...(cur.copying ?? []), ...added] } : cur,
     );
+    // Before the copy is queued, so the chip's times do not include it.
+    if (marks && log) traceChip(marks, added.length, handed, log);
     window.setTimeout(() => {
       for (const job of starting) {
         if (!job.cancelled) job.begin();
@@ -79,7 +90,13 @@ export function useDroppedAttachments(opts: {
   };
 
   /** A copy that does not start until `begin`. Sending can start it early. */
-  function deferredCopy(id: string, file: File, base: readonly Attached[], slot: unknown): Job {
+  function deferredCopy(
+    id: string,
+    file: File,
+    base: readonly Attached[],
+    slot: unknown,
+    timing: ReturnType<typeof traceCopy> | null,
+  ): Job {
     let started = false;
     const job: Job = {
       cancelled: false,
@@ -94,7 +111,11 @@ export function useDroppedAttachments(opts: {
           reject(new Error('cancelled'));
           return;
         }
-        void stageDropped([file], base, optsRef.current.stage)
+        timing?.began();
+        void stageDropped([file], base, (name, bytes) => {
+          timing?.read();
+          return optsRef.current.stage(name, bytes);
+        })
           .then((result) => {
             if (result.rejected.includes(file.name) || result.kept.length === base.length) {
               optsRef.current.onRejected([file.name]);
@@ -109,6 +130,7 @@ export function useDroppedAttachments(opts: {
     });
     void job.promise.then(
       (ready) => {
+        timing?.settled('ok');
         done.current.set(id, ready);
         jobs.current.delete(id);
         if (job.cancelled || optsRef.current.composer() !== slot) return;
@@ -126,6 +148,12 @@ export function useDroppedAttachments(opts: {
         if (refused.length > 0) optsRef.current.onRejected(refused);
       },
       (error: unknown) => {
+        // The outcome's kind only. An error from the copy can carry a path.
+        timing?.settled(
+          error instanceof Error && (error.message === 'rejected' || error.message === 'cancelled')
+            ? error.message
+            : 'failed',
+        );
         jobs.current.delete(id);
         if (job.cancelled || optsRef.current.composer() !== slot) return;
         optsRef.current.setDraft((cur) =>

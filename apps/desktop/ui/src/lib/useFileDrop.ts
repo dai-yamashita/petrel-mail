@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { classifyComposerDrag, type ComposerDrag } from './composer-drag';
+import { noteDragOver, noteDrop } from './drop-timing';
 import { filesFromDataTransfer } from './dropped-files';
 
 /**
@@ -129,6 +130,7 @@ export function useFileDropZone(onFiles: (files: readonly File[]) => void) {
       e.preventDefault();
       if (kind !== 'file') return;
       e.dataTransfer.dropEffect = 'copy';
+      noteDragOver();
       cover.dragOver();
     },
     [cover],
@@ -137,7 +139,13 @@ export function useFileDropZone(onFiles: (files: readonly File[]) => void) {
   // Every drop ends the drag, including the ones the editor takes and stops.
   // Capture, so the editor's stop cannot hide it; and the transfer is not
   // read here, so the editor's `getAsFile()` still gets the file.
-  const onDropCapture = useCallback(() => cover.drop(), [cover]);
+  const onDropCapture = useCallback(
+    (e: React.DragEvent) => {
+      noteDrop(e.nativeEvent.timeStamp);
+      cover.drop();
+    },
+    [cover],
+  );
 
   // Bubble, not capture. Capture runs before the editor, and on WKWebView
   // `getAsFile()` returns the file only for the element the drag was already

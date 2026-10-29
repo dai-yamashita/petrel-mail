@@ -1951,6 +1951,7 @@ export function App() {
         }),
       ),
     onFailed: (error) => setToast(t('compose-attach-failed', { error: String(error) })),
+    log: api.log,
   });
 
   /**

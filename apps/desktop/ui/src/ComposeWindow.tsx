@@ -99,6 +99,7 @@ export function ComposeWindow({ draftId }: { draftId: number }) {
         }),
       ),
     onFailed: (error) => setToast(t('compose-attach-failed', { error: String(error) })),
+    log: api.log,
   });
 
   /** Writes the draft and remembers its row. Throws on failure, so every
