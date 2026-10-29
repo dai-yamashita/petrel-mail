@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { classifyComposerDrag, type ComposerDrag } from './composer-drag';
 import { filesFromDataTransfer } from './dropped-files';
 
@@ -74,7 +74,7 @@ export function useDropGuard() {
 }
 
 /**
- * A region that accepts files dragged in from the desktop.
+ * Whether a file drag is over a drop zone, from the events that say so.
  *
  * Whether a drag is overhead is decided by a timer rather than by counting
  * `dragenter` against `dragleave`. Those two fire on every child the pointer
@@ -82,33 +82,62 @@ export function useDropGuard() {
  * region stuck highlighted, and a boolean toggled by both flickers on and off
  * as the pointer moves across the fields. `dragover` repeats while a drag is
  * overhead, so "recently heard one" is the honest question, and the flicker
- * cannot happen because nothing turns it off except silence.
+ * cannot happen because nothing turns it off except silence — or the drop.
  */
+export function dropCover(show: (over: boolean) => void) {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const stop = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  return {
+    /** A file drag was heard overhead. */
+    dragOver: () => {
+      show(true);
+      stop();
+      // Comfortably longer than the interval between `dragover` events, so an
+      // ordinary pause in a slow drag does not read as the drag having left.
+      timer = setTimeout(() => {
+        timer = null;
+        show(false);
+      }, 160);
+    },
+    /** The drag ended in a drop. Takes no transfer, so it cannot spend one.
+     *  Waiting out the clock instead left the cover over the chip the drop
+     *  had just added. */
+    drop: () => {
+      stop();
+      show(false);
+    },
+    stop,
+  };
+}
+
+/** A region that accepts files dragged in from the desktop. */
 export function useFileDropZone(onFiles: (files: readonly File[]) => void) {
   const [over, setOver] = useState(false);
-  const timer = useRef<number | null>(null);
+  const [cover] = useState(() => dropCover(setOver));
 
-  const stopClock = () => {
-    if (timer.current !== null) window.clearTimeout(timer.current);
-    timer.current = null;
-  };
+  useEffect(() => cover.stop, [cover]);
 
-  useEffect(() => stopClock, []);
+  const onDragOverCapture = useCallback(
+    (e: React.DragEvent) => {
+      const kind = composerDragKind(e.nativeEvent);
+      if (kind === 'field') return;
+      // Cancelled whatever is being dragged, so a drop is always possible here;
+      // the drop itself decides whether there were files.
+      e.preventDefault();
+      if (kind !== 'file') return;
+      e.dataTransfer.dropEffect = 'copy';
+      cover.dragOver();
+    },
+    [cover],
+  );
 
-  const onDragOverCapture = useCallback((e: React.DragEvent) => {
-    const kind = composerDragKind(e.nativeEvent);
-    if (kind === 'field') return;
-    // Cancelled whatever is being dragged, so a drop is always possible here;
-    // the drop itself decides whether there were files.
-    e.preventDefault();
-    if (kind !== 'file') return;
-    e.dataTransfer.dropEffect = 'copy';
-    setOver(true);
-    stopClock();
-    // Comfortably longer than the interval between `dragover` events, so an
-    // ordinary pause in a slow drag does not read as the drag having left.
-    timer.current = window.setTimeout(() => setOver(false), 160);
-  }, []);
+  // Every drop ends the drag, including the ones the editor takes and stops.
+  // Capture, so the editor's stop cannot hide it; and the transfer is not
+  // read here, so the editor's `getAsFile()` still gets the file.
+  const onDropCapture = useCallback(() => cover.drop(), [cover]);
 
   // Bubble, not capture. Capture runs before the editor, and on WKWebView
   // `getAsFile()` returns the file only for the element the drag was already
@@ -124,12 +153,10 @@ export function useFileDropZone(onFiles: (files: readonly File[]) => void) {
       if (files.length === 0) return;
       e.preventDefault();
       e.stopPropagation();
-      stopClock();
-      setOver(false);
       onFiles(files);
     },
     [onFiles],
   );
 
-  return { over, dropProps: { onDragOverCapture, onDrop } };
+  return { over, dropProps: { onDragOverCapture, onDropCapture, onDrop } };
 }
