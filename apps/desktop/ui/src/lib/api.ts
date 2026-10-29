@@ -2,6 +2,7 @@
    UI depends on is one file wide. Types mirror the Rust structs. */
 
 import { invoke } from '@tauri-apps/api/core';
+import { stageAttachmentMessage } from './attachments';
 import type { RuleField, RuleOp } from './rules';
 import { clampThreadLimit, THREAD_PAGE } from './reader-window';
 
@@ -1008,8 +1009,14 @@ const real = {
    *  when it was deleted forever while it waited. */
   outboxEdit: (id: number) => invoke<number>('outbox_edit', { id }),
   outboxCheck: (id: number) => invoke<string>('outbox_check', { id }),
-  stageAttachment: (name: string, bytes: Uint8Array) =>
-    invoke<{ path: string; name: string; size: number }>('stage_attachment', { name, bytes }),
+  stageAttachment: (name: string, bytes: Uint8Array) => {
+    // Raw bytes, not `{ name, bytes }`. The object form expands every byte
+    // into a JSON number and that expansion runs before the chip can paint.
+    const message = stageAttachmentMessage(name, bytes);
+    return invoke<{ path: string; name: string; size: number }>('stage_attachment', message.body, {
+      headers: message.headers,
+    });
+  },
   /** The original's attachments, as files a forward can carry. Pictures the
    *  forwarded body already shows are left out by the command. */
   stageForwarded: (messageId: number, parts: number[]) =>

@@ -6,6 +6,7 @@ import {
   fits,
   pickAttachments,
   planDrop,
+  stageAttachmentMessage,
   stageDropped,
   withAttached,
 } from './attachments';
@@ -48,6 +49,15 @@ describe('fits', () => {
     // 20MB on disk is about 27MB on the wire. A check against the raw size
     // would wave this through.
     expect(fits([], 20 * 1024 * 1024)).toBe(false);
+  });
+});
+
+describe('stageAttachmentMessage', () => {
+  it('sends the bytes unchanged and percent-encodes the name', () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const message = stageAttachmentMessage('報告.pdf', bytes);
+    expect(message.body).toBe(bytes);
+    expect(decodeURIComponent(message.headers['attachment-name'])).toBe('報告.pdf');
   });
 });
 

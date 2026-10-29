@@ -9,15 +9,20 @@ import {
   type Copying,
 } from './attachments';
 
-type Job = { cancelled: boolean; promise: Promise<Attached> };
+type Job = {
+  cancelled: boolean;
+  promise: Promise<Attached>;
+  /** Starts the byte copy. Idempotent, and a no-op read when already cancelled. */
+  begin: () => void;
+};
 
 /**
  * Shows a dropped file's chip before the bytes have been copied, and finishes
  * the copy before a save or a send.
  *
- * The chip used to wait on `arrayBuffer` and the write to disk. Both are the
- * whole file. The name and the size are known on the drop, so the chip is
- * drawn then and the copy follows.
+ * The name and the size are known on the drop. The copy used to start in the
+ * same turn, and its continuation runs before the browser paints, so the chip
+ * was in the tree and still not on screen. The copy starts on a later turn.
  */
 export function useDroppedAttachments(opts: {
   getDraft: () => Draft | null;
@@ -49,61 +54,99 @@ export function useDroppedAttachments(opts: {
     );
     if (plan.rejected.length > 0) optsRef.current.onRejected(plan.rejected);
     const added: Copying[] = [];
+    const starting: Job[] = [];
     for (const index of plan.take) {
       const file = files[index];
       if (!file) continue;
       const id = crypto.randomUUID();
       const base = current.attachments ?? [];
-      const promise = stageDropped([file], base, optsRef.current.stage).then((result) => {
-        if (result.rejected.includes(file.name) || result.kept.length === base.length) {
-          optsRef.current.onRejected([file.name]);
-          throw new Error('rejected');
-        }
-        const staged = result.kept[result.kept.length - 1];
-        if (!staged) throw new Error('not staged');
-        return staged;
-      });
-      const job: Job = { cancelled: false, promise };
+      const job = deferredCopy(id, file, base, slot);
       jobs.current.set(id, job);
-      void promise.then(
-        (ready) => {
-          done.current.set(id, ready);
-          jobs.current.delete(id);
-          if (job.cancelled || optsRef.current.composer() !== slot) return;
-          let refused: string[] = [];
-          optsRef.current.setDraft((cur) => {
-            if (!cur?.copying?.some((c) => c.id === id)) return cur;
-            const placed = withAttached(cur.attachments ?? [], [ready]);
-            refused = placed.rejected;
-            return {
-              ...cur,
-              copying: cur.copying.filter((c) => c.id !== id),
-              attachments: placed.kept,
-            };
-          });
-          if (refused.length > 0) optsRef.current.onRejected(refused);
-        },
-        (error: unknown) => {
-          jobs.current.delete(id);
-          if (job.cancelled || optsRef.current.composer() !== slot) return;
-          optsRef.current.setDraft((cur) =>
-            cur ? { ...cur, copying: (cur.copying ?? []).filter((c) => c.id !== id) } : cur,
-          );
-          if (error instanceof Error && error.message === 'rejected') return;
-          optsRef.current.onFailed(error);
-        },
-      );
+      starting.push(job);
       added.push({ id, name: file.name, size: file.size });
     }
     if (added.length === 0) return;
+    // The chip first. The copy is a later turn, so this paint is not stuck
+    // behind reading the file.
     optsRef.current.setDraft((cur) =>
       cur ? { ...cur, copying: [...(cur.copying ?? []), ...added] } : cur,
     );
+    window.setTimeout(() => {
+      for (const job of starting) {
+        if (!job.cancelled) job.begin();
+      }
+    }, 0);
   };
+
+  /** A copy that does not start until `begin`. Sending can start it early. */
+  function deferredCopy(id: string, file: File, base: readonly Attached[], slot: unknown): Job {
+    let started = false;
+    const job: Job = {
+      cancelled: false,
+      promise: Promise.resolve({ path: '', name: file.name, size: file.size }),
+      begin: () => {},
+    };
+    job.promise = new Promise<Attached>((resolve, reject) => {
+      job.begin = () => {
+        if (started) return;
+        started = true;
+        if (job.cancelled) {
+          reject(new Error('cancelled'));
+          return;
+        }
+        void stageDropped([file], base, optsRef.current.stage)
+          .then((result) => {
+            if (result.rejected.includes(file.name) || result.kept.length === base.length) {
+              optsRef.current.onRejected([file.name]);
+              throw new Error('rejected');
+            }
+            const staged = result.kept[result.kept.length - 1];
+            if (!staged) throw new Error('not staged');
+            return staged;
+          })
+          .then(resolve, reject);
+      };
+    });
+    void job.promise.then(
+      (ready) => {
+        done.current.set(id, ready);
+        jobs.current.delete(id);
+        if (job.cancelled || optsRef.current.composer() !== slot) return;
+        let refused: string[] = [];
+        optsRef.current.setDraft((cur) => {
+          if (!cur?.copying?.some((c) => c.id === id)) return cur;
+          const placed = withAttached(cur.attachments ?? [], [ready]);
+          refused = placed.rejected;
+          return {
+            ...cur,
+            copying: cur.copying.filter((c) => c.id !== id),
+            attachments: placed.kept,
+          };
+        });
+        if (refused.length > 0) optsRef.current.onRejected(refused);
+      },
+      (error: unknown) => {
+        jobs.current.delete(id);
+        if (job.cancelled || optsRef.current.composer() !== slot) return;
+        optsRef.current.setDraft((cur) =>
+          cur ? { ...cur, copying: (cur.copying ?? []).filter((c) => c.id !== id) } : cur,
+        );
+        if (error instanceof Error && (error.message === 'rejected' || error.message === 'cancelled')) {
+          return;
+        }
+        optsRef.current.onFailed(error);
+      },
+    );
+    return job;
+  }
 
   const remove = (id: string) => {
     const job = jobs.current.get(id);
-    if (job) job.cancelled = true;
+    if (job) {
+      job.cancelled = true;
+      // Settle a copy that has not started, without reading the file.
+      job.begin();
+    }
     done.current.delete(id);
     jobs.current.delete(id);
     optsRef.current.setDraft((cur) =>
@@ -120,6 +163,8 @@ export function useDroppedAttachments(opts: {
       const settled = done.current.get(id);
       if (settled) return settled;
       if (!job) return null;
+      // A send does not wait out the paint gap. The chip is already up.
+      job.begin();
       try {
         const ready = await job.promise;
         return job.cancelled ? null : ready;

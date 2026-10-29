@@ -29,6 +29,23 @@ export type Attached = { path: string; name: string; size: number };
  *  it, and the chip is the thing someone is waiting to see. */
 export type Copying = { id: string; name: string; size: number };
 
+/**
+ * The invoke that writes a dropped file into staging.
+ *
+ * The bytes are the whole message. Put inside a JSON object they are written
+ * out as one number per byte, on the page thread, and that work finishes
+ * before the browser can paint the chip.
+ */
+export function stageAttachmentMessage(
+  name: string,
+  bytes: Uint8Array,
+): { body: Uint8Array; headers: { 'attachment-name': string } } {
+  return {
+    body: bytes,
+    headers: { 'attachment-name': encodeURIComponent(name) },
+  };
+}
+
 /** Whether one more file fits, counting what is already attached. */
 export function fits(existing: Attached[], addition: number): boolean {
   const used = existing.reduce((n, a) => n + encodedSize(a.size), 0);

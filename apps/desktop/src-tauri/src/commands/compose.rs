@@ -758,9 +758,54 @@ fn plain_text_quote(text: &str) -> String {
 /// The name is reduced to a file name and nothing else. It arrives from a drag
 /// the application did not compose, so `../../.ssh/id_rsa` has to be a file
 /// called `id_rsa` in the staging directory and not a path out of it.
+///
+/// The bytes are the request body, not a JSON field. A field is one JSON
+/// number per byte, built on the page thread, and that blocked the chip.
 #[tauri::command(async)]
-pub fn stage_attachment(name: String, bytes: Vec<u8>) -> Result<AttachmentInfo, String> {
-    stage_bytes(&name, &bytes)
+pub fn stage_attachment(request: tauri::ipc::Request<'_>) -> Result<AttachmentInfo, String> {
+    let name = attachment_name(
+        request
+            .headers()
+            .get("attachment-name")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let bytes = attachment_bytes(request.body())?;
+    stage_bytes(&name, bytes)
+}
+
+/// The file name from the `attachment-name` header, which is percent-encoded
+/// because a header cannot carry every character a file name can.
+fn attachment_name(header: Option<&str>) -> String {
+    header
+        .map(percent_decode_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "attachment".to_string())
+}
+
+fn percent_decode_name(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(value) = hex.and_then(|text| u8::from_str_radix(text, 16).ok()) {
+                out.push(value);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| "attachment".to_string())
+}
+
+fn attachment_bytes(body: &tauri::ipc::InvokeBody) -> Result<&[u8], String> {
+    match body {
+        tauri::ipc::InvokeBody::Raw(bytes) => Ok(bytes),
+        _ => Err("attachment bytes were not sent as a file".to_string()),
+    }
 }
 
 /// Stages the original's attachments for a forward, as every client forwards
@@ -1372,5 +1417,25 @@ mod remote_picture_tests {
         assert_eq!(asked.into_inner().unwrap(), REMOTE_PICTURES_MAX);
         assert_eq!(out.matches("data:image/gif").count(), REMOTE_PICTURES_MAX);
         assert_eq!(out.matches("data-remote=").count(), 5);
+    }
+}
+
+#[cfg(test)]
+mod stage_attachment_tests {
+    use super::{attachment_bytes, attachment_name};
+
+    #[test]
+    fn the_name_header_is_percent_encoded() {
+        assert_eq!(attachment_name(Some("%E5%A0%B1%E5%91%8A.pdf")), "報告.pdf");
+        assert_eq!(attachment_name(None), "attachment");
+        assert_eq!(attachment_name(Some("")), "attachment");
+    }
+
+    #[test]
+    fn the_body_is_the_bytes_and_not_a_json_list() {
+        let raw = tauri::ipc::InvokeBody::Raw(vec![9, 8, 7]);
+        assert_eq!(attachment_bytes(&raw).expect("raw"), &[9, 8, 7]);
+        let json = tauri::ipc::InvokeBody::Json(serde_json::json!([9, 8, 7]));
+        assert!(attachment_bytes(&json).is_err());
     }
 }
